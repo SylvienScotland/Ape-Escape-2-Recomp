@@ -104,3 +104,12 @@
   "presents" fade. Text looks doubled/ghosted (likely interlace field / GS presentation issue).
 - Open questions: what happens after the presents screen (intro FMV = MPEG via FFmpeg?), memory card behavior,
   ghosted text.
+
+## Boot 6b: stuck starting the intro movie
+- After the presents screen: MC checks (GetInfo ok, Sync cmd=2 -> -4 = no save yet), sceSifSetDma,
+  sceCdSearchFile(MOVIE\D1.PSS), 3rd thread appears, then main thread spins in 0x1895E0 (movie open).
+- 0x1895E0 allocates an IOP stream buffer via sceSifAllocIopHeap (0x3A3920, runtime stub) of
+  bufmax*2048+16 bytes, then loops on sceCdStInit(bufmax, bankmax, buf) until nonzero.
+  Runtime sceCdStInit returns 0 if any arg is 0 -> most likely the IOP alloc returned 0
+  (IOP reported only ~787KB free after modules). R5900 3-operand mult (rd write) verified correct.
+- Trace v3: logs 0x1895E0 args, every IOP heap alloc (size -> addr), and sceCdStInit args/result.

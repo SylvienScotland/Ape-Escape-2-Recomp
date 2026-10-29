@@ -123,6 +123,39 @@ namespace
                       << " -> 0x" << v0 << std::dec << " data=" << ape2_hex(rdram, v0) << std::endl;
     }
 
+    // Movie stream setup (boot 6 hang): 0x1895E0(path=a0, a1, a2, a3) allocates an IOP stream buffer
+    // with sceSifAllocIopHeap(0x3A3920) and loops on sceCdStInit(0x36EC18) until it returns nonzero.
+    void trace_1895E0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t calls = 0;
+        if (calls++ < 8u)
+            std::cerr << "[ape2:movie] open a0=0x" << std::hex << GPR_U32(ctx, 4) << " '" << ape2_rdName(rdram, GPR_U32(ctx, 4), 40)
+                      << "' a1=0x" << GPR_U32(ctx, 5) << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                      << " ra=0x" << GPR_U32(ctx, 31) << std::dec << std::endl;
+        sub_001895E0_0x1895e0(rdram, ctx, runtime);
+    }
+
+    void trace_3A3920(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t calls = 0;
+        const uint32_t size = GPR_U32(ctx, 4), ra = GPR_U32(ctx, 31);
+        sub_003A3920_0x3a3920(rdram, ctx, runtime);
+        if (calls++ < 32u)
+            std::cerr << "[ape2:iopheap] alloc size=0x" << std::hex << size << " (" << std::dec << size << ") -> 0x"
+                      << std::hex << GPR_U32(ctx, 2) << " ra=0x" << ra << std::dec << std::endl;
+    }
+
+    void trace_36EC18(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t calls = 0;
+        const uint32_t a0 = GPR_U32(ctx, 4), a1 = GPR_U32(ctx, 5), a2 = GPR_U32(ctx, 6);
+        sub_0036EC18_0x36ec18(rdram, ctx, runtime);
+        const uint32_t n = calls++;
+        if (n < 8u || (n % 100000u) == 0u)
+            std::cerr << "[ape2:stinit] #" << n << " bufmax=0x" << std::hex << a0 << " bankmax=0x" << a1 << " iop_buf=0x" << a2
+                      << " -> " << std::dec << static_cast<int32_t>(GPR_U32(ctx, 2)) << std::endl;
+    }
+
     void trace_18CA50(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::cerr << "[ape2:handlers] enter 0x18CA50 ra=0x" << std::hex << GPR_U32(ctx, 31) << std::dec << std::endl;
@@ -181,6 +214,9 @@ namespace
         runtime.registerFunction(0x001929E8u, trace_1929E8);
         runtime.registerFunction(0x0036E668u, trace_36E668);
         runtime.registerFunction(0x001A28D8u, trace_1A28D8);
+        runtime.registerFunction(0x001895E0u, trace_1895E0);
+        runtime.registerFunction(0x003A3920u, trace_3A3920);
+        runtime.registerFunction(0x0036EC18u, trace_36EC18);
         std::cerr << "[ape2:handlers] trace override installed" << std::endl;
     }
 }
