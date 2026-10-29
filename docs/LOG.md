@@ -123,3 +123,14 @@
   iop_memory.h is ps2xIOP-internal (not in the runner PCH), so cheap to rebuild.
 - Fix 2: overrides/zz_ape2_iopheap.cpp: if the movie-buffer alloc (ra 0x189680) still fails, return a
   placeholder 0x200000. Runtime sceCdSt* is HLE and only checks buf != 0; it never touches that buffer.
+
+## Boot 7: movie streaming starts, MPEG RAW8 unsupported
+- IOP max free now 1527168 (was 806272); all sound-bank IOP allocs succeed; movie buffer -> placeholder;
+  sceCdStInit OK first try; sceCdStStart(lbn 0x100017, 384-sector buffer); MPEG stream opened.
+- Abort: "Unimplemented PS2 stub called: sceMpegGetPictureRAW8" from the movie thread (0x1A9118).
+  Game decodes to RAW8 macroblocks and colour-converts on the IPU; runtime has neither RAW8 output
+  nor IPU CSC (FFmpeg path decodes to RGBA for sceMpegGetPicture only).
+- Movie thread: caller 0x1A4B78 opens d1.pss, CreateThread(0x1A4B08), StartThread. Decode loop 0x1A9118:
+  RAW8 result checked with bgez; loop exits when 0x3702F0 (unnamed sceMpegIsEnd: *(*(mp+0x40))) != 0.
+- Temporary: overrides/zz_ape2_skipfmv.cpp: RAW8 returns 0 and marks skip; IsEnd returns 1 once.
+  Proper fix later: RAW8 output from FFmpeg frames (YCbCr macroblocks) + IPU CSC in the runtime.
