@@ -21,6 +21,7 @@ patch_cache = true
 
 # Functions to stub (only names with runtime syscall/stub handlers)
 stubs = [
+  "sceCdDiskReady@0x0036E3A8", # unnamed by SCE DB; identified by hand (mode arg, returns 2/6, binds CD RPC 0x8000059A)
   "__ieee754_rem_pio2f@0x00368CF0",
   "__kernel_cosf@0x00369490",
   "__kernel_sinf@0x00369E48",

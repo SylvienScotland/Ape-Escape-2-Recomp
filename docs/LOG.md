@@ -42,3 +42,15 @@
 - Fix: patches/ps2recomp/0001-cd-strip-repeated-iso-version-suffix.patch (accept ';' in the suffix).
   build_windows.ps1 now applies patches/ps2recomp/*.patch idempotently after checkout.
   Worth upstreaming to ran-j/PS2Recomp.
+
+## Boot 3: files found, IOP modules up, first GS writes; stuck in CD RPC bind
+- FILEMAP.DAT;1;1 and SARU2.MM now resolve (patch 0001 works). IOP printf output visible, first GIF/GS reg writes.
+- Hang at 0x36e448 inside sub_0036E3A8: SifBindRpc(0x8000059A) retry loop. Runtime has no IOP server
+  for that SID (CDVDFSV lives in BIOS ROM; HLE routes only cover mcserv/libsd/dbcman), so bind never completes.
+- 0x36E3A8 was unnamed by the SCE DB. Identified as sceCdDiskReady: called with mode 0 before every
+  sceCdSearchFile in the game's file wrapper (0x187B00), returns 2/6, treats mode 8 as non-blocking.
+- Fix: stubs += "sceCdDiskReady@0x0036E3A8" (runtime returns 2 = ready).
+- Audit of other functions that call sceSifBindRpc directly:
+  0x36DC40 (sid 0x80000595, CD N-cmd) and 0x36DF58 (0x80000593, CD S-cmd): no direct callers, only
+  reached via stubbed sceCd*. 0x36BC00 sceDbcInit, 0x3A3B98 _lf_bind (loadfile), 0x1A1CD8 (game, ..6D69),
+  0x37C2B0 (unnamed, ..646E): watch these if the next hang is in a bind loop.
