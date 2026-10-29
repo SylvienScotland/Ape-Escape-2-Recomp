@@ -14,3 +14,5 @@
 - Syntax check vs runtime headers: 40/40 random sample OK; full pass hit timeout at 685/8471, 0 failures.
   Needed include dirs: ps2xRuntime/include, ps2xRuntime/src/lib/Kernel, ps2xIOP include, raylib/src.
 - Next: Ghidra function export for better boundaries; full compile + link on a desktop machine.
+- Ghidra: can't install in the cloud workspace (GitHub release downloads blocked by egress policy).
+  Plan: run Ghidra + ExportPS2Functions.java on the desktop, commit the exported TOML/CSV to config/.
