@@ -135,16 +135,6 @@ namespace
         sub_001895E0_0x1895e0(rdram, ctx, runtime);
     }
 
-    void trace_3A3920(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        static uint32_t calls = 0;
-        const uint32_t size = GPR_U32(ctx, 4), ra = GPR_U32(ctx, 31);
-        sub_003A3920_0x3a3920(rdram, ctx, runtime);
-        if (calls++ < 32u)
-            std::cerr << "[ape2:iopheap] alloc size=0x" << std::hex << size << " (" << std::dec << size << ") -> 0x"
-                      << std::hex << GPR_U32(ctx, 2) << " ra=0x" << ra << std::dec << std::endl;
-    }
-
     void trace_36EC18(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static uint32_t calls = 0;
@@ -215,7 +205,6 @@ namespace
         runtime.registerFunction(0x0036E668u, trace_36E668);
         runtime.registerFunction(0x001A28D8u, trace_1A28D8);
         runtime.registerFunction(0x001895E0u, trace_1895E0);
-        runtime.registerFunction(0x003A3920u, trace_3A3920);
         runtime.registerFunction(0x0036EC18u, trace_36EC18);
         std::cerr << "[ape2:handlers] trace override installed" << std::endl;
     }

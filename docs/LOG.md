@@ -113,3 +113,13 @@
   Runtime sceCdStInit returns 0 if any arg is 0 -> most likely the IOP alloc returned 0
   (IOP reported only ~787KB free after modules). R5900 3-operand mult (rd write) verified correct.
 - Trace v3: logs 0x1895E0 args, every IOP heap alloc (size -> addr), and sceCdStInit args/result.
+- Trace v3 result: movie open('cdrom0:/APE2_USA\movie/d1.pss', 0x20, 0xc, 1) asks the IOP heap for
+  0xC0010 (768KB) -> 0. sceCdStInit(0x180, 0xc, 0) then fails ~18M times (the "slow crawl").
+  Earlier during boot two sound-bank IOP allocs also failed (0x1BA10, 0x6000).
+- Cause: emulated IOP uses a fixed layout: modules below IopMemory::HeapBase=0x120000, heap
+  0x120000-0x1F0000 (~832KB). Game modules end ~0x52000, so ~800KB is never usable.
+  Game wants ~1.7MB of IOP heap in total (sound banks ~920KB + movie buffer 768KB).
+- Fix 1: patches/ps2recomp/0002-iop-lower-heap-base.patch: HeapBase 0x120000 -> 0x70000 (~1.5MB heap).
+  iop_memory.h is ps2xIOP-internal (not in the runner PCH), so cheap to rebuild.
+- Fix 2: overrides/zz_ape2_iopheap.cpp: if the movie-buffer alloc (ra 0x189680) still fails, return a
+  placeholder 0x200000. Runtime sceCdSt* is HLE and only checks buf != 0; it never touches that buffer.
