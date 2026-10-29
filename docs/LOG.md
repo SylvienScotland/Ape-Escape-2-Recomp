@@ -142,3 +142,14 @@
   +0x8 write idx; 0x1AA508 push: count++, slot state 3; slots 0x40540 bytes). The skipped empty frame was
   still pushed, never colour-converted, so never consumed -> count stays 1 -> main waits forever.
 - Fix: skip override also zeroes +0xC and +0x8 when it reports the movie ended (same as 0x1AA4E0).
+
+## Boot 9: IN-ENGINE 3D INTRO RENDERS
+- Movie skip + frame-queue clear works: movie thread exits (activeThreads back to 2), game moves on into
+  the in-engine 3D intro (radial speed lines / zoom). Real geometry, textures, blending. No errors.
+- Very slow: DMA counter ~1 per 120-tick log line (was ~24 during boot screens) -> roughly a frame every ~2s.
+  Hot PCs spread over game code (0x208B60, 0x353320, 0x29E928, 0x349440, 0x1C3430...).
+- Not logging: boot.log stays tiny (logs are capped). Suspects: CPU-only GS backend (only gs_cpu_backend
+  exists) rasterizing full-screen 3D, VU1 microcode execution, RelWithDebInfo build.
+- Visual: picture shows 512x512 FB region with a duplicated band at the bottom (display rect vs 640x448),
+  washed-out colors; earlier text looked doubled (likely interlace/field presentation).
+- Next: per-frame timing instrumentation (EE vs GS backend vs VU) before optimizing anything.

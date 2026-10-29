@@ -5,6 +5,6 @@ Static recompilation of Ape Escape 2 (PS2, USA) to native PC using
 
 Contains no game data. You must supply your own legally dumped disc.
 
-Status: boots to the memory card check and the "presents" screen (milestone 5). See docs/LOG.md.
+Status: boots through memory card check, presents screen and (skipped) intro movie into the in-engine 3D intro; very slow. See docs/LOG.md.
 
 Ape Escape is copyright Sony Interactive Entertainment.
