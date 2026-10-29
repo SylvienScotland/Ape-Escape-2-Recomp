@@ -83,6 +83,46 @@ namespace
         }
     }
 
+    std::string ape2_hex(const uint8_t *rdram, uint32_t addr, uint32_t len = 32)
+    {
+        if (addr == 0u || (addr & 0x01FFFFFFu) + len > 0x02000000u)
+            return "<bad ptr>";
+        std::ostringstream o;
+        o << std::hex;
+        for (uint32_t i = 0; i < len; ++i)
+        {
+            const unsigned b = rdram[(addr + i) & 0x01FFFFFFu];
+            o << (i ? (i % 4 ? "" : " ") : "") << (b < 16 ? "0" : "") << b;
+        }
+        return o.str();
+    }
+
+    // sceCdRead(lbn=a0, sectors=a1, buf=a2, mode=a3): runtime stub, synchronous.
+    void trace_36E668(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t calls = 0;
+        const uint32_t lbn = GPR_U32(ctx, 4), sectors = GPR_U32(ctx, 5), buf = GPR_U32(ctx, 6), mode = GPR_U32(ctx, 7);
+        const uint32_t ra = GPR_U32(ctx, 31);
+        sub_0036E668_0x36e668(rdram, ctx, runtime);
+        if (calls++ < 64u)
+            std::cerr << "[ape2:cdread] lbn=0x" << std::hex << lbn << " sectors=0x" << sectors << " buf=0x" << buf
+                      << " mode=0x" << mode << " ra=0x" << ra << " ret=" << std::dec << static_cast<int32_t>(GPR_U32(ctx, 2))
+                      << " data=" << ape2_hex(rdram, buf) << std::endl;
+    }
+
+    // 0x1A28D8(name): finds a loaded file's data by name (used for "FILEMAP.DAT").
+    void trace_1A28D8(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static uint32_t calls = 0;
+        const uint32_t namePtr = GPR_U32(ctx, 4);
+        const uint32_t base = ape2_rd32(rdram, GPR_U32(ctx, 28) - 0x454u);
+        sub_001A28D8_0x1a28d8(rdram, ctx, runtime);
+        const uint32_t v0 = GPR_U32(ctx, 2);
+        if (calls++ < 64u)
+            std::cerr << "[ape2:lookup] '" << ape2_rdName(rdram, namePtr, 32) << "' base[gp-0x454]=0x" << std::hex << base
+                      << " -> 0x" << v0 << std::dec << " data=" << ape2_hex(rdram, v0) << std::endl;
+    }
+
     void trace_18CA50(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         std::cerr << "[ape2:handlers] enter 0x18CA50 ra=0x" << std::hex << GPR_U32(ctx, 31) << std::dec << std::endl;
@@ -94,6 +134,9 @@ namespace
     {
         std::cerr << "[ape2:handlers] table init 0x192618" << std::endl;
         sub_00192618_0x192618(rdram, ctx, runtime);
+        const uint32_t fmap = ape2_rd32(rdram, GPR_U32(ctx, 28) + 0x1778u);
+        std::cerr << "[ape2:handlers] FILEMAP data ptr [gp+0x1778]=0x" << std::hex << fmap << std::dec
+                  << " bytes=" << ape2_hex(rdram, fmap, 96) << std::endl;
         ape2_dumpTable(rdram, ctx, "after init");
     }
 
@@ -136,6 +179,8 @@ namespace
         runtime.registerFunction(0x00192618u, trace_192618);
         runtime.registerFunction(0x00192728u, trace_192728);
         runtime.registerFunction(0x001929E8u, trace_1929E8);
+        runtime.registerFunction(0x0036E668u, trace_36E668);
+        runtime.registerFunction(0x001A28D8u, trace_1A28D8);
         std::cerr << "[ape2:handlers] trace override installed" << std::endl;
     }
 }
