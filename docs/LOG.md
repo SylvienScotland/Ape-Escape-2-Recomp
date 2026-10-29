@@ -160,3 +160,9 @@
   gs-front (GS::processGIFPacket minus raster), vu1 (VU1Interpreter::execute/run), vif1 (processVIF1Data).
   Frames counted in GS::latchHostPresentationFrame. Prints "[perf] ..." to stderr every ~2s;
   "other" = wall time outside all zones (EE game code, scheduling, waits).
+- First perf results (boot screens): 9-22 fps, gs-raster ~86% with only ~800 draws/2s (~2ms per draw:
+  large 2D sprites, slow per-pixel path). 3D intro: ~1 frame per 6-7s; per 2-3s window either
+  {~38k draws, raster ~23%, vu1 ~17%, other ~60%} or {other ~99%}. Most 3D time is outside all zones.
+- patches/ps2recomp/0004-perf-ee-wait-zone.patch: new zone ee-wait around EeScheduler pacing / idle
+  waits, so "other" = EE game code + runtime overhead only. Build script now records applied patches in
+  PS2Recomp/.ape2_patches_applied (0004 edits a file 0003 creates, which breaks reverse-check detection).

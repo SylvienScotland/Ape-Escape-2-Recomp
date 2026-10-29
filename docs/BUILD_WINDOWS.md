@@ -37,3 +37,7 @@ The runner is a unity build (batches of 32 files, alphabetical) with a precompil
 - Editing an existing override file = one batch + link.
 Rules: name NEW override files `zz_*.cpp` so they sort last; never rename existing ones; avoid
 runtime patches that touch PCH headers unless needed.
+
+## PS2Recomp patches
+`patches/ps2recomp/*.patch` are applied in name order by the build script. Applied ones are recorded
+in `PS2Recomp/.ape2_patches_applied`. If you ever reset or re-clone PS2Recomp, delete that file too.

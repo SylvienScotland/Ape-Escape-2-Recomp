@@ -1,0 +1,69 @@
+--- a/ps2xRuntime/src/lib/ps2_perf.h
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -4,7 +4,7 @@
+ // percentages add up (VIF1 -> VU1 -> XGKICK -> GS front-end -> GS raster all nest).
+ // Every ~2 s of wall time one line is printed to stderr:
+ //   [perf] 2.00s | frames 3 (1.5/s) | gs-raster 61% (n=...) | gs-front 9% | vu1 18% | vif1 2% | other 10%
+-// "other" = wall time not inside any zone: EE game code, scheduling, waits.
++// "other" = wall time not inside any zone: EE game code and runtime overhead (waits are ee-wait).
+ // Header-only and private to src/lib (not part of the runner PCH) so it is cheap to change.
+ #pragma once
+ 
+@@ -22,12 +22,13 @@
+         GsFront,
+         Vu1,
+         Vif1,
++        EeWait, // scheduler pacing / idle waits (EeScheduler)
+         ZoneCount
+     };
+ 
+     inline const char *zoneName(int z)
+     {
+-        static const char *const names[ZoneCount] = {"gs-raster", "gs-front", "vu1", "vif1"};
++        static const char *const names[ZoneCount] = {"gs-raster", "gs-front", "vu1", "vif1", "ee-wait"};
+         return (z >= 0 && z < ZoneCount) ? names[z] : "?";
+     }
+ 
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -8,6 +8,7 @@
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
++#include "../ps2_perf.h"
+ 
+ namespace
+ {
+@@ -1800,6 +1801,7 @@
+ 
+             if (now < pacingDeadline)
+             {
++                ps2perf::Scope perfWait(ps2perf::EeWait);
+                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                      { return !m_events.empty() ||
+                                               m_stopRequested.load(std::memory_order_acquire); });
+@@ -2005,6 +2007,7 @@
+     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
+     if (m_deadlines.empty() && !hasTimerDeadline)
+     {
++        ps2perf::Scope perfWait(ps2perf::EeWait);
+         m_eventCv.wait(lock, [this]()
+                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
+         return;
+@@ -2036,9 +2039,13 @@
+         }
+     }
+ 
+-    const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
+-                                               { return !m_events.empty() ||
+-                                                        m_stopRequested.load(std::memory_order_acquire); });
++    bool signaled = false;
++    {
++        ps2perf::Scope perfWaitDeadline(ps2perf::EeWait);
++        signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
++                                        { return !m_events.empty() ||
++                                                 m_stopRequested.load(std::memory_order_acquire); });
++    }
+     if (!signaled)
+     {
+         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;

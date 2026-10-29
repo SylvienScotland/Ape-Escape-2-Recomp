@@ -48,16 +48,27 @@ if (-not $RunOnly) {
     git -C $Ps2RecompDir checkout --quiet $Ps2RecompCommit
     git -C $Ps2RecompDir submodule update --init --recursive
 
-    # Our fixes to PS2Recomp, kept as patches in this repo (idempotent: skip if already applied)
+    # Our fixes to PS2Recomp, kept as patches in this repo. Applied patches are recorded in a marker
+    # file because later patches can edit files earlier ones created (then a reverse-check of the
+    # earlier patch no longer matches). Reverse-check is only the fallback for clones without a marker.
+    $Marker = Join-Path $Ps2RecompDir ".ape2_patches_applied"
+    $appliedList = @()
+    if (Test-Path $Marker) { $appliedList = @(Get-Content $Marker) }
     foreach ($p in Get-ChildItem "$Repo\patches\ps2recomp\*.patch" -ErrorAction SilentlyContinue | Sort-Object Name) {
+        if ($appliedList -contains $p.Name) { Write-Host "patch already applied: $($p.Name)"; continue }
         $ErrorActionPreference = "Continue"
         git -C $Ps2RecompDir apply --reverse --check $p.FullName 2>$null
         $already = ($LASTEXITCODE -eq 0)
         $ErrorActionPreference = "Stop"
-        if ($already) { Write-Host "patch already applied: $($p.Name)"; continue }
-        git -C $Ps2RecompDir apply $p.FullName
-        if ($LASTEXITCODE -ne 0) { throw "Failed to apply $($p.Name)" }
-        Write-Host "applied patch: $($p.Name)"
+        if (-not $already) {
+            git -C $Ps2RecompDir apply $p.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Failed to apply $($p.Name)" }
+            Write-Host "applied patch: $($p.Name)"
+        } else {
+            Write-Host "patch already applied: $($p.Name)"
+        }
+        Add-Content -Path $Marker -Value $p.Name
+        $appliedList += $p.Name
     }
 }
 $Ps2RecompDir = (Resolve-Path $Ps2RecompDir).Path
