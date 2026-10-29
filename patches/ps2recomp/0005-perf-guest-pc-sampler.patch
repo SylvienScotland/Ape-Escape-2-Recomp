@@ -1,0 +1,86 @@
+--- a/ps2xRuntime/src/lib/ps2_perf.h
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -8,11 +8,16 @@
+ // Header-only and private to src/lib (not part of the runner PCH) so it is cheap to change.
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+ #include <mutex>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
+ 
+ namespace ps2perf
+ {
+@@ -144,6 +149,56 @@
+         Frame m_frame;
+     };
+ 
++    // ---- guest PC sampler -------------------------------------------------------------
++    // The scheduler publishes &context.pc of the guest thread it is about to run; generated code
++    // writes ctx->pc before every instruction, so sampling that word ~every 1ms gives a histogram
++    // of where guest time goes. Racy by design (a stale pointer after a thread switch only adds
++    // noise). Every ~2s prints the hottest PCs:  [perf:pc] 0x1a90d8 31% | 0x19bd34 12% | ...
++    inline std::atomic<const uint32_t *> g_activePc{nullptr};
++
++    inline void samplerMain()
++    {
++        std::unordered_map<uint32_t, uint32_t> hist;
++        uint32_t total = 0;
++        auto next = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++        for (;;)
++        {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            const uint32_t *p = g_activePc.load(std::memory_order_relaxed);
++            if (p)
++            {
++                const uint32_t pc = *reinterpret_cast<const volatile uint32_t *>(p);
++                ++hist[pc];
++                ++total;
++            }
++            if (std::chrono::steady_clock::now() < next)
++                continue;
++            next += std::chrono::seconds(2);
++            if (total == 0)
++                continue;
++            std::vector<std::pair<uint32_t, uint32_t>> rows(hist.begin(), hist.end());
++            const size_t topN = rows.size() < 12 ? rows.size() : 12;
++            std::partial_sort(rows.begin(), rows.begin() + topN, rows.end(),
++                              [](const auto &a, const auto &b) { return a.second > b.second; });
++            char line[640];
++            int len = std::snprintf(line, sizeof(line), "[perf:pc] samples=%u", total);
++            for (size_t i = 0; i < topN && len < static_cast<int>(sizeof(line)) - 32; ++i)
++                len += std::snprintf(line + len, sizeof(line) - len, " | 0x%06x %.0f%%", rows[i].first,
++                                     100.0 * rows[i].second / total);
++            std::fprintf(stderr, "%s\n", line);
++            std::fflush(stderr);
++            hist.clear();
++            total = 0;
++        }
++    }
++
++    inline void publishActivePc(const uint32_t *pcWord)
++    {
++        g_activePc.store(pcWord, std::memory_order_relaxed);
++        static std::once_flag started;
++        std::call_once(started, [] { std::thread(samplerMain).detach(); });
++    }
++
+     inline void countFrame()
+     {
+         g_frames.fetch_add(1, std::memory_order_relaxed);
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -2123,6 +2123,7 @@
+ void EeScheduler::publishDebugContext(const R5900Context &context)
+ {
+     m_runtime.m_debugPc.store(context.pc, std::memory_order_relaxed);
++    ps2perf::publishActivePc(&context.pc);
+     m_runtime.m_debugRa.store(getRegU32(&context, 31), std::memory_order_relaxed);
+     m_runtime.m_debugSp.store(getRegU32(&context, 29), std::memory_order_relaxed);
+     m_runtime.m_debugGp.store(getRegU32(&context, 28), std::memory_order_relaxed);

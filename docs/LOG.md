@@ -166,3 +166,9 @@
 - patches/ps2recomp/0004-perf-ee-wait-zone.patch: new zone ee-wait around EeScheduler pacing / idle
   waits, so "other" = EE game code + runtime overhead only. Build script now records applied patches in
   PS2Recomp/.ape2_patches_applied (0004 edits a file 0003 creates, which breaks reverse-check detection).
+- ee-wait result: ~0% everywhere. "other" is real CPU time (EE game code / runtime helpers). 3D intro
+  alternates {38k draws, raster ~22%, vu1 ~16%, other ~62%} and {nothing drawn, other ~99%},
+  ~7s per frame. Suspect a guest busy-wait (polling a HW register/flag) that completes slowly here.
+- patches/ps2recomp/0005-perf-guest-pc-sampler.patch: EeScheduler::publishDebugContext publishes &context.pc
+  (generated code writes ctx->pc before every instruction); a detached sampler thread reads it every ~1ms
+  and prints the top 12 guest PCs every ~2s as "[perf:pc] ...".
