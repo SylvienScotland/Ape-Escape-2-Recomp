@@ -54,3 +54,16 @@
   0x36DC40 (sid 0x80000595, CD N-cmd) and 0x36DF58 (0x80000593, CD S-cmd): no direct callers, only
   reached via stubbed sceCd*. 0x36BC00 sceDbcInit, 0x3A3B98 _lf_bind (loadfile), 0x1A1CD8 (game, ..6D69),
   0x37C2B0 (unnamed, ..646E): watch these if the next hang is in a bind loop.
+
+## Boot 4: past disc checks, null handler call
+- All 10 IRX modules load from disc (SIO2MAN, MCMAN, MCSERV, DBCMAN, SIO2D, DS1O x2, LIBSD, SNDN2DRV, IOPMISC).
+- File table probe finds all movies/BGM/demo PCM. PUB.PSS / UBILOGO.PSS missing (PAL publisher logos), harmless.
+- Second thread starts; it sits in sceMc state machine (0x378AE8, real SDK code).
+- Main thread: [guest-branch:missing-target] JALR at 0x192a6c target=0 inside 0x1929E8.
+  0x1929E8 walks an ordered list (built by 0x192840), reads entry type at +0x59, calls
+  handler table 0x53B840[type].fn (+0x10). Table is .bss, 32-byte slots, 16-byte name key at +0.
+  0x192618 = init (clears fn), 0x192728 = register(name, fn): key = 0x1A41B0(name) (128-bit),
+  binds fn to the slot whose key matches (lq/pceqw/ppach/nor). Only caller of both: 0x18CA50.
+- Checked MMI translation (POR/PCEQW/PPACH, operand order): correct.
+- Next: overrides/ape2_trace_handlers.cpp logs init, every register (name, fn, slot count, bound?),
+  and the table on the first runner call, to see if registration never runs, count=0, or keys never match.
