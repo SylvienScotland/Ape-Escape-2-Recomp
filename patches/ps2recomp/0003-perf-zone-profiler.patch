@@ -1,0 +1,243 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9281d5f..07f8935 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
++#include "../ps2_perf.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+ #include <algorithm>
+@@ -526,6 +527,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+ 
+ void GS::latchHostPresentationFrame()
+ {
++    ps2perf::countFrame();
+     GSPresentationRequest request{};
+     {
+         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+@@ -640,6 +642,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2perf::Scope perfScope(ps2perf::GsFront);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+@@ -1577,7 +1580,10 @@ void GS::vertexKick(bool drawing)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+         updatePreferredDisplaySourceForDraw(batch);
+-        m_backend->Submit(batch);
++        {
++            ps2perf::Scope perfRaster(ps2perf::GsRaster);
++            m_backend->Submit(batch);
++        }
+         recordDrawDebugEventUnlocked(needed);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_perf.h b/ps2xRuntime/src/lib/ps2_perf.h
+new file mode 100644
+index 0000000..4811b6a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -0,0 +1,151 @@
++// Lightweight per-zone profiler (Ape Escape 2 recomp patch).
++//
++// Exclusive timing: time spent in a nested zone is not counted again for its parent, so the
++// percentages add up (VIF1 -> VU1 -> XGKICK -> GS front-end -> GS raster all nest).
++// Every ~2 s of wall time one line is printed to stderr:
++//   [perf] 2.00s | frames 3 (1.5/s) | gs-raster 61% (n=...) | gs-front 9% | vu1 18% | vif1 2% | other 10%
++// "other" = wall time not inside any zone: EE game code, scheduling, waits.
++// Header-only and private to src/lib (not part of the runner PCH) so it is cheap to change.
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <mutex>
++
++namespace ps2perf
++{
++    enum Zone : int
++    {
++        GsRaster = 0,
++        GsFront,
++        Vu1,
++        Vif1,
++        ZoneCount
++    };
++
++    inline const char *zoneName(int z)
++    {
++        static const char *const names[ZoneCount] = {"gs-raster", "gs-front", "vu1", "vif1"};
++        return (z >= 0 && z < ZoneCount) ? names[z] : "?";
++    }
++
++    inline std::atomic<uint64_t> g_ns[ZoneCount]{};
++    inline std::atomic<uint64_t> g_calls[ZoneCount]{};
++    inline std::atomic<uint64_t> g_frames{0};
++    inline std::atomic<int64_t> g_nextReportNs{0};
++
++    inline int64_t nowNs()
++    {
++        return std::chrono::duration_cast<std::chrono::nanoseconds>(
++                   std::chrono::steady_clock::now().time_since_epoch())
++            .count();
++    }
++
++    inline void maybeReport(int64_t now)
++    {
++        constexpr int64_t kIntervalNs = 2'000'000'000;
++        int64_t due = g_nextReportNs.load(std::memory_order_relaxed);
++        if (due == 0)
++        {
++            g_nextReportNs.compare_exchange_strong(due, now + kIntervalNs);
++            return;
++        }
++        if (now < due)
++            return;
++
++        static std::mutex mtx;
++        std::unique_lock<std::mutex> lock(mtx, std::try_to_lock);
++        if (!lock.owns_lock())
++            return;
++        due = g_nextReportNs.load();
++        if (now < due)
++            return;
++
++        static int64_t lastNow = now - kIntervalNs;
++        static uint64_t lastNs[ZoneCount]{};
++        static uint64_t lastCalls[ZoneCount]{};
++        static uint64_t lastFrames = 0;
++
++        const double wall = static_cast<double>(now - lastNow);
++        const uint64_t frames = g_frames.load() - lastFrames;
++        char line[512];
++        int len = std::snprintf(line, sizeof(line), "[perf] %.2fs | frames %llu (%.1f/s)", wall / 1e9,
++                                static_cast<unsigned long long>(frames), wall > 0 ? frames * 1e9 / wall : 0.0);
++        double inside = 0.0;
++        for (int z = 0; z < ZoneCount; ++z)
++        {
++            const uint64_t ns = g_ns[z].load();
++            const uint64_t calls = g_calls[z].load();
++            const double d = static_cast<double>(ns - lastNs[z]);
++            inside += d;
++            len += std::snprintf(line + len, sizeof(line) - len, " | %s %.0f%% (n=%llu)", zoneName(z),
++                                 wall > 0 ? 100.0 * d / wall : 0.0,
++                                 static_cast<unsigned long long>(calls - lastCalls[z]));
++            lastNs[z] = ns;
++            lastCalls[z] = calls;
++            if (len >= static_cast<int>(sizeof(line)))
++                break;
++        }
++        if (len < static_cast<int>(sizeof(line)))
++            std::snprintf(line + len, sizeof(line) - len, " | other %.0f%%",
++                          wall > 0 ? 100.0 * (wall - inside) / wall : 0.0);
++        std::fprintf(stderr, "%s\n", line);
++        std::fflush(stderr);
++
++        lastNow = now;
++        lastFrames = g_frames.load();
++        g_nextReportNs.store(now + kIntervalNs);
++    }
++
++    struct Frame
++    {
++        int zone;
++        int64_t start;
++        int64_t childNs;
++        Frame *parent;
++    };
++
++    inline thread_local Frame *t_top = nullptr;
++
++    class Scope
++    {
++    public:
++        explicit Scope(Zone zone)
++        {
++            m_frame.zone = zone;
++            m_frame.start = nowNs();
++            m_frame.childNs = 0;
++            m_frame.parent = t_top;
++            t_top = &m_frame;
++            g_calls[zone].fetch_add(1, std::memory_order_relaxed);
++        }
++
++        ~Scope()
++        {
++            const int64_t end = nowNs();
++            const int64_t total = end - m_frame.start;
++            int64_t exclusive = total - m_frame.childNs;
++            if (exclusive < 0)
++                exclusive = 0;
++            g_ns[m_frame.zone].fetch_add(static_cast<uint64_t>(exclusive), std::memory_order_relaxed);
++            t_top = m_frame.parent;
++            if (t_top)
++                t_top->childNs += total;
++            maybeReport(end);
++        }
++
++        Scope(const Scope &) = delete;
++        Scope &operator=(const Scope &) = delete;
++
++    private:
++        Frame m_frame;
++    };
++
++    inline void countFrame()
++    {
++        g_frames.fetch_add(1, std::memory_order_relaxed);
++        maybeReport(nowNs());
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f872edd..7397f69 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,4 +1,5 @@
+ // Based on Blackline Interactive implementation
++#include "ps2_perf.h"
+ #include "runtime/ps2_memory.h"
+ #include <cstring>
+ 
+@@ -297,6 +298,7 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    ps2perf::Scope perfScope(ps2perf::Vif1);
+     if (sizeBytes == 0u)
+         return;
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f19e281..df60c49 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
++#include "../ps2_perf.h"
+ 
+ #include <algorithm>
+ #include <cfenv>
+@@ -1590,6 +1591,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+                              uint32_t startPC, uint32_t top, uint32_t itop,
+                              uint32_t maxCycles)
+ {
++    ps2perf::Scope perfScope(ps2perf::Vu1);
+     resetScheduler();
+     m_state.pc = startPC & microAddressMask();
+     m_state.ebit = false;
+@@ -1624,6 +1626,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    ps2perf::Scope perfScope(ps2perf::Vu1);
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;

@@ -153,3 +153,10 @@
 - Visual: picture shows 512x512 FB region with a duplicated band at the bottom (display rect vs 640x448),
   washed-out colors; earlier text looked doubled (likely interlace/field presentation).
 - Next: per-frame timing instrumentation (EE vs GS backend vs VU) before optimizing anything.
+
+## Perf instrumentation
+- patches/ps2recomp/0003-perf-zone-profiler.patch: header-only exclusive-time profiler (src/lib/ps2_perf.h,
+  not in the runner PCH). Zones: gs-raster (GSCpuBackend::Submit, synchronous DrawPrimitive),
+  gs-front (GS::processGIFPacket minus raster), vu1 (VU1Interpreter::execute/run), vif1 (processVIF1Data).
+  Frames counted in GS::latchHostPresentationFrame. Prints "[perf] ..." to stderr every ~2s;
+  "other" = wall time outside all zones (EE game code, scheduling, waits).
