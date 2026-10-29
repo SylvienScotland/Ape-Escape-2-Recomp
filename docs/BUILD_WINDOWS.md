@@ -29,3 +29,11 @@ Re-runs: add `-SkipToolBuild -SkipRecomp` to only rebuild and boot. Use `-NoRun`
 ## What to send back
 - If the build fails: the first ~30 lines that contain `error`.
 - If it boots (or crashes): `boot.log`, or its last ~300 lines if it's huge.
+
+## Why some rebuilds take forever
+The runner is a unity build (batches of 32 files, alphabetical) with a precompiled header.
+- Changing anything in the PCH (ps2_runtime*.h, ps2_stubs.h and what they include) = full rebuild.
+- Adding/removing a .cpp in src/runner shifts every batch after it = rebuild of those batches.
+- Editing an existing override file = one batch + link.
+Rules: name NEW override files `zz_*.cpp` so they sort last; never rename existing ones; avoid
+runtime patches that touch PCH headers unless needed.
