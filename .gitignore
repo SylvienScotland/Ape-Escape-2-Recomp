@@ -1,0 +1,11 @@
+# Never commit game data or anything generated from it
+game/*
+!game/README.md
+generated/
+*.iso
+*.bin
+*.elf
+SCUS_*
+SLUS_*
+build/
+out/

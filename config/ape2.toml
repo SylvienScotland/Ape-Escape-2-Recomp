@@ -1,0 +1,16 @@
+# PS2Recomp config for Ape Escape 2 (USA).
+# Phase 1 bring-up: start from the analyzer/Ghidra export, then hand-tune here.
+[general]
+input = "game/MAIN.ELF"            # rename to the real SCUS_xxx.xx once dumped
+ghidra_output = "config/ape2_functions.csv"
+output = "generated"
+single_file_output = false
+output_worker_threads = 0
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+stubs = []
+skip = []
+
+[patches]
+instructions = []
