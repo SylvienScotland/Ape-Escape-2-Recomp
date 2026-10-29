@@ -10813,3 +10813,11 @@ critical = [
   "_kDebugException", # Uses SIMD instructions
 ]
 
+
+# Game heap: 0x1A3118 sizes the heap up to 0x1FA0000 (start of the 384KB stack), but the runtime
+# caps the guest heap at 0x1F00000 (it keeps RPC packets / callback stacks above that), so memalign
+# fails and every allocation is NULL. Clamp the game's heap end to 0x1F00000 (lui $v1,0x1FA -> 0x1F0).
+[patches]
+instructions = [
+  { address = "0x1a312c", value = "0x3c0301f0" },
+]

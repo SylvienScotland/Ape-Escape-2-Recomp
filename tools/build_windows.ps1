@@ -86,10 +86,24 @@ if (-not $RunOnly) {
 Step "Copying generated code into ps2xRuntime"
 $RunnerSrc = "$Ps2RecompDir\ps2xRuntime\src\runner"
 $RunnerInc = "$Ps2RecompDir\ps2xRuntime\include"
-Copy-Item "$Gen\*.cpp" $RunnerSrc -Force
-Copy-Item "$Gen\ps2_recompiled_functions.h", "$Gen\ps2_recompiled_stubs.h" $RunnerInc -Force
+# Only copy files whose contents changed. The recompiler rewrites every file on each run, and a
+# blanket copy would make MSBuild rebuild all ~8.5k files even when one function changed.
+function Copy-IfChanged($src, $dstDir) {
+    $dst = Join-Path $dstDir (Split-Path $src -Leaf)
+    if (Test-Path $dst) {
+        $a = Get-Item $src; $b = Get-Item $dst
+        if ($a.Length -eq $b.Length -and
+            (Get-FileHash $src -Algorithm MD5).Hash -eq (Get-FileHash $dst -Algorithm MD5).Hash) { return $false }
+    }
+    Copy-Item $src $dst -Force
+    return $true
+}
+$changed = 0
+foreach ($f in Get-ChildItem "$Gen\*.cpp") { if (Copy-IfChanged $f.FullName $RunnerSrc) { $changed++ } }
+foreach ($h in "ps2_recompiled_functions.h", "ps2_recompiled_stubs.h") { if (Copy-IfChanged "$Gen\$h" $RunnerInc) { $changed++; Write-Host "header changed: $h (expect a full rebuild)" } }
+Write-Host "generated files changed: $changed"
 # Game-specific overrides live in our repo
-Get-ChildItem "$Repo\overrides\*.cpp" -ErrorAction SilentlyContinue | Copy-Item -Destination $RunnerSrc -Force
+foreach ($o in Get-ChildItem "$Repo\overrides\*.cpp" -ErrorAction SilentlyContinue) { [void](Copy-IfChanged $o.FullName $RunnerSrc) }
 }
 
 # 5. Build the runner (this is the long one: ~8.5k generated files)

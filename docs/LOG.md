@@ -75,3 +75,14 @@
   0x187A80 via sceCdSearchFile + sceCdRead stub + sceCdSync), then sceCdSearchFile.
 - Trace v2: also logs every sceCdRead (lbn/sectors/buf/mode + first bytes), the FILEMAP.DAT lookup
   result, and the raw bytes the table init reads.
+- Trace v2 result: every sceCdRead has buf=0x0, and the heap handle [gp-0x454] is 0.
+- Root cause: game heap init 0x1A3118 sizes its heap from end-of-bss 0x619AD8 to 0x1FA0000
+  (bottom of a 384KB stack) and calls memalign(64, 0x1976528). The runtime caps the guest heap at
+  0x1F00000 (SetupHeap/EndOfHeap; it keeps kRpcPacketPoolBase and async callback stacks at 0x1F00000+),
+  so only 0x18E6520 is available -> memalign NULL -> allocator handle 0 -> every buffer NULL.
+- Fix (interim): instruction patch 0x1a312c lui $v1,0x1FA -> 0x1F0, so the game asks for
+  0x18D6528 (fits, ~64KB slack). Game gets 640KB less heap than on hardware.
+  Proper fix later: move runtime-internal regions out of 0x1F00000-0x1FA0000 (e.g. into the
+  kernel area below 0x100000) and let SetupHeap(-1) end at the main thread's stack base.
+- Recompiler output verified deterministic (only sub_001A3118 changed). build_windows.ps1 now
+  copies only changed generated files, so a one-function change rebuilds one unity batch.
