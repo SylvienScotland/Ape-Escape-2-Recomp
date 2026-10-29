@@ -45,6 +45,18 @@ if (-not $RunOnly) {
     git -C $Ps2RecompDir fetch --quiet origin
     git -C $Ps2RecompDir checkout --quiet $Ps2RecompCommit
     git -C $Ps2RecompDir submodule update --init --recursive
+
+    # Our fixes to PS2Recomp, kept as patches in this repo (idempotent: skip if already applied)
+    foreach ($p in Get-ChildItem "$Repo\patches\ps2recomp\*.patch" -ErrorAction SilentlyContinue | Sort-Object Name) {
+        $ErrorActionPreference = "Continue"
+        git -C $Ps2RecompDir apply --reverse --check $p.FullName 2>$null
+        $already = ($LASTEXITCODE -eq 0)
+        $ErrorActionPreference = "Stop"
+        if ($already) { Write-Host "patch already applied: $($p.Name)"; continue }
+        git -C $Ps2RecompDir apply $p.FullName
+        if ($LASTEXITCODE -ne 0) { throw "Failed to apply $($p.Name)" }
+        Write-Host "applied patch: $($p.Name)"
+    }
 }
 $Ps2RecompDir = (Resolve-Path $Ps2RecompDir).Path
 $ToolBuild = "$Ps2RecompDir\out\tools"

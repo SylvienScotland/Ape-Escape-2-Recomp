@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index b1bb6d8..490a5c8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -48,7 +48,9 @@ namespace
+         bool numericSuffix = semicolon + 1 < value.size();
+         for (std::size_t i = semicolon + 1; i < value.size(); ++i)
+         {
+-            if (!std::isdigit(static_cast<unsigned char>(value[i])))
++            // Accept repeated version suffixes like "FILE.DAT;1;1" (Ape Escape 2 does this);
++            // real CDVD lookups ignore everything from the first ';'.
++            if (!std::isdigit(static_cast<unsigned char>(value[i])) && value[i] != ';')
+             {
+                 numericSuffix = false;
+                 break;

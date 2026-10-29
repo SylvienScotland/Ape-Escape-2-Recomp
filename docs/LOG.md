@@ -34,3 +34,11 @@
 - Fix: added the 68 addresses to `entry_points` in config/ape2.toml. All 68 now exist, but as the
   game's real SDK code (entry_* wrappers don't get stub bindings). Fine for pure code (VU0 math,
   sceCdCallback); DMA/SIF/MC ones may need runtime handlers later via overrides/.
+
+## Boot 2: past sceCdCallback, stuck on FILEMAP.DAT
+- Game now loops on sceCdSearchFile("\APE2_USA\FILEMAP.DAT;1;1") (800k+ retries).
+- Root cause (runtime): stripIsoVersionSuffix only strips when everything after the first ';' is
+  digits, so the doubled ";1;1" the game passes is never stripped and the lookup fails.
+- Fix: patches/ps2recomp/0001-cd-strip-repeated-iso-version-suffix.patch (accept ';' in the suffix).
+  build_windows.ps1 now applies patches/ps2recomp/*.patch idempotently after checkout.
+  Worth upstreaming to ran-j/PS2Recomp.
