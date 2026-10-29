@@ -95,3 +95,12 @@
 - Runtime already supports reading raw sectors from a configured CD image (IoPaths::cdImage), but
   nothing sets it. Added overrides/zz_ape2_cdimage.cpp: sets cdImage from env APE2_ISO;
   build_windows.ps1 -IsoPath sets the env var. Mapped (synthetic) LSNs are checked first, so name lookups are unchanged.
+
+## Boot 6: FIRST PIXELS
+- CD image override works (869280 sectors). FILEMAP.DAT read from LSN 0xCF4: header "FMAP", 10 entries.
+- All 9 PROC_* handlers bind (slots 0-9). No more missing-target.
+- Game streams ~20 gzip'd resources by real LSN into heap buffers.
+- On screen: memory card check dialog ("Checking memory card ... slot 1"), then the publisher
+  "presents" fade. Text looks doubled/ghosted (likely interlace field / GS presentation issue).
+- Open questions: what happens after the presents screen (intro FMV = MPEG via FFmpeg?), memory card behavior,
+  ghosted text.

@@ -4,6 +4,6 @@
   "system": "PS2",
   "type": "recomp",
   "toolchain": "PS2Recomp",
-  "status": "exploring",
+  "status": "in-progress",
   "original": { "region": "USA", "serial": "SLUS-20685" }
 }
