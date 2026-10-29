@@ -4,12 +4,14 @@
   Run from the repo root in a "Developer PowerShell for VS 2022":
     .\tools\build_windows.ps1 -GameDir "D:\AE2\disc"
 
+  -IsoPath : your Ape Escape 2 (USA) .iso (the game reads some files by raw disc sector)
   -GameDir : folder with the extracted contents of YOUR Ape Escape 2 (USA) ISO
              (must contain SLUS_206.85 and SYSTEM.CNF at the top level).
   Steps you can skip on re-runs: -SkipToolBuild, -SkipRecomp, or -RunOnly to just boot
 #>
 param(
     [Parameter(Mandatory = $true)][string]$GameDir,
+    [string]$IsoPath = "",   # your Ape Escape 2 (USA) .iso; needed for reads by real disc sector
     [string]$Ps2RecompDir = "$PSScriptRoot\..\..\PS2Recomp",
     [string]$Ps2RecompCommit = "e5636981a1c9de368f6b71e819c3dc188dfedbf4",
     [ValidateSet("Debug", "RelWithDebInfo", "Release")][string]$Config = "RelWithDebInfo",
@@ -122,6 +124,13 @@ if (-not $NoRun) {
     $Log = "$Repo\boot.log"
     # The runtime logs to stderr. Windows PowerShell turns native stderr into errors (and we run
     # with -Stop), so let cmd do the redirection instead and just show the tail afterwards.
+    if ($IsoPath) {
+        if (-not (Test-Path $IsoPath)) { throw "ISO not found: $IsoPath" }
+        $env:APE2_ISO = (Resolve-Path $IsoPath).Path
+        Write-Host "CD image: $env:APE2_ISO"
+    } else {
+        Write-Host "No -IsoPath given: reads by real disc sector will fail" -ForegroundColor Yellow
+    }
     $ErrorActionPreference = "Continue"
     cmd /c "`"$($Runner.FullName)`" `"$Elf`" > `"$Log`" 2>&1"
     Write-Host "Exit code: $LASTEXITCODE"

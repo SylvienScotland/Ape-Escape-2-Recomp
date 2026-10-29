@@ -86,3 +86,12 @@
   kernel area below 0x100000) and let SetupHeap(-1) end at the main thread's stack base.
 - Recompiler output verified deterministic (only sub_001A3118 changed). build_windows.ps1 now
   copies only changed generated files, so a one-function change rebuilds one unity batch.
+
+## Boot 5: heap OK, reads by real disc sector fail
+- Heap fix works: buffers non-null (0x659c40...), SARU2.MM loads (it's the game's file index:
+  paths like /APE2_USA/MODULES/IOPRP243.IMG + real LSNs).
+- FILEMAP.DAT is then read by its REAL disc LSN from SARU2.MM (0xCF4, 0x95 sectors), not the
+  runtime's synthetic LSN from sceCdSearchFile (0x100017) -> "[sceCdRead] unresolved request", retried forever.
+- Runtime already supports reading raw sectors from a configured CD image (IoPaths::cdImage), but
+  nothing sets it. Added overrides/zz_ape2_cdimage.cpp: sets cdImage from env APE2_ISO;
+  build_windows.ps1 -IsoPath sets the env var. Mapped (synthetic) LSNs are checked first, so name lookups are unchanged.
