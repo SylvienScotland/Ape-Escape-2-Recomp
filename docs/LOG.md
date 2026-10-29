@@ -134,3 +134,11 @@
   RAW8 result checked with bgez; loop exits when 0x3702F0 (unnamed sceMpegIsEnd: *(*(mp+0x40))) != 0.
 - Temporary: overrides/zz_ape2_skipfmv.cpp: RAW8 returns 0 and marks skip; IsEnd returns 1 once.
   Proper fix later: RAW8 output from FFmpeg frames (YCbCr macroblocks) + IPU CSC in the runtime.
+
+## Boot 8: movie skipped, black screen
+- Skip works ("movie #1 reported as ended"), no crashes for ~10 min, DMA still climbing, but the screen is black.
+- Movie thread entry 0x1A90A0: after the decode loop it spins on [0x3DF5C0+0xC] != 0 before setting
+  state 3 (0x1A8ED8(mp,3)) and ExitThread. 0x3DF5C0 = decoded-frame queue (0x1AA4E0 reset: +0xC count,
+  +0x8 write idx; 0x1AA508 push: count++, slot state 3; slots 0x40540 bytes). The skipped empty frame was
+  still pushed, never colour-converted, so never consumed -> count stays 1 -> main waits forever.
+- Fix: skip override also zeroes +0xC and +0x8 when it reports the movie ended (same as 0x1AA4E0).
