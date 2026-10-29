@@ -9,3 +9,5 @@ SCUS_*
 SLUS_*
 build/
 out/
+boot.log
+generated_recomp.log

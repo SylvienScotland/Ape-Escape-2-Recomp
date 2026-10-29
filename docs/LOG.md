@@ -16,3 +16,6 @@
 - Next: Ghidra function export for better boundaries; full compile + link on a desktop machine.
 - Ghidra: can't install in the cloud workspace (GitHub release downloads blocked by egress policy).
   Plan: run Ghidra + ExportPS2Functions.java on the desktop, commit the exported TOML/CSV to config/.
+- Skipped Ghidra for now. Added tools/build_windows.ps1 + docs/BUILD_WINDOWS.md for the first
+  desktop build/boot. PS2Recomp pinned at e5636981. Runtime uses the ELF's folder as cdrom0:,
+  so the extracted ISO folder is the disc.
