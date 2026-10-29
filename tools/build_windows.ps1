@@ -6,7 +6,7 @@
 
   -GameDir : folder with the extracted contents of YOUR Ape Escape 2 (USA) ISO
              (must contain SLUS_206.85 and SYSTEM.CNF at the top level).
-  Steps you can skip on re-runs: -SkipToolBuild, -SkipRecomp
+  Steps you can skip on re-runs: -SkipToolBuild, -SkipRecomp, or -RunOnly to just boot
 #>
 param(
     [Parameter(Mandatory = $true)][string]$GameDir,
@@ -15,8 +15,10 @@ param(
     [ValidateSet("Debug", "RelWithDebInfo", "Release")][string]$Config = "RelWithDebInfo",
     [switch]$SkipToolBuild,
     [switch]$SkipRecomp,
-    [switch]$NoRun
+    [switch]$NoRun,
+    [switch]$RunOnly   # just boot the already-built exe
 )
+if ($RunOnly) { $SkipToolBuild = $true; $SkipRecomp = $true }
 
 $ErrorActionPreference = "Stop"
 $Repo = (Resolve-Path "$PSScriptRoot\..").Path
@@ -39,9 +41,11 @@ Step "PS2Recomp @ $Ps2RecompCommit"
 if (-not (Test-Path "$Ps2RecompDir\.git")) {
     git clone https://github.com/ran-j/PS2Recomp.git $Ps2RecompDir
 }
-git -C $Ps2RecompDir fetch --quiet origin
-git -C $Ps2RecompDir checkout --quiet $Ps2RecompCommit
-git -C $Ps2RecompDir submodule update --init --recursive
+if (-not $RunOnly) {
+    git -C $Ps2RecompDir fetch --quiet origin
+    git -C $Ps2RecompDir checkout --quiet $Ps2RecompCommit
+    git -C $Ps2RecompDir submodule update --init --recursive
+}
 $Ps2RecompDir = (Resolve-Path $Ps2RecompDir).Path
 $ToolBuild = "$Ps2RecompDir\out\tools"
 $RunBuild  = "$Ps2RecompDir\out\runner"
@@ -65,6 +69,7 @@ if (-not $SkipRecomp) {
 $Gen = "$Repo\generated\output"
 if (-not (Test-Path "$Gen\register_functions.cpp")) { throw "No generated output in $Gen" }
 
+if (-not $RunOnly) {
 # 4. Drop generated code into the runtime (that's how ps2xRuntime picks it up)
 Step "Copying generated code into ps2xRuntime"
 $RunnerSrc = "$Ps2RecompDir\ps2xRuntime\src\runner"
@@ -73,19 +78,28 @@ Copy-Item "$Gen\*.cpp" $RunnerSrc -Force
 Copy-Item "$Gen\ps2_recompiled_functions.h", "$Gen\ps2_recompiled_stubs.h" $RunnerInc -Force
 # Game-specific overrides live in our repo
 Get-ChildItem "$Repo\overrides\*.cpp" -ErrorAction SilentlyContinue | Copy-Item -Destination $RunnerSrc -Force
+}
 
 # 5. Build the runner (this is the long one: ~8.5k generated files)
-Step "Building ps2EntryRunner ($Config)"
-cmake -S $Ps2RecompDir -B $RunBuild -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
-cmake --build $RunBuild --config $Config --target ps2EntryRunner --parallel
+if (-not $RunOnly) {
+    Step "Building ps2EntryRunner ($Config)"
+    cmake -S $Ps2RecompDir -B $RunBuild -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+    cmake --build $RunBuild --config $Config --target ps2EntryRunner --parallel
+}
 $Runner = Get-ChildItem -Recurse -Filter ps2EntryRunner.exe $RunBuild | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $Runner) { throw "ps2EntryRunner.exe not built" }
 Write-Host "Built: $($Runner.FullName)"
 
 # 6. First boot, with a log
 if (-not $NoRun) {
-    Step "Booting (log: boot.log). Close the window or Ctrl+C to stop."
+    Step "Booting (log: boot.log). Close the game window to stop."
     $Log = "$Repo\boot.log"
-    & $Runner.FullName $Elf 2>&1 | Tee-Object -FilePath $Log
-    Write-Host "`nLog saved to $Log. Attach it (or the last ~300 lines) to the chat."
+    # The runtime logs to stderr. Windows PowerShell turns native stderr into errors (and we run
+    # with -Stop), so let cmd do the redirection instead and just show the tail afterwards.
+    $ErrorActionPreference = "Continue"
+    cmd /c "`"$($Runner.FullName)`" `"$Elf`" > `"$Log`" 2>&1"
+    Write-Host "Exit code: $LASTEXITCODE"
+    Write-Host "--- last 40 lines of boot.log ---"
+    Get-Content $Log -Tail 40
+    Write-Host "`nFull log: $Log. Attach it to the chat."
 }
