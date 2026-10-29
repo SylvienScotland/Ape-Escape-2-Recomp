@@ -23,3 +23,14 @@
   game calls SetupHeap(0x619ad8, -1) fine. Run was killed by the script itself: PS 5.1 + 2>&1 +
   ErrorAction Stop turns runtime stderr into a terminating error. Fixed: boot via cmd redirection.
   Added -RunOnly. /FORCE:MULTIPLE link warning is upstream's intentional raylib/WinAPI workaround.
+
+## Boot 1: magenta screen, hang
+- Window + raylib + audio OK. Magenta = runtime "no GS frame presented yet" placeholder.
+- Hang: pc stuck at 0x36d3e0 (sceCdCallback), ra 0x1a1c38. Call chain: sub_001A1BC8 (startup,
+  after sceCdInit) -> jal 0x1876A0 -> tail `j sceCdCallback`.
+- Root cause: 68 of 223 analyzer stub bindings (`name@0xADDR`) were dropped because the recompiler
+  had no function starting at those addresses, so 0x36d3e0 had no code at all. Missing set: most
+  sceDma*, many sceVu0*, sceCdCallback/St*, sceMc*, sceMpeg*, sceSif* RPC/IOP, sceDeci2*, _printf_r.
+- Fix: added the 68 addresses to `entry_points` in config/ape2.toml. All 68 now exist, but as the
+  game's real SDK code (entry_* wrappers don't get stub bindings). Fine for pure code (VU0 math,
+  sceCdCallback); DMA/SIF/MC ones may need runtime handlers later via overrides/.

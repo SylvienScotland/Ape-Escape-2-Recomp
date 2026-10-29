@@ -249,6 +249,74 @@ stubs = [
 # Guest functions without runtime handlers that may be referenced by address.
 # PS2Recomp keeps their guest implementation and exposes exact callable entries.
 entry_points = [
+  "0x0036AA38", # sceDmaGetEnv: forced so its stub binding applies
+  "0x0036AA70", # sceDmaPutStallAddr: forced so its stub binding applies
+  "0x0036AA98", # sceDmaSend: forced so its stub binding applies
+  "0x0036AB70", # sceDmaSendN: forced so its stub binding applies
+  "0x0036AC58", # sceDmaSendI: forced so its stub binding applies
+  "0x0036AD40", # sceDmaRecv: forced so its stub binding applies
+  "0x0036AE08", # sceDmaRecvN: forced so its stub binding applies
+  "0x0036AEF8", # sceDmaRecvI: forced so its stub binding applies
+  "0x0036AFE8", # sceDmaSync: forced so its stub binding applies
+  "0x0036B0B0", # sceDmaWatch: forced so its stub binding applies
+  "0x0036B180", # sceDmaPause: forced so its stub binding applies
+  "0x0036C608", # sceVu0ApplyMatrix: forced so its stub binding applies
+  "0x0036C6A0", # sceVu0InnerProduct: forced so its stub binding applies
+  "0x0036C7C0", # sceVu0DivVector: forced so its stub binding applies
+  "0x0036C7E0", # sceVu0DivVectorXYZ: forced so its stub binding applies
+  "0x0036C800", # sceVu0InterVector: forced so its stub binding applies
+  "0x0036C8C8", # sceVu0CopyMatrix: forced so its stub binding applies
+  "0x0036CA78", # sceVu0RotMatrixX: forced so its stub binding applies
+  "0x0036CBC8", # sceVu0RotMatrix: forced so its stub binding applies
+  "0x0036CC18", # sceVu0ClampVector: forced so its stub binding applies
+  "0x0036CC40", # sceVu0CameraMatrix: forced so its stub binding applies
+  "0x0036CCF0", # sceVu0NormalLightMatrix: forced so its stub binding applies
+  "0x0036CDB0", # sceVu0LightColorMatrix: forced so its stub binding applies
+  "0x0036CE18", # sceVu0ViewScreenMatrix: forced so its stub binding applies
+  "0x0036CF20", # sceVu0DropShadowMatrix: forced so its stub binding applies
+  "0x0036D0B0", # sceVu0RotTransPersN: forced so its stub binding applies
+  "0x0036D108", # sceVu0RotTransPers: forced so its stub binding applies
+  "0x0036D170", # sceVu0InterVectorXYZ: forced so its stub binding applies
+  "0x0036D1B8", # sceVu0ClipScreen: forced so its stub binding applies
+  "0x0036D200", # sceVu0ClipScreen3: forced so its stub binding applies
+  "0x0036D260", # sceVu0ClipAll: forced so its stub binding applies
+  "0x0036D3E0", # sceCdCallback: forced so its stub binding applies
+  "0x0036ECB0", # sceCdStSeek: forced so its stub binding applies
+  "0x0036EEA0", # sceCdStPause: forced so its stub binding applies
+  "0x0036EEF0", # sceCdStResume: forced so its stub binding applies
+  "0x003701B0", # sceMpegAddBs: forced so its stub binding applies
+  "0x003701D8", # sceMpegGetPicture: forced so its stub binding applies
+  "0x00370268", # sceMpegGetPictureRAW8xy: forced so its stub binding applies
+  "0x003702D0", # sceMpegGetDecodeMode: forced so its stub binding applies
+  "0x00377358", # sceMcEnd: forced so its stub binding applies
+  "0x003773C8", # sceMcChangeThreadPriority: forced so its stub binding applies
+  "0x00377480", # sceMcGetSlotMax: forced so its stub binding applies
+  "0x00377768", # sceMcSeek: forced so its stub binding applies
+  "0x003780F0", # sceMcChdir: forced so its stub binding applies
+  "0x00378308", # sceMcDelete: forced so its stub binding applies
+  "0x00378430", # sceMcFlush: forced so its stub binding applies
+  "0x003784E8", # sceMcSetFileInfo: forced so its stub binding applies
+  "0x003786C0", # sceMcRename: forced so its stub binding applies
+  "0x00378828", # sceMcUnformat: forced so its stub binding applies
+  "0x003788F0", # sceMcGetEntSpace: forced so its stub binding applies
+  "0x00393058", # _printf_r: forced so its stub binding applies
+  "0x0039DBA8", # iRotateThreadReadyQueue: forced so its stub binding applies
+  "0x0039F6B8", # sceSifGetOtherData: forced so its stub binding applies
+  "0x0039FD10", # sceSifSetRpcQueue: forced so its stub binding applies
+  "0x0039FDA8", # sceSifRegisterRpc: forced so its stub binding applies
+  "0x0039FE78", # sceSifRemoveRpc: forced so its stub binding applies
+  "0x0039FF10", # sceSifRemoveRpcQueue: forced so its stub binding applies
+  "0x003A01C0", # sceSifRpcLoop: forced so its stub binding applies
+  "0x003A3990", # sceSifAllocSysMemory: forced so its stub binding applies
+  "0x003A3AA8", # sceSifLoadIopHeap: forced so its stub binding applies
+  "0x003A4700", # sceSifLoadElf: forced so its stub binding applies
+  "0x003A4728", # sceSifGetIopAddr: forced so its stub binding applies
+  "0x003A4818", # sceSifSetIopAddr: forced so its stub binding applies
+  "0x003A4A38", # sceSifIsAliveIop: forced so its stub binding applies
+  "0x003A5898", # sceDeci2Close: forced so its stub binding applies
+  "0x003A5988", # sceDeci2ExReqSend: forced so its stub binding applies
+  "0x003A59B8", # sceDeci2ExLock: forced so its stub binding applies
+  "0x003A59E0", # sceDeci2ExUnLock: forced so its stub binding applies
   "_InitSys@0x001CD528",
   "_InitSys@0x001D3BF0",
   "_InitSys@0x001D8298",
