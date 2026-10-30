@@ -1,0 +1,112 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 07f8935..20f7dd4 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -7,8 +7,11 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
++#include <string>
++#include <vector>
+ #include <sstream>
+ 
+ namespace
+@@ -525,6 +528,86 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+     return request;
+ }
+ 
++// Frame dump for picture debugging (Ape Escape 2 recomp patch 0010). With APE2_FRAME_DUMP=<dir>, every
++// APE2_FRAME_DUMP_EVERY-th presented frame (default 30, max 200 dumps) is written as <dir>/frame_NNNN.ppm
++// (presented RGB, unscaled) and one line with the raw display registers is printed:
++//   [frame:dump] n=3 file=... size=640x448 pmode=.. smode2=.. dispfb1=.. display1=.. dispfb2=.. display2=..
++// With APE2_FRAME_DUMP_VRAM=1 the whole 4 MiB of GS local memory is also written as <dir>/vram_NNNN.bin.
++static void dumpPresentationFrame(const PresentationFrame &frame, const GSPresentationRequest &request,
++                                  const GSRasterBackend &backend)
++{
++    static const char *dir = std::getenv("APE2_FRAME_DUMP");
++    if (!dir || !*dir || frame.width == 0u || frame.height == 0u)
++        return;
++    static const uint32_t every = []
++    {
++        const char *e = std::getenv("APE2_FRAME_DUMP_EVERY");
++        const long v = e ? std::strtol(e, nullptr, 10) : 30;
++        return static_cast<uint32_t>(v > 0 ? v : 30);
++    }();
++    static uint32_t presented = 0u;
++    static uint32_t dumped = 0u;
++    if ((presented++ % every) != 0u || dumped >= 200u)
++        return;
++    char path[512];
++    std::snprintf(path, sizeof(path), "%s/frame_%04u.ppm", dir, dumped);
++    if (FILE *f = std::fopen(path, "wb"))
++    {
++        std::fprintf(f, "P6\n%u %u\n255\n", frame.width, frame.height);
++        std::vector<uint8_t> row(static_cast<size_t>(frame.width) * 3u);
++        for (uint32_t y = 0; y < frame.height; ++y)
++        {
++            const size_t src = static_cast<size_t>(y) * kHostFrameWidth * 4u;
++            if (src + static_cast<size_t>(frame.width) * 4u > frame.pixels.size())
++                break;
++            for (uint32_t x = 0; x < frame.width; ++x)
++            {
++                row[x * 3u + 0u] = frame.pixels[src + x * 4u + 0u];
++                row[x * 3u + 1u] = frame.pixels[src + x * 4u + 1u];
++                row[x * 3u + 2u] = frame.pixels[src + x * 4u + 2u];
++            }
++            std::fwrite(row.data(), 1, row.size(), f);
++        }
++        std::fclose(f);
++    }
++    static const bool dumpVram = []
++    {
++        const char *e = std::getenv("APE2_FRAME_DUMP_VRAM");
++        return e && *e && *e != '0';
++    }();
++    if (dumpVram)
++    {
++        std::vector<uint8_t> vram;
++        backend.SnapshotVram(vram);
++        char vramPath[512];
++        std::snprintf(vramPath, sizeof(vramPath), "%s/vram_%04u.bin", dir, dumped);
++        if (FILE *f = std::fopen(vramPath, "wb"))
++        {
++            std::fwrite(vram.data(), 1, vram.size(), f);
++            std::fclose(f);
++        }
++    }
++    auto ctxFrame = [](const GSFrameReg &r)
++    {
++        char b[64];
++        std::snprintf(b, sizeof(b), "fbp=0x%x fbw=%u psm=0x%x", r.fbp, r.fbw, r.psm);
++        return std::string(b);
++    };
++    std::fprintf(stderr,
++                 "[frame:dump] n=%u file=%s size=%ux%u displayFbp=0x%x sourceFbp=0x%x preferred=%d vsync=%llu "
++                 "pmode=0x%llx smode2=0x%llx dispfb1=0x%llx display1=0x%llx dispfb2=0x%llx display2=0x%llx "
++                 "bgcolor=0x%llx ctx0{%s} ctx1{%s}\n",
++                 dumped, path, frame.width, frame.height, frame.displayFbp, frame.sourceFbp,
++                 frame.usedPreferred ? 1 : 0, static_cast<unsigned long long>(request.vsyncTick),
++                 static_cast<unsigned long long>(request.pmode), static_cast<unsigned long long>(request.smode2),
++                 static_cast<unsigned long long>(request.dispfb1), static_cast<unsigned long long>(request.display1),
++                 static_cast<unsigned long long>(request.dispfb2), static_cast<unsigned long long>(request.display2),
++                 static_cast<unsigned long long>(request.bgcolor), ctxFrame(request.contextFrames[0]).c_str(),
++                 ctxFrame(request.contextFrames[1]).c_str());
++    std::fflush(stderr);
++    ++dumped;
++}
++
+ void GS::latchHostPresentationFrame()
+ {
+     ps2perf::countFrame();
+@@ -550,6 +633,8 @@ void GS::latchHostPresentationFrame()
+             m_backend->Flush();
+             m_backend->Sync(GSSyncReason::Presentation);
+             frame = m_backend->Present(request);
++            if (frame)
++                dumpPresentationFrame(frame, request, *m_backend);
+         }
+     }
+ 

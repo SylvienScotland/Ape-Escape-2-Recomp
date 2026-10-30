@@ -1,0 +1,27 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+index d467c4b..95add7a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/LibC.cpp
+@@ -114,7 +114,21 @@ namespace ps2_stubs
+                 break;
+             }
+ 
+-            ::memcpy(hostDest, hostSrc, chunk);
++            if (hostDest > hostSrc && hostDest < hostSrc + chunk)
++            {
++                // Overlapping forward copy: the guest memcpy copies forwards (bytes, or qwords loaded
++                // before they are stored), so bytes written earlier in the copy are read again. zlib's
++                // inflate relies on that for short-distance LZ77 matches; host memcpy is undefined here
++                // and copied in wide blocks, corrupting decompressed textures (Ape Escape 2 recomp patch 0015).
++                volatile uint8_t *d = hostDest; // volatile: keep the compiler from turning this into a block copy
++                const volatile uint8_t *s = hostSrc;
++                for (uint32_t i = 0u; i < chunk; ++i)
++                    d[i] = s[i];
++            }
++            else
++            {
++                ::memcpy(hostDest, hostSrc, chunk);
++            }
+             copied += chunk;
+             curDst += chunk;
+             curSrc += chunk;

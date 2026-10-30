@@ -1,0 +1,117 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index fac35f5..6183726 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -10,8 +10,12 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
++#include <initializer_list>
++#include <mutex>
++#include <unordered_set>
+ #include <iostream>
+ #include <stdexcept>
+ 
+@@ -519,6 +523,37 @@ GSCpuBackend::GSCpuBackend()
+     Reset();
+ }
+ 
++// GS state tracer for picture debugging (Ape Escape 2 recomp patch 0013). With APE2_GS_TRACE=1, prints each
++// distinct textured draw state, CLUT load and image upload once (capped), e.g.
++//   [gs:tex] prim=6 abe=1 fst=1 lin=1 tex0{tbp0=.. tbw=.. psm=0x14 tw=8 th=8 tcc=1 tfx=0 cbp=.. cpsm=0 csm=0 csa=0}
++static bool gsTraceEnabled()
++{
++    static const bool enabled = []
++    {
++        const char *e = std::getenv("APE2_GS_TRACE");
++        return e && *e && *e != '0';
++    }();
++    return enabled;
++}
++
++static bool gsTraceFirst(uint64_t key, uint32_t cap)
++{
++    static std::mutex mutex;
++    static std::unordered_set<uint64_t> seen;
++    std::lock_guard<std::mutex> lock(mutex);
++    if (seen.size() >= cap)
++        return false;
++    return seen.insert(key).second;
++}
++
++static uint64_t gsTraceHash(std::initializer_list<uint64_t> values)
++{
++    uint64_t h = 1469598103934665603ull;
++    for (uint64_t v : values)
++        h = (h ^ v) * 1099511628211ull;
++    return h;
++}
++
+ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+     if (vram && vramSize < GSMem::MEMORY_SIZE)
+@@ -591,6 +626,12 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+         return;
+     }
+ 
++    if (gsTraceEnabled() &&
++        gsTraceFirst(gsTraceHash({2u, tex0.psm, tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld, texclut.cbw,
++                                  texclut.cou, texclut.cov}),
++                     600u))
++        std::fprintf(stderr, "[gs:clut] tex-psm=0x%x cbp=0x%x cpsm=0x%x csm=%u csa=%u cld=%u texclut{cbw=%u cou=%u cov=%u}\n",
++                     tex0.psm, tex0.cbp, tex0.cpsm, tex0.csm, tex0.csa, tex0.cld, texclut.cbw, texclut.cou, texclut.cov);
+     LoadClutUnlocked(tex0, texclut);
+ }
+ 
+@@ -718,6 +759,31 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
++    if (gsTraceEnabled() && state.prim.tme)
++    {
++        const auto &t = ctx.tex0;
++        const uint64_t key = gsTraceHash({1u, static_cast<uint64_t>(state.prim.type), state.prim.abe, state.prim.fst,
++                                          state.linearFilter, t.tbp0, t.tbw, t.psm, t.tw, t.th, t.tcc, t.tfx, t.cbp,
++                                          t.cpsm, t.csm, t.csa, ctx.alpha, ctx.frame.fbp, ctx.frame.psm, ctx.clamp,
++                                          state.texa.ta0, state.texa.aem, state.texa.ta1});
++        if (gsTraceFirst(key, 400u))
++        {
++            const GSVertex &v0 = batch.vertices[0];
++            const GSVertex &v1 = batch.vertices[1];
++            std::fprintf(stderr,
++                         "[gs:tex] prim=%u abe=%d fst=%d lin=%d tex1=0x%llx tex0{tbp0=0x%x tbw=%u psm=0x%x tw=%u th=%u tcc=%u "
++                         "tfx=%u cbp=0x%x cpsm=0x%x csm=%u csa=%u} texa{%u,%d,%u} clamp=0x%llx alpha=0x%llx "
++                         "frame{fbp=0x%x fbw=%u psm=0x%x} xy0=(%.1f,%.1f) xy1=(%.1f,%.1f) uv0=(%.2f,%.2f) uv1=(%.2f,%.2f) "
++                         "stq0=(%g,%g,%g) rgba1=(%u,%u,%u,%u)\n",
++                         static_cast<unsigned>(state.prim.type), state.prim.abe ? 1 : 0, state.prim.fst ? 1 : 0,
++                         state.linearFilter ? 1 : 0, static_cast<unsigned long long>(ctx.tex1), t.tbp0, t.tbw, t.psm,
++                         t.tw, t.th, t.tcc, t.tfx, t.cbp, t.cpsm, t.csm, t.csa, state.texa.ta0, state.texa.aem ? 1 : 0,
++                         state.texa.ta1, static_cast<unsigned long long>(ctx.clamp),
++                         static_cast<unsigned long long>(ctx.alpha), ctx.frame.fbp, ctx.frame.fbw, ctx.frame.psm,
++                         v0.x, v0.y, v1.x, v1.y, v0.u / 16.0, v0.v / 16.0, v1.u / 16.0, v1.v / 16.0, v0.s, v0.t, v0.q,
++                         v1.r, v1.g, v1.b, v1.a);
++        }
++    }
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)
+@@ -1469,6 +1535,16 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (gsTraceEnabled())
++    {
++        const auto &b = command.bitbltbuf;
++        if (gsTraceFirst(gsTraceHash({3u, command.direction, b.sbp, b.sbw, b.spsm, b.dbp, b.dbw, b.dpsm,
++                                      command.trxpos.dsax, command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh}),
++                         600u))
++            std::fprintf(stderr, "[gs:xfer] dir=%u src{bp=0x%x bw=%u psm=0x%x %u,%u} dst{bp=0x%x bw=%u psm=0x%x %u,%u} size=%ux%u\n",
++                         command.direction, b.sbp, b.sbw, b.spsm, command.trxpos.ssax, command.trxpos.ssay, b.dbp, b.dbw,
++                         b.dpsm, command.trxpos.dsax, command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
++    }
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;

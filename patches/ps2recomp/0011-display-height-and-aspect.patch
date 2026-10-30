@@ -1,0 +1,58 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..fac35f5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -315,14 +315,20 @@ namespace
+                                      ((a >= 0x40u) ? 0x8000u : 0u));
+     }
+ 
+-    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight)
++    // interlacedFrameMode = SMODE2 INT=1, FFMD=1. Some games program DH in half-lines there (Ape Escape 2:
++    // DH=895 for a 448-line buffer); no NTSC/PAL picture has more than ~480/576 visible lines, so a
++    // height above 576 in that mode is halved instead of reading past the frame buffer (patch 0011).
++    void decodeDisplaySize(uint64_t display64, uint32_t &outWidth, uint32_t &outHeight, bool interlacedFrameMode)
+     {
+         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
+         const uint32_t dh = static_cast<uint32_t>((display64 >> 44) & 0x07FFu);
+         const uint32_t magh = static_cast<uint32_t>((display64 >> 23) & 0x0Fu);
++        const uint32_t magv = static_cast<uint32_t>((display64 >> 27) & 0x03u);
+ 
+         outWidth = (dw + 1u) / (magh + 1u);
+-        outHeight = dh + 1u;
++        outHeight = (dh + 1u) / (magv + 1u);
++        if (interlacedFrameMode && outHeight > 576u)
++            outHeight /= 2u;
+         if (outWidth < 64u || outHeight < 64u)
+         {
+             outWidth = kDefaultDisplayWidth;
+@@ -1869,8 +1875,9 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     const GSDisplayReadOrigin origin1 = decodeDisplayReadOrigin(request.dispfb1);
+     const GSDisplayReadOrigin origin2 = decodeDisplayReadOrigin(request.dispfb2);
+     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
+-    decodeDisplaySize(request.display1, width1, height1);
+-    decodeDisplaySize(request.display2, width2, height2);
++    const bool interlacedFrameMode = smode2.interlaced && smode2.frameMode;
++    decodeDisplaySize(request.display1, width1, height1, interlacedFrameMode);
++    decodeDisplaySize(request.display2, width2, height2, interlacedFrameMode);
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
+     if (!valid1 && !valid2)
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 45cb9d2..255bfe3 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2430,9 +2430,11 @@ void PS2Runtime::run()
+         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+         const float screenWidth = static_cast<float>(GetScreenWidth());
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+-        const float dstWidth = srcWidth * scale;
+-        const float dstHeight = srcHeight * scale;
++        // The PS2 always outputs a 4:3 picture whatever the frame buffer width (512, 640...), so fit a
++        // 4:3 box instead of keeping the source pixel aspect (Ape Escape 2 recomp patch 0011).
++        constexpr float kDisplayAspect = 4.0f / 3.0f;
++        const float dstHeight = std::min(screenHeight, screenWidth / kDisplayAspect);
++        const float dstWidth = dstHeight * kDisplayAspect;
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+         const Rectangle dstRect{
+             (screenWidth - dstWidth) * 0.5f,

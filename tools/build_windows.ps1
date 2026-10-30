@@ -127,6 +127,8 @@ if (-not $RunOnly) {
     Step "Building ps2EntryRunner ($Config)"
     cmake -S $Ps2RecompDir -B $RunBuild -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
     cmake --build $RunBuild --config $Config --target ps2EntryRunner --parallel
+    # Without this a failed build silently boots the previous exe.
+    if ($LASTEXITCODE -ne 0) { throw "ps2EntryRunner build failed (exit $LASTEXITCODE)" }
 }
 $Runner = Get-ChildItem -Recurse -Filter ps2EntryRunner.exe $RunBuild | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $Runner) { throw "ps2EntryRunner.exe not built" }

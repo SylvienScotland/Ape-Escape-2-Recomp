@@ -210,3 +210,43 @@
 - Running unattended from Claude: VsDevCmd.bat in cmd, then `powershell -File tools\build_windows.ps1
   -Ps2RecompDir C:\dev\PS2Recomp ...` with cmd doing the redirection (with -File, $PSScriptRoot is empty in
   param defaults; a PowerShell `*>` redirect turns CMake's stderr warnings into terminating errors).
+
+## Picture: from garbled to a correct title screen
+- patches/ps2recomp/0009-runtime-full-inlining.patch: RelWithDebInfo is /O2 /Ob1 on MSVC; /Ob2 for the
+  ps2_runtime and ps2_iop libraries only (generated runner sources keep their flags, no full rebuild).
+- patches/ps2recomp/0010-gs-frame-dump.patch: APE2_FRAME_DUMP=<dir> (+ APE2_FRAME_DUMP_EVERY=N, default 30,
+  max 200) writes presented frames as PPM and prints [frame:dump] with the raw display registers;
+  APE2_FRAME_DUMP_VRAM=1 also writes the 4 MiB GS local memory (vram_NNNN.bin).
+- Display registers (AE2, all screens): PMODE=0x8063 (both CRTs, MMOD=1, ALP=0x80: anti-flicker merge of the
+  same buffer with a 1-line offset), SMODE2 INT=1 FFMD=1, DISPFB FBP=0 FBW=8 (512 wide) CT32,
+  DISPLAY DW=2559 MAGH=4 DH=895. Double buffer 0x0 / 0x70 (0x70 pages = line 448).
+- patches/ps2recomp/0011-display-height-and-aspect.patch: DH counts half-lines here (895 -> 448 lines);
+  the runtime used 896, clamped to 512 and read 64 lines of the other buffer (the "duplicated bottom band").
+  Fix: honour MAGV; in interlaced frame mode halve heights above 576. Presenter now fits a 4:3 box (the PS2
+  always outputs 4:3) instead of keeping the 512x448 source aspect.
+- patches/ps2recomp/0012-gs-texture-cache-direct-read.patch: TexturePageCache copied one 8 KB page and was only
+  invalidated on TEXFLUSH/reset (stale after uploads/render-to-texture) and cost an 8 KB memcpy whenever
+  sampling alternated pages. Resolve now returns a pointer into VRAM.
+- patches/ps2recomp/0013-gs-state-trace.patch: APE2_GS_TRACE=1 prints each distinct textured draw state
+  ([gs:tex]), CLUT load ([gs:clut]) and image transfer ([gs:xfer]) once.
+  Finding: AE2 uploads T8/T4 textures pre-swizzled as CT32 (e.g. 256x224 CT32 -> 512x448 T8, CSM1 CLUTs).
+- patches/ps2recomp/0014-gs-integer-pixel-centers.patch: the GS samples at integer pixel coordinates (games
+  supply the +0.5 texel offset: AE2 copies 0x70 -> 0x0 every frame with a bilinear sprite, uv 0.5..512.5).
+  DrawSprite/DrawTriangle sampled at x+0.5 => half-texel shift => blur on every pass ("muddy" picture).
+- Ground truth for the remaining garbled logos: SYSTEM\PUBLOGO.BIN is gzip -> "IDP/IMG/YIM" container,
+  YIM 512x448 T8 at +0x50, 16x16 CT32 CLUT at +0x38050. Decoding it through a reference GS swizzle
+  (scratch tool gsdecode.py, GS-manual tables) gives clean text, so the tables are right; the VRAM copy
+  differed in 4769 bytes, every byte equal to the correct byte or the one 8 earlier: the whole upload
+  stream was delayed by 8 bytes, starting with 00000000 50003800 = VIFcodes NOP; DIRECT 0x3800.
+- patches/ps2recomp/0015-libc-memcpy-overlap.patch: (found on the way, separate bug) the memcpy HLE stub
+  used host memcpy on overlapping ranges; the guest memcpy copies forwards (LZ-style propagation). Overlap
+  with dst > src now copies byte-wise forwards.
+- patches/ps2recomp/0016-vif1-direct-continuation.patch: the real cause. When a GIF IMAGE packet spans
+  several VIF1 DIRECTs, processVIF1Data consumed the start of the *next VIF chunk* as image data, i.e. the
+  DMAtag's VIFcodes (NOP; DIRECT n), shifting every such texture by 8 bytes. Now only DIRECT payload feeds
+  PATH2 (pending IMAGE continues inside the next DIRECT payload), and a DIRECT cut off at a chunk end is
+  resumed via a pending-DIRECT counter (file-static in ps2_vif1_interpreter.cpp to keep ps2_memory.h,
+  which is in the runner PCH, unchanged). Logo texture now identical to the disc data (0 bytes differ).
+- Result: memory card text, UbiSoft / SCE logos and the Ape Escape 2 title screen ("Press the START
+  button") render correctly; the game reaches the title in < 150 s unattended.
+- build_windows.ps1 now throws when the runner build fails (it used to boot the previous exe).

@@ -1,0 +1,27 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+index 1cb1540..bfa62bf 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
++++ b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+@@ -19,15 +19,15 @@ namespace GSMem
+ 
+         // byteAddress is the wrapped, swizzled VRAM address. The returned
+         // pointer is valid only until the next miss or invalidation.
++        //
++        // Ape Escape 2 recomp patch 0012: read VRAM directly. The page copy was only invalidated on
++        // TEXFLUSH/reset, so texture uploads, local->local copies and render-to-texture into the cached
++        // page were sampled stale (garbled/doubled glyphs), and sampling that alternates between two
++        // pages (bilinear taps at a page edge) cost an 8 KB memcpy per texel. The CPU rasterizer reads
++        // the same host memory, so the copy bought nothing.
+         const uint8_t* Resolve(const uint8_t* vram, uint32_t byteAddress) noexcept
+         {
+-            const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
+-            if (m_pageBase != pageBase)
+-            {
+-                std::memcpy(m_bytes.data(), vram + pageBase, kPageSize);
+-                m_pageBase = pageBase;
+-            }
+-            return m_bytes.data() + (byteAddress & (kPageSize - 1u));
++            return vram + byteAddress;
+         }
+ 
+     private:

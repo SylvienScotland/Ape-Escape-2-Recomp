@@ -1,0 +1,21 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 589d768..28e0dc6 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -507,6 +507,16 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++
++# RelWithDebInfo on MSVC defaults to /Ob1 (only explicitly inline functions), which leaves the hot
++# rasterizer/VU/IOP helpers as calls. Full inlining for the runtime libraries only, so the generated
++# runner sources keep their flags and do not rebuild (Ape Escape 2 recomp patch 0009).
++if(MSVC)
++    target_compile_options(ps2_runtime PRIVATE $<$<CONFIG:RelWithDebInfo>:/Ob2>)
++    if(TARGET ps2_iop)
++        target_compile_options(ps2_iop PRIVATE $<$<CONFIG:RelWithDebInfo>:/Ob2>)
++    endif()
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime

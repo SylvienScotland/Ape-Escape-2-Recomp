@@ -13,29 +13,26 @@ Read this first, then the end of docs/LOG.md (full history).
   Drop `-SkipRecomp` after changing config/ape2.toml. Output: `boot.log` in the repo root.
 - Rebuild cost rules: see docs/BUILD_WINDOWS.md (avoid PCH headers; new override files named `zz_*`).
 
+## Running it unattended (how Claude does it)
+From a plain shell (no dev prompt needed):
+`cmd /c "call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 >nul && powershell -NoProfile -ExecutionPolicy Bypass -File C:\dev\Ape-Escape-2-Recomp\tools\build_windows.ps1 -Ps2RecompDir C:\dev\PS2Recomp -GameDir ... -IsoPath ... -SkipToolBuild -SkipRecomp -RunSeconds 150 > log.txt 2>&1"`
+(pass -Ps2RecompDir explicitly with -File; let cmd redirect, never a PowerShell `*>`). `-RunOnly` skips the build.
+Debug env vars (patches 0010/0013): APE2_FRAME_DUMP=<dir>, APE2_FRAME_DUMP_EVERY=20, APE2_FRAME_DUMP_VRAM=1,
+APE2_GS_TRACE=1. Profiling (0003-0007) prints [perf], [perf:pc], [perf:host-self/incl], [perf:iop]; perf.txt
+is written by tools/perf_summary.ps1 after -RunSeconds.
+
 ## State
-Boots: memory card check -> "presents" -> intro FMV (skipped by override) -> in-engine 3D intro renders,
-but ~1 frame per 6-7 s. 2D screens 9-22 fps with the software rasterizer at ~86%.
+Boots unattended to the title screen ("Press the START button") in < 150 s: memory card check, UbiSoft and
+SCE logos, intro FMV (skipped by override), in-engine 3D intro, title. 2D screens and textures now render
+correctly (see LOG "Picture: from garbled to a correct title screen").
+Speed: 2D screens ~20 fps; 3D intro / title ~0.5-1 fps. The IOP SPU2 AutoDMA storm is fixed (0008).
 
-## Current step: performance
-Profiler patches 0003-0005 print `[perf]` (per-zone time) and `[perf:pc]` (hottest guest PCs) every ~2 s.
-Known: ee-wait ~0%, so "other" (EE game code / runtime helpers) dominates the 3D intro. Suspect a guest
-busy-wait polling a HW flag. 0005 has been committed but NOT yet built/run on the user's PC (no `[perf:pc]`
-lines in any log so far).
-Next (user runs, unattended, ~2 min; the 3D intro starts ~55 s after boot):
-`git pull`, then
-`.\tools\build_windows.ps1 -GameDir "..." -IsoPath "..." -SkipToolBuild -SkipRecomp -RunSeconds 120`
-It applies 0005, rebuilds, stops the game after 120 s and writes `perf.txt` (tools/perf_summary.ps1:
-merged PC ranking for slow frames + whole run, then the raw `[perf]` lines; plain ASCII).
-Then read the top PCs: `python tools/mdis.py game/SLUS_206.85 0x<pc> 64` (capstone; R5900 COP2/MMI ops
-mis-decode) or the generated C++ in generated/output.
-Do NOT use `[run:tick] pc=` for profiling: that PC is only stored at scheduler dispatch, so it lands on
-function entries / call-return points (0x353320, 0x208B60, 0x19BD34...). The 0005 sampler reads the live
-`ctx->pc`, which generated code writes before every instruction.
-Known code: 0x19BCB8 = per-frame loop (calls main frame function 0x19BCE0 until nonzero, then sceGsSyncPath).
-
-## After performance (user's order)
-1. Picture: 512x512 FB region with a duplicated bottom band (display rect vs 640x448), washed colours,
-   doubled text (interlace/field presentation).
-2. Controller input.
+## Next steps
+1. Performance: the 3D scenes are now pure emulation cost, ~50% GS software rasterizer (DrawTriangle,
+   SampleTexture, lerpChannel, LookupCLUT) and ~45% VU1 interpreter (commitReadyPipelines,
+   calculatePairReadyCycle: cycle-accurate pipeline bookkeeping). Profile with perf.txt host rankings.
+2. Controller input (title screen waits for START).
+3. Picture details still open: PMODE anti-flicker merge ignores the 1-line DISPLAY offset between the two
+   CRTs (harmless); check the 3D intro frames for remaining issues.
 Later: real FMV playback (sceMpegGetPictureRAW8 + IPU CSC), proper guest heap layout (see LOG), remove trace overrides.
+Not pushed: this PC has no GitHub credentials for git push; push from a shell where they are set up.

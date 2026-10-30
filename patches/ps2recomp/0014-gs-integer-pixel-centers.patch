@@ -1,0 +1,36 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 6183726..df853b0 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1308,12 +1308,15 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ 
+         for (int y = drawY0; y <= drawY1; ++y)
+         {
+-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
++            // The GS samples at integer pixel coordinates (games add the +0.5 texel offset themselves, e.g.
++            // uv 0.5..512.5 for a 1:1 copy). Sampling at x+0.5 shifted every texel by half a texel, which
++            // bilinear filtering turned into a blur on every pass (Ape Escape 2 recomp patch 0014).
++            float ty = static_cast<float>(y - unclippedY0) / spriteH;
+             float texVf = v0f + (v1f - v0f) * ty;
+ 
+             for (int x = drawX0; x <= drawX1; ++x)
+             {
+-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
++                float tx = static_cast<float>(x - unclippedX0) / spriteW;
+                 float texUf = u0f + (u1f - u0f) * tx;
+                 uint32_t texel = 0xFFFF00FFu;
+                 if (state.prim.fst)
+@@ -1385,10 +1388,11 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ 
+     for (int y = minY; y <= maxY; ++y)
+     {
+-        float py = static_cast<float>(y) + 0.5f;
++        // GS pixel centres are at integer coordinates (patch 0014; see DrawSprite).
++        float py = static_cast<float>(y);
+         for (int x = minX; x <= maxX; ++x)
+         {
+-            float px = static_cast<float>(x) + 0.5f;
++            float px = static_cast<float>(x);
+ 
+             float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
