@@ -184,3 +184,29 @@
 - build_windows.ps1 -RunSeconds N: runs the game in a child cmd, kills ps2EntryRunner after N s, then runs
   tools/perf_summary.ps1 (boot.log -> perf.txt, ASCII; merged [perf:pc] ranking weighted by samples).
 - tools/mdis.py: capstone disassembly of the ELF by guest address.
+
+## Perf: IOP SPU2 AutoDMA was the 3D-intro bottleneck
+- 0005 [perf:pc] result: hot guest PCs 0x192044 (sw D1_CHCR=0x145, VIF1 DMA kick) and 0x352f88/0x352eb8
+  (4095-entry DMA ordering-table clear/link loops via uncached mirrors 0x2000_0000/0x3000_0000, which use
+  the fast path). Those PCs only say *where* the guest was: the codegen sets ctx->pc to the loop head on every
+  backward branch and calls runtime->eeCheckpointDue(), so runtime work done there is charged to that PC.
+- patches/ps2recomp/0006-perf-host-stack-sampler.patch: the sampler thread also suspends the EE executor
+  thread (single EeScheduler dispatch loop), unwinds its native stack (RtlLookupFunctionEntry/RtlVirtualUnwind,
+  no allocation while suspended), symbolizes from the PDB with DbgHelp and prints [perf:host-self] /
+  [perf:host-incl] every ~2s. New file ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp (Kernel/ is globbed).
+  perf_summary.ps1 merges them into perf.txt.
+- Result: ~81% of slow-frame time = EeScheduler::checkpointDue -> IopEmulator::runCycles ->
+  servicePendingDmaInterrupts -> IopIntrman::dispatchInterrupt -> callFunction -> IOP interpreter.
+- patches/ps2recomp/0007-perf-iop-irq-stats.patch: [perf:iop] per-IRQ handler stats. Result: IRQ 40
+  (0x28 = SPU2 core1 DMA) ~6000 calls/s x ~10.7k IOP instructions, never hitting its budget: the sound
+  driver's 256-word AutoDMA stream block "completed" after transferWords*2 cycles (bus speed).
+- patches/ps2recomp/0008-iop-spu2-adma-pacing.patch: if ADMAS (SPU2 core offset 0x1B0; bit0 core0,
+  bit1 core1) is set for the core, the DMA completion waits 768 IOP cycles (36.864MHz/48kHz) per word.
+  First try read offset 0x19A (that is CORE_ATTR) and slowed core0 bank uploads by seconds; fixed.
+  Log: core0 bank uploads admas=0 (bus speed), core1 stream bcr=0x00100010 admas=0x2 delay=196608.
+- After: "other" 60-99% -> 2-4%, IRQ 40 ~3 calls/s wall, 3D intro ~0.15 fps -> 0.5-1 fps.
+  Now gs-raster ~50% (~38k-60k draws per frame) and vu1 ~45%. Host-self top: VU1 commitReadyPipelines,
+  GSCpuBackend::DrawTriangle, lerpChannel, SampleTexture lambda, LookupCLUT, calculatePairReadyCycle.
+- Running unattended from Claude: VsDevCmd.bat in cmd, then `powershell -File tools\build_windows.ps1
+  -Ps2RecompDir C:\dev\PS2Recomp ...` with cmd doing the redirection (with -File, $PSScriptRoot is empty in
+  param defaults; a PowerShell `*>` redirect turns CMake's stderr warnings into terminating errors).

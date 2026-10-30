@@ -1,0 +1,98 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index e5f63a9..698cf49 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -19,6 +19,8 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
++#include <cstdio>
+ #include <map>
+ #include <optional>
+ #include <span>
+@@ -456,6 +458,8 @@ namespace ps2x::iop::detail
+             }
+             cpu.gpr[31] = kCallReturnSentinel;
+             runCpu(cpu, budget);
++            lastCallReturned = cpu.stopped;
++            lastCallEndPc = cpu.pc;
+             return cpu.gpr[2];
+         }
+ 
+@@ -502,7 +506,21 @@ namespace ps2x::iop::detail
+             try
+             {
+                 for (const int irq : completed)
+-                    (void)intrman.dispatchInterrupt(irq, *this);
++                {
++                    const uint64_t before = totalInstructions;
++                    if (intrman.dispatchInterrupt(irq, *this))
++                    {
++                        IrqPerf &s = irqPerf[irq];
++                        ++s.calls;
++                        s.instructions += totalInstructions - before;
++                        if (!lastCallReturned)
++                        {
++                            ++s.budgetHits;
++                            s.lastEndPc = lastCallEndPc;
++                        }
++                    }
++                }
++                reportIrqPerf();
+             }
+             catch (...)
+             {
+@@ -710,6 +728,52 @@ namespace ps2x::iop::detail
+         GuestCallback secrMcCommandHandler;
+         GuestCallback secrMcDevIdHandler;
+         GuestCallback checkKelfPathCallback;
++
++        // [perf:iop] DMA interrupt handler stats (Ape Escape 2 recomp patch 0007). Every ~2s:
++        //   [perf:iop] instr 12.3M | irq 9: calls 40, instr 4.0M, budget-hits 40, end-pc 0x1234
++        // A budget hit means the handler did not return within its 100k-instruction budget.
++        struct IrqPerf
++        {
++            uint64_t calls = 0;
++            uint64_t instructions = 0;
++            uint64_t budgetHits = 0;
++            uint32_t lastEndPc = 0;
++        };
++        std::map<int, IrqPerf> irqPerf;
++        bool lastCallReturned = true;
++        uint32_t lastCallEndPc = 0;
++        uint64_t perfWindowInstructions = 0;
++        std::chrono::steady_clock::time_point perfNextReport{};
++
++        void reportIrqPerf()
++        {
++            const auto now = std::chrono::steady_clock::now();
++            if (perfNextReport.time_since_epoch().count() == 0)
++            {
++                perfNextReport = now + std::chrono::seconds(2);
++                perfWindowInstructions = totalInstructions;
++                return;
++            }
++            if (now < perfNextReport)
++                return;
++            perfNextReport = now + std::chrono::seconds(2);
++            char line[1024];
++            int len = std::snprintf(line, sizeof(line), "[perf:iop] instr %.1fM",
++                                    (totalInstructions - perfWindowInstructions) / 1e6);
++            for (const auto &[irq, s] : irqPerf)
++            {
++                if (len >= static_cast<int>(sizeof(line)) - 96)
++                    break;
++                len += std::snprintf(line + len, sizeof(line) - len,
++                                     " | irq %d: calls %llu, instr %.2fM, budget-hits %llu, end-pc 0x%x", irq,
++                                     static_cast<unsigned long long>(s.calls), s.instructions / 1e6,
++                                     static_cast<unsigned long long>(s.budgetHits), s.lastEndPc);
++            }
++            std::fprintf(stderr, "%s\n", line);
++            std::fflush(stderr);
++            irqPerf.clear();
++            perfWindowInstructions = totalInstructions;
++        }
+     };
+ 
+     IopEmulator::IopEmulator(IopHost &host)

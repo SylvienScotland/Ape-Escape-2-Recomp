@@ -1,0 +1,241 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp b/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp
+new file mode 100644
+index 0000000..cbe721a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp
+@@ -0,0 +1,186 @@
++// Host stack sampler for the perf profiler (Ape Escape 2 recomp patch); see ps2_perf.h.
++// Lives in Kernel/ because that directory is globbed into ps2_runtime (no CMake edit needed).
++#include "../ps2_perf.h"
++
++#if defined(_WIN32)
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <dbghelp.h>
++#include <string>
++
++#pragma comment(lib, "dbghelp.lib")
++
++namespace ps2perf
++{
++    namespace
++    {
++        std::atomic<HANDLE> g_target{nullptr};
++        std::atomic<DWORD> g_targetId{0};
++
++        constexpr int kMaxFrames = 64;
++
++        // Only touched by the sampler thread.
++        std::unordered_map<DWORD64, uint32_t> g_self;
++        std::unordered_map<DWORD64, uint32_t> g_incl;
++        std::unordered_map<DWORD64, std::string> g_names;
++        uint32_t g_samples = 0;
++        bool g_symInit = false;
++
++        // Unwind the suspended thread into function start addresses. Must not allocate or take
++        // CRT locks: the target may hold them. RtlLookupFunctionEntry/RtlVirtualUnwind are what
++        // in-process sampling profilers use for this.
++        int unwind(CONTEXT &ctx, DWORD64 *frames)
++        {
++            int n = 0;
++            while (n < kMaxFrames && ctx.Rip != 0)
++            {
++                DWORD64 imageBase = 0;
++                PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
++                if (!fe)
++                {
++                    // Leaf function (no unwind info): return address is at [rsp].
++                    frames[n++] = ctx.Rip;
++                    if (ctx.Rsp == 0)
++                        break;
++                    ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
++                    ctx.Rsp += 8;
++                    continue;
++                }
++                frames[n++] = imageBase + fe->BeginAddress;
++                PVOID handlerData = nullptr;
++                DWORD64 establisher = 0;
++                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fe, &ctx, &handlerData,
++                                 &establisher, nullptr);
++            }
++            return n;
++        }
++
++        const std::string &nameOf(DWORD64 addr)
++        {
++            auto it = g_names.find(addr);
++            if (it != g_names.end())
++                return it->second;
++            HANDLE proc = GetCurrentProcess();
++            if (!g_symInit)
++            {
++                SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
++                g_symInit = SymInitialize(proc, nullptr, TRUE) != FALSE;
++            }
++            char buf[sizeof(SYMBOL_INFO) + 256] = {};
++            auto *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
++            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
++            sym->MaxNameLen = 255;
++            DWORD64 disp = 0;
++            std::string name;
++            if (g_symInit && SymFromAddr(proc, addr, &disp, sym))
++            {
++                name.assign(sym->Name, sym->NameLen);
++                if (disp != 0)
++                {
++                    char off[24];
++                    std::snprintf(off, sizeof(off), "+0x%llx", static_cast<unsigned long long>(disp));
++                    name += off;
++                }
++            }
++            else
++            {
++                char raw[32];
++                std::snprintf(raw, sizeof(raw), "0x%llx", static_cast<unsigned long long>(addr));
++                name = raw;
++            }
++            for (char &c : name)
++                if (c == '|')
++                    c = '!';
++            if (name.size() > 70)
++                name = name.substr(0, 67) + "...";
++            return g_names.emplace(addr, std::move(name)).first->second;
++        }
++
++        void printTop(const char *tag, const std::unordered_map<DWORD64, uint32_t> &hist, size_t limit)
++        {
++            std::vector<std::pair<DWORD64, uint32_t>> rows(hist.begin(), hist.end());
++            const size_t topN = rows.size() < limit ? rows.size() : limit;
++            std::partial_sort(rows.begin(), rows.begin() + topN, rows.end(),
++                              [](const auto &a, const auto &b) { return a.second > b.second; });
++            std::string line = std::string("[") + tag + "] samples=" + std::to_string(g_samples);
++            for (size_t i = 0; i < topN; ++i)
++            {
++                char pct[16];
++                std::snprintf(pct, sizeof(pct), " | %.0f%% ", 100.0 * rows[i].second / g_samples);
++                line += pct;
++                line += nameOf(rows[i].first);
++            }
++            std::fprintf(stderr, "%s\n", line.c_str());
++        }
++    }
++
++    void hostRegisterCurrentThread()
++    {
++        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
++                              GetCurrentThreadId());
++        if (!h)
++            return;
++        g_targetId.store(GetCurrentThreadId());
++        HANDLE old = g_target.exchange(h);
++        if (old)
++            CloseHandle(old);
++    }
++
++    void hostSampleTick()
++    {
++        HANDLE h = g_target.load();
++        if (!h || g_targetId.load() == GetCurrentThreadId())
++            return;
++        DWORD64 frames[kMaxFrames];
++        int n = 0;
++        if (SuspendThread(h) == static_cast<DWORD>(-1))
++            return;
++        CONTEXT ctx{};
++        ctx.ContextFlags = CONTEXT_FULL;
++        if (GetThreadContext(h, &ctx))
++            n = unwind(ctx, frames);
++        ResumeThread(h);
++        if (n == 0)
++            return;
++
++        ++g_samples;
++        ++g_self[frames[0]];
++        for (int i = 0; i < n; ++i)
++        {
++            bool seen = false;
++            for (int j = 0; j < i && !seen; ++j)
++                seen = frames[j] == frames[i];
++            if (!seen)
++                ++g_incl[frames[i]];
++        }
++    }
++
++    void hostReport()
++    {
++        if (g_samples == 0)
++            return;
++        printTop("perf:host-self", g_self, 15);
++        printTop("perf:host-incl", g_incl, 30);
++        std::fflush(stderr);
++        g_self.clear();
++        g_incl.clear();
++        g_samples = 0;
++    }
++}
++
++#else
++
++namespace ps2perf
++{
++    void hostRegisterCurrentThread() {}
++    void hostSampleTick() {}
++    void hostReport() {}
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/ps2_perf.h b/ps2xRuntime/src/lib/ps2_perf.h
+index 1a3cbf6..9cce367 100644
+--- a/ps2xRuntime/src/lib/ps2_perf.h
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -156,6 +156,16 @@ namespace ps2perf
+     // noise). Every ~2s prints the hottest PCs:  [perf:pc] 0x1a90d8 31% | 0x19bd34 12% | ...
+     inline std::atomic<const uint32_t *> g_activePc{nullptr};
+ 
++    // ---- host stack sampler (Kernel/zz_ps2_perf_host.cpp; Windows only, no-ops elsewhere) ----
++    // The guest PC alone hides runtime time (DMA kicks, checkpoints, syscalls run "at" a guest PC),
++    // so the sampler also suspends the thread running guest code, unwinds its native stack and
++    // every ~2s prints the hottest host functions (PDB names; sub_XXXXXXXX = generated guest code):
++    //   [perf:host-self] samples=N | 31% name | ...   (leaf function)
++    //   [perf:host-incl] samples=N | 88% name | ...   (anywhere on the stack)
++    void hostRegisterCurrentThread();
++    void hostSampleTick();
++    void hostReport();
++
+     inline void samplerMain()
+     {
+         std::unordered_map<uint32_t, uint32_t> hist;
+@@ -170,12 +180,14 @@ namespace ps2perf
+                 const uint32_t pc = *reinterpret_cast<const volatile uint32_t *>(p);
+                 ++hist[pc];
+                 ++total;
++                hostSampleTick();
+             }
+             if (std::chrono::steady_clock::now() < next)
+                 continue;
+             next += std::chrono::seconds(2);
+             if (total == 0)
+                 continue;
++            hostReport();
+             std::vector<std::pair<uint32_t, uint32_t>> rows(hist.begin(), hist.end());
+             const size_t topN = rows.size() < 12 ? rows.size() : 12;
+             std::partial_sort(rows.begin(), rows.begin() + topN, rows.end(),
+@@ -195,6 +207,12 @@ namespace ps2perf
+     inline void publishActivePc(const uint32_t *pcWord)
+     {
+         g_activePc.store(pcWord, std::memory_order_relaxed);
++        static thread_local bool registered = false;
++        if (!registered)
++        {
++            registered = true;
++            hostRegisterCurrentThread();
++        }
+         static std::once_flag started;
+         std::call_once(started, [] { std::thread(samplerMain).detach(); });
+     }

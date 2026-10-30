@@ -1,0 +1,53 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 25e9b36..4f16409 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,6 +1,7 @@
+ #include "iop_memory.h"
+ 
+ #include <algorithm>
++#include <cstdio>
+ #include <cstring>
+ 
+ namespace ps2x::iop::detail
+@@ -12,6 +13,13 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+         constexpr int kDmaSpu1Irq = 0x28;
++        // SPU2 AutoDMA (ADMA): the SPU pulls the stream block as it plays it, so the DMA only completes
++        // after one 32-bit word (one 16-bit stereo frame) per 48 kHz sample. Completing at bus speed
++        // makes sound drivers refill their stream thousands of times per second (Ape Escape 2 recomp
++        // patch 0008). ADMAS is SPU2 core offset 0x1B0 (bit 0 = core0, bit 1 = core1).
++        constexpr uint32_t kSpu2Core0AdmasWord = 0x1F9001B0u;
++        constexpr uint32_t kSpu2CoreStride = 0x400u;
++        constexpr uint64_t kAdmaCyclesPerWord = 36'864'000ull / 48'000ull; // IOP clock / 48 kHz = 768
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -269,9 +277,25 @@ namespace ps2x::iop::detail
+         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
+         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
+         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
++        uint64_t delayCycles = std::max<uint64_t>(transferWords * 2u, 64u);
++        const uint32_t admasWord = kSpu2Core0AdmasWord + (secondCore ? kSpu2CoreStride : 0u);
++        uint32_t admas = 0u;
++        if (const auto current = m_hardware.find(admasWord); current != m_hardware.end())
++            admas = current->second & 0xFFFFu;
++        const bool autoDma = (admas & (secondCore ? 2u : 1u)) != 0u;
++        if (autoDma)
++            delayCycles = std::max<uint64_t>(delayCycles, transferWords * kAdmaCyclesPerWord);
++        static int logged[2] = {0, 0};
++        if (logged[secondCore ? 1 : 0] < 4)
++        {
++            ++logged[secondCore ? 1 : 0];
++            std::fprintf(stderr, "[IOP] SPU2 core%d DMA start: bcr=0x%08x words=%llu admas=0x%x delay=%llu cycles\n",
++                         secondCore ? 1 : 0, blockControl, static_cast<unsigned long long>(transferWords), admas,
++                         static_cast<unsigned long long>(delayCycles));
++        }
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            std::max<uint64_t>(transferWords * 2u, 64u),
++            delayCycles,
+         };
+     }
+ 
