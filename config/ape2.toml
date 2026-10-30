@@ -250,6 +250,17 @@ stubs = [
 # Guest functions without runtime handlers that may be referenced by address.
 # PS2Recomp keeps their guest implementation and exposes exact callable entries.
 entry_points = [
+  "0x0018D7B8", # reached only by pointer: stored in table 0x3dc65c
+  "0x0018D7D0", # reached only by pointer: stored in tables 0x3dc7e0/0x3dc810
+  "0x0018D7E8", # reached only by pointer: stored in table 0x3dc600
+  "0x0019B890", # reached only by pointer: stored in table 0x3dd0d4
+  "0x001BF048", # reached only by pointer: game mode init table 0x3ec338: blocked the game after START
+  "0x001BFFB8", # reached only by pointer: game mode table 0x3ec3a8
+  "0x002F91E8", # reached only by pointer: stored in table 0x4d6cac
+  "0x0032BF40", # reached only by pointer: stored in table 0x4dd7bc
+  "0x0011E9A8", # reached only by pointer: address taken in code
+  "0x00313B20", # reached only by pointer: address taken in code
+  "0x00205698", # reached only by pointer: return-0 callback (found by the PAL port heuristic)
   "0x0036AA38", # sceDmaGetEnv: forced so its stub binding applies
   "0x0036AA70", # sceDmaPutStallAddr: forced so its stub binding applies
   "0x0036AA98", # sceDmaSend: forced so its stub binding applies

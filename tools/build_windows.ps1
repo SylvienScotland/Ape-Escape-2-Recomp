@@ -125,7 +125,7 @@ foreach ($o in Get-ChildItem "$Repo\overrides\*.cpp" -ErrorAction SilentlyContin
 # 5. Build the runner (this is the long one: ~8.5k generated files)
 if (-not $RunOnly) {
     Step "Building ps2EntryRunner ($Config)"
-    cmake -S $Ps2RecompDir -B $RunBuild -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+    cmake -S $Ps2RecompDir -B $RunBuild -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF -DPS2X_ENABLE_AGRESSIVE_LOGS=OFF
     cmake --build $RunBuild --config $Config --target ps2EntryRunner --parallel
     # Without this a failed build silently boots the previous exe.
     if ($LASTEXITCODE -ne 0) { throw "ps2EntryRunner build failed (exit $LASTEXITCODE)" }

@@ -307,3 +307,28 @@
   START leaves the title. Next: after START the game stops drawing, EE idle (all threads blocked), last disc
   read = 1-sector header at lbn 0x5b9f0 ("title", 0xbb80 = 48 kHz): likely the PCM/BGM stream start (IOP
   sound driver + CD streaming) blocks.
+
+## Past START into the stage intro: missed functions, movie skip, IOP heap (0024, 0025)
+- The stall after START was not the PCM stream. The title screen's state machine (switch 0x1BE2B8, table
+  0x3EC338: 10 states x init/update/draw/exit) calls state 2's init 0x1BF048 through the table; the
+  recompiler never registered it ("[guest-branch:missing-target] ... target=0x1bf048"), so the main thread
+  stopped. Scanned the ELF for code addresses stored in data / built with lui+addiu that are not registered
+  and not switch labels: 10 real entries, added to config/ape2.toml entry_points (resume entries inside the
+  containing function, dispatched by `switch (ctx->pc)`). Cross-checked with the entry heuristic of the PAL
+  port (JackyPendrag0n/ae2-recomp, recomp/elfinfo.py): one more, 0x205698.
+- Build: PS2X_ENABLE_AGRESSIVE_LOGS=OFF. It logged every guest function entry to ps2_log.txt (500 MB/run).
+- overrides/zz_ape2_movies.cpp (approach from the PAL port's hle_movie_start / hle_movie_bank_load, with the
+  author's permission): movie start 0x1A4B78 reports the movie finished at once ([gp-0x3F8] = 3, the game's
+  own end state written at 0x1A4B68); per-movie bank load 0x1A5968 -> [gp-0x3C0] = 0. APE2_MOVIES=1 keeps
+  the originals.
+- IOP heap: sceSifAllocIopHeap is a runtime stub, but sceSifFreeIopHeap (0x3A3A88) -> sceSifFreeSysMemory
+  (0x3A3A10) ran the game's RPC, which never freed these blocks. zz_ape2_iopheap.cpp now frees 0x3A3A10 in the
+  same allocator. The sound loader 0x1B73E0 allocates a temporary IOP buffer per bank and frees it.
+- patches/ps2recomp/0024-iop-heap-first-fit.patch: IopMemory::allocate searched from a high-water mark, so
+  freed blocks were never reused; now first fit from HeapBase, maxFreeMemory = largest real gap. New Game's
+  stage bank (0x54D90 bytes) failed before this.
+- Result: title -> menu (New game / Continue / Options) -> New Game -> "Go ape and capture 3 monkeys!" intro.
+- Next stall: return into 0x200034, unregistered. The recompiler had made 0x200030 a function start (a data
+  word 0x00200030 passed LooksLikeCallableEntry's short-tail-thunk check), cutting 0x1FFFE8 short in the
+  middle; 0x200030 is a jal delay slot. patches/ps2recomp/0025-recomp-no-entry-in-delay-slot.patch: an
+  address-taken start is rejected when it is a branch/jump delay slot or the return site after a call.

@@ -1,0 +1,51 @@
+diff --git a/ps2xRecomp/src/lib/elf_parser.cpp b/ps2xRecomp/src/lib/elf_parser.cpp
+index 9d3b9f0..8d41269 100644
+--- a/ps2xRecomp/src/lib/elf_parser.cpp
++++ b/ps2xRecomp/src/lib/elf_parser.cpp
+@@ -517,6 +517,46 @@ namespace
+         }
+ 
+         const uint32_t startOffset = address - section->address;
++
++        // A data word that happens to equal a code address (flags such as 0x00200030) must not
++        // split a function in the middle. Two positions can never be a function start: a branch
++        // or jump delay slot, and the return site right after a call's delay slot. Splitting there
++        // cut the caller short, so the call returned into unregistered code.
++        auto isBranchOrJump = [](uint32_t raw) -> bool
++        {
++            const uint32_t opcode = OPCODE(raw);
++            if (opcode == OPCODE_J || opcode == OPCODE_JAL)
++                return true;
++            if (opcode == OPCODE_SPECIAL)
++                return FUNCTION(raw) == SPECIAL_JR || FUNCTION(raw) == SPECIAL_JALR;
++            if (opcode == OPCODE_REGIMM)
++                return true; // BLTZ/BGEZ(AL)(L)
++            if ((opcode >= 0x04u && opcode <= 0x07u) || (opcode >= 0x14u && opcode <= 0x17u))
++                return true; // BEQ/BNE/BLEZ/BGTZ and the likely forms
++            if ((opcode == 0x10u || opcode == 0x11u || opcode == 0x12u) && RS(raw) == 0x08u)
++                return true; // BC0x/BC1x/BC2x
++            return false;
++        };
++        auto isCall = [](uint32_t raw) -> bool
++        {
++            return OPCODE(raw) == OPCODE_JAL ||
++                   (OPCODE(raw) == OPCODE_SPECIAL && FUNCTION(raw) == SPECIAL_JALR);
++        };
++        uint32_t previous = 0;
++        if (startOffset >= MIPS_INSTRUCTION_SIZE &&
++            ReadSectionWord(*section, startOffset - MIPS_INSTRUCTION_SIZE, previous) &&
++            isBranchOrJump(previous))
++        {
++            return false;
++        }
++        uint32_t beforePrevious = 0;
++        if (startOffset >= 2u * MIPS_INSTRUCTION_SIZE &&
++            ReadSectionWord(*section, startOffset - 2u * MIPS_INSTRUCTION_SIZE, beforePrevious) &&
++            isCall(beforePrevious))
++        {
++            return false;
++        }
++
+         constexpr uint32_t kStandardProbeWords = 8;
+         // Retail initializer tables sometimes point at functions that materialize
+         // a sizeable block of constants before allocating their stack frame.
