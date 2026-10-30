@@ -296,3 +296,14 @@
   APE2_GS_THREADS=N, 1 disables), 4-row blocks from an atomic counter; per-row code unchanged.
 - Title / 3D intro: ~1.0 -> 1.9 fps. gs-raster 55-60% -> 15-21%; VU1 interpreter is now ~70% of the frame.
 - Frames compared to the previous build: identical where the game state matches.
+- patches/ps2recomp/0023-iop-sifsetdmaintr-callback.patch: the real blocker. sifman import 32 is
+  sceSifSetDmaIntr(dmat, count, callback, arg): DBCMAN sends pad data with it and its completion callback
+  (DBCMAN+0x2c0) does iSignalSema on the semaphore DS1O's port thread then WaitSema's on (DBCMAN+0x388). The
+  callback is now queued (pendingGuestCallbacks, +256 cycles). Found with patch 0022 diagnostics:
+  APE2_IOP_THREADS=1 (IOP thread table every 5 s: DS1O thread blocked on sema 4 at DBCMAN+0x390) and
+  APE2_RPC_TRACE=1 (EE and IOP SIF RPC binds/calls; DBCMAN servers are 0x80000900 / 0x8000091b, the game
+  calls 0x80000900 fn 0x8000091a every frame).
+- Result: port 0 polled every frame; scripted START/CROSS reach the game (pad0 buttons=0xfff7 / 0xbfff);
+  START leaves the title. Next: after START the game stops drawing, EE idle (all threads blocked), last disc
+  read = 1-sector header at lbn 0x5b9f0 ("title", 0xbb80 = 48 kHz): likely the PCM/BGM stream start (IOP
+  sound driver + CD streaming) blocks.

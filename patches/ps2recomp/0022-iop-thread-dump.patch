@@ -1,0 +1,225 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index 4832d8f..06c7d34 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -4,6 +4,8 @@
+ #include "../iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <iterator>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -23,6 +25,27 @@ namespace ps2x::iop::detail
+     {
+     }
+ 
++    void IopKernel::debugDump(uint64_t currentCycle) const
++    {
++        static const char *const kStates[] = {"dormant", "ready", "running", "sleep", "delay",
++                                              "sema", "evflag", "suspended", "dead"};
++        std::fprintf(stderr, "[iop:threads] cycle=%llu threads=%zu\n", static_cast<unsigned long long>(currentCycle),
++                     m_threads.size());
++        for (const auto &[id, t] : m_threads)
++        {
++            const auto state = static_cast<size_t>(t.state);
++            std::fprintf(stderr,
++                         "[iop:threads]   id=%d %-9s prio=%u entry=0x%x pc=0x%x ra=0x%x wait=%d bits=0x%x mode=%u wake=%llu\n",
++                         id, state < std::size(kStates) ? kStates[state] : "?", t.priority, t.entry, t.cpu.pc,
++                         t.cpu.gpr[31], t.waitId, t.waitBits, t.waitMode,
++                         static_cast<unsigned long long>(t.wakeCycle));
++        }
++        for (const auto &[id, s] : m_semaphores)
++            std::fprintf(stderr, "[iop:threads]   sema %d count=%d/%d\n", id, s.current, s.maximum);
++        for (const auto &[id, e] : m_eventFlags)
++            std::fprintf(stderr, "[iop:threads]   evflag %d bits=0x%x\n", id, e.bits);
++    }
++
+     void IopKernel::reset()
+     {
+         m_threads.clear();
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 4977102..5683548 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -68,6 +68,10 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+ 
++        // Prints every thread (state, priority, pc, ra, wait object) plus semaphores and event flags
++        // (APE2_IOP_THREADS=1, Ape Escape 2 recomp patch 0022).
++        void debugDump(uint64_t currentCycle) const;
++
+     private:
+         struct Semaphore
+         {
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index d730ac1..bc7bb50 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -21,6 +21,7 @@
+ #include <cctype>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ #include <map>
+ #include <optional>
+ #include <span>
+@@ -583,6 +584,7 @@ namespace ps2x::iop::detail
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this);
+                     vblank.serviceDue(totalCycles, *this);
++                    maybeDumpThreads();
+                     IopThread *next = kernel.beginNextReady(totalCycles);
+                     if (!next)
+                     {
+@@ -748,6 +750,24 @@ namespace ps2x::iop::detail
+         uint64_t perfWindowInstructions = 0;
+         std::chrono::steady_clock::time_point perfNextReport{};
+ 
++        // APE2_IOP_THREADS=1: dump the IOP thread table every ~5 s of wall time (patch 0022).
++        void maybeDumpThreads()
++        {
++            static const bool enabled = []
++            {
++                const char *e = std::getenv("APE2_IOP_THREADS");
++                return e && *e && *e != '0';
++            }();
++            if (!enabled)
++                return;
++            static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++            const auto now = std::chrono::steady_clock::now();
++            if (now < next)
++                return;
++            next = now + std::chrono::seconds(5);
++            kernel.debugDump(totalCycles);
++        }
++
+         void reportIrqPerf()
+         {
+             const auto now = std::chrono::steady_clock::now();
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index dd70af2..4a88ab2 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -8,12 +8,27 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
++    namespace
++    {
++        // APE2_RPC_TRACE=1: log IOP RPC server registrations and calls into emulated modules (patch 0022).
++        bool rpcTraceEnabled()
++        {
++            static const bool enabled = []
++            {
++                const char *e = std::getenv("APE2_RPC_TRACE");
++                return e && *e && *e != '0';
++            }();
++            return enabled;
++        }
++    }
++
+     IopRpcBridge::IopRpcBridge(IopHost &host, IopMemory &memory, IopKernel &kernel) noexcept
+         : m_host(host), m_memory(memory), m_kernel(kernel)
+     {
+@@ -243,6 +258,9 @@ namespace ps2x::iop::detail
+             server.callbackBuffer = m_memory.read32(stackPointer + 20u);
+             server.queue = m_memory.read32(stackPointer + 24u);
+             m_servers[server.sid] = server;
++            if (rpcTraceEnabled())
++                std::fprintf(stderr, "[rpc] register sid=0x%x function=0x%x buffer=0x%x\n", server.sid, server.function,
++                             server.buffer);
+             if (server.serverData != 0u)
+             {
+                 m_memory.write32(server.serverData + 0x20u, server.sid);
+@@ -303,6 +321,17 @@ namespace ps2x::iop::detail
+             return result;
+ 
+         RpcServer &server = serverIt->second;
++        if (rpcTraceEnabled())
++        {
++            static uint32_t traced = 0;
++            if (traced < 400u)
++            {
++                ++traced;
++                std::fprintf(stderr, "[rpc] call sid=0x%x fn=0x%x send=0x%x/0x%x recv=0x%x/0x%x\n", request.sid,
++                             request.function, request.send.address, request.send.size, request.receive.address,
++                             request.receive.size);
++            }
++        }
+         if (request.send.size != 0u && server.buffer != 0u)
+         {
+             const uint32_t copySize = std::min<uint32_t>(request.send.size, IopMemory::RamSize - std::min(server.buffer, IopMemory::RamSize));
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..57d329d 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -2,10 +2,31 @@
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+ 
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++
+ namespace ps2_syscalls
+ {
+     namespace
+     {
++        // APE2_RPC_TRACE=1: log EE-side SIF RPC binds, calls and busy CheckStatRpc results (patch 0022).
++        bool eeRpcTrace()
++        {
++            static const bool enabled = []
++            {
++                const char *e = std::getenv("APE2_RPC_TRACE");
++                return e && *e && *e != '0';
++            }();
++            return enabled;
++        }
++
++        bool eeRpcTraceBudget()
++        {
++            static std::atomic<uint32_t> lines{0};
++            return eeRpcTrace() && lines.fetch_add(1, std::memory_order_relaxed) < 600u;
++        }
++
+         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
+         {
+             SifRpcDebugEvent event{};
+@@ -329,6 +350,8 @@ namespace ps2_syscalls
+             client->cbuf = 0;
+         }
+ 
++        if (eeRpcTraceBudget())
++            std::fprintf(stderr, "[ee:rpc] bind client=0x%x sid=0x%x server=0x%x\n", clientPtr, rpcId, serverPtr);
+         SifRpcDebugEvent event = makeRpcDebugEvent("BindRpc", ctx, runtime);
+         event.clientPtr = clientPtr;
+         event.serverPtr = serverPtr;
+@@ -544,6 +567,9 @@ namespace ps2_syscalls
+             request.endParameter = endParameter;
+ 
+             iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
++            if (eeRpcTraceBudget())
++                std::fprintf(stderr, "[ee:rpc] call client=0x%x sid=0x%x fn=0x%x mode=%u server=0x%x handled=%d\n",
++                             clientPtr, sid, rpcNum, mode, serverPtr, iopResult.handled ? 1 : 0);
+ 
+             if (iopResult.signalNowaitCompletion &&
+                 (mode & kSifRpcModeNowait) != 0u)
+@@ -824,6 +850,8 @@ namespace ps2_syscalls
+             setReturnS32(ctx, 0);
+             return;
+         }
++        if (it->second.busy && eeRpcTraceBudget())
++            std::fprintf(stderr, "[ee:rpc] checkstat client=0x%x sid=0x%x busy\n", clientPtr, it->second.sid);
+         setReturnS32(ctx, it->second.busy ? 1 : 0);
+     }
+ 

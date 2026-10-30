@@ -1,0 +1,49 @@
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index bc7bb50..2d147ef 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -40,6 +40,7 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kCallStackSize = 0x2000u;
+         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
+         constexpr uint64_t kCdvdCompletionCycles = 128u;
++        constexpr uint64_t kSifDmaCompletionCycles = 256u;
+ 
+         uint32_t physicalAddress(uint32_t address)
+         {
+@@ -322,9 +323,20 @@ namespace ps2x::iop::detail
+                 return ImportDisposition::Handled;
+             if (iequals(call.library, "sifman"))
+             {
+-                return rpc.dispatchSifManImport(call.ordinal, cpu)
+-                           ? ImportDisposition::Handled
+-                           : ImportDisposition::Missing;
++                // sceSifSetDmaIntr(dmat, count, callback, arg): the DMA's completion interrupt calls
++                // callback(arg). DBCMAN signals the semaphore its pad thread then waits on from that callback,
++                // so without it the controller was read once and never again (Ape Escape 2 recomp patch 0023).
++                const uint32_t completionCallback = call.ordinal == 32u ? cpu.gpr[6] : 0u;
++                const uint32_t completionArgument = cpu.gpr[7];
++                const uint32_t callerGp = cpu.gpr[28];
++                if (!rpc.dispatchSifManImport(call.ordinal, cpu))
++                    return ImportDisposition::Missing;
++                if (completionCallback != 0u && cpu.gpr[2] != 0u)
++                {
++                    pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
++                                                  ScheduledGuestCallback{completionCallback, callerGp, completionArgument});
++                }
++                return ImportDisposition::Handled;
+             }
+             if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+                 return ImportDisposition::Handled;
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index 4a88ab2..f704f22 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -55,7 +55,7 @@ namespace ps2x::iop::detail
+             setV0(0u);
+             return true;
+         case 7:  // sceSifSetDma
+-        case 32: // isceSifSetDma (interrupt-context variant; DBCMAN sends pad data with it, patch 0020)
++        case 32: // sceSifSetDmaIntr: same transfer; the emulator queues its completion callback (patch 0023)
+         {
+             constexpr uint32_t kDescriptorSize = 16u;
+             constexpr uint32_t kMaxDescriptors = 32u;
