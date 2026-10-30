@@ -366,3 +366,24 @@
     APE2_VU_NATIVE=1 / verify (off by default until verify is clean: clip/Q of the past-end vertices differ).
   - Debug aids: APE2_VIF_TRACE=1 (unpacks into low VU1 memory + source), APE2_STORE_WATCH=<addr>.
 - Lesson: compare with the PAL port first (its mmi.h would have shown the shuffles at once).
+
+## Flicker and white/magenta washes fixed: VU random unit, FPU/VU0 edge cases, presentation (0028)
+- Presenter: two guesses (show the source of the full-screen copy sprite; show a render target when the
+  display buffer is black) showed the back buffer while the next frame was still being drawn. Now strictly
+  DISPFB like the hardware / PAL port; APE2_DISPLAY_HEURISTICS=1 restores them.
+- APE2_DRAW_LOG=<first vsync>,<count>: per vsync, every distinct draw state (target, prim, texture, alpha,
+  test, fog, first vertex colour, rectangle). APE2_FRAME_DUMP_START=<n> starts dumping at presented frame n.
+  The washes were full-screen additive glow sprites (ALPHA 0x48) with random-looking vertex colours.
+- Differential test harnesses (tools/mmi_check.py, cop2_check.py, fpu_check.py): one generated statement per
+  MMI / COP2 / FPU operation the game uses, run against the PAL port's reference semantics (mmi.h, vu0.h,
+  ps2.h + its recomp.py decode) on random registers. MMI 29/29 match after 0027.
+- patches/ps2recomp/0028:
+  - VU0 random unit (game: ~2300 VRNEXT, 655 VRGET, 656 VRINIT): VRNEXT never wrote ft, VRGET returned the
+    raw state instead of 1.0 + 23 random bits, VRINIT/VRXOR used invented mixing. Now the hardware LFSR (as the
+    VU interpreter and PAL). This was the wash: the effects' flicker intensity came from VRGET.
+  - PS2_FLOAT_MAX_BITS was 0x7FFFFFFF (a host NaN): now 0x7F7FFFFF like PCSX2/PAL.
+  - CVT.W.S used nearbyintf (round to nearest); now truncates and saturates.
+  - VDIV/VSQRT/VRSQRT use the PS2 helpers (zero divisor -> +-max, sqrt |x|); VRSQRT ignored fs (computed 1/sqrt).
+- Result: stage intro plays with a stable picture. Open: two VDIV encodings still give Q=0 in the harness
+  (decoded differently), VOPMULA/VOPMSUB MAC flags, NaN-pattern operands in FPU ops (PS2 treats exponent 255 as a
+  number).

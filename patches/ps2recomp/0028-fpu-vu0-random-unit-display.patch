@@ -1,0 +1,328 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..e8ddcf7 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -75,21 +75,24 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fdiv(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf); // PS2 rules: zero divisor gives +-max
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fsqrt(ft); }}", ft_reg, ft_reg, ftf); // sqrt(|ft|) as on the PS2
+     }
+ 
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        // VRSQRT Q, fs.fsf, ft.ftf: Q = fs / sqrt(|ft|) (the numerator is fs, not 1)
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_frsqrt(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+@@ -177,22 +180,20 @@ namespace ps2recomp
+             vis_reg_idx);
+     }
+ 
++    // The VU random unit (Ape Escape 2 recomp patch 0028): R holds 23 random bits in lane 0 as 0x3F800000 | bits (the
++    // form copyVu0ContextToState expects); RNEXT steps the hardware LFSR (bit 4 xor bit 22 shifted in, as the VU
++    // interpreter and the PAL port do), RNEXT/RGET return 1.0 + bits in [1, 2). The old versions never wrote ft
++    // (RNEXT), returned the raw state (RGET) and mixed seeds with made-up functions (RINIT/RXOR): random-driven
++    // effects drew with garbage colours.
+     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
+     {
++        const uint8_t dest = inst.vectorInfo.vectorField;
+         return fmt::format(
+-            "{{\n"
+-            "    uint32_t r_vals[4];\n"
+-            "    _mm_storeu_si128((__m128i*)r_vals, _mm_castps_si128(ctx->vu0_r));\n"
+-            "\n"
+-            "    // Simple LFSR-based random number generation (PS2-like behavior)\n"
+-            "    uint32_t feedback = r_vals[0] ^ (r_vals[0] << 13) ^ (r_vals[1] >> 19) ^ (r_vals[2] << 7);\n"
+-            "    r_vals[0] = r_vals[1];\n"
+-            "    r_vals[1] = r_vals[2];\n"
+-            "    r_vals[2] = r_vals[3];\n"
+-            "    r_vals[3] = feedback;\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_loadu_si128((__m128i*)r_vals));\n"
+-            "}}");
++            "{{ uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); r &= 0x7FFFFFu; "
++            "r = ((r << 1) | (((r >> 4) ^ (r >> 22)) & 1u)) & 0x7FFFFFu; "
++            "const __m128 v = _mm_castsi128_ps(_mm_set1_epi32((int)(0x3F800000u | r))); ctx->vu0_r = v; "
++            "if ({} != 0) ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], v, _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); }}",
++            inst.rt, inst.rt, inst.rt, (dest & 0x1) ? -1 : 0, (dest & 0x2) ? -1 : 0, (dest & 0x4) ? -1 : 0, (dest & 0x8) ? -1 : 0);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMADD_Field(const Instruction &inst)
+@@ -831,56 +832,32 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+     {
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ __m128 res = ctx->vu0_r; __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}", (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, ft_reg, ft_reg);
++        const uint8_t dest = inst.vectorInfo.vectorField;
++        return fmt::format(
++            "{{ uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); "
++            "const __m128 v = _mm_castsi128_ps(_mm_set1_epi32((int)(0x3F800000u | (r & 0x7FFFFFu)))); "
++            "if ({} != 0) ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], v, _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); }}",
++            inst.rt, inst.rt, inst.rt, (dest & 0x1) ? -1 : 0, (dest & 0x2) ? -1 : 0, (dest & 0x4) ? -1 : 0, (dest & 0x8) ? -1 : 0);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRINIT(const Instruction &inst)
+     {
+-        uint8_t fs_reg = inst.rd;
+-        uint8_t fsf = inst.vectorInfo.fsf;
+-
++        // R = fs.fsf & 0x7FFFFF
+         return fmt::format(
+-            "{{\n"
+-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
+-            "    uint32_t seed; std::memcpy(&seed, &src, sizeof(seed));\n"
+-            "\n"
+-            "    // PS2 uses a specific LFSR initialization pattern\n"
+-            "    if (seed == 0) seed = 1;\n"
+-            "\n"
+-            "    uint32_t r0 = seed;\n"
+-            "    uint32_t r1 = seed * 0x41C64E6D + 0x3039;\n"
+-            "    uint32_t r2 = r1 * 0x41C64E6D + 0x3039;\n"
+-            "    uint32_t r3 = r2 * 0x41C64E6D + 0x3039;\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_set_epi32(r3, r2, r1, r0));\n"
+-            "}}",
+-            fs_reg, fs_reg, fsf);
++            "{{ const float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++            "uint32_t bits; std::memcpy(&bits, &src, 4); "
++            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)(0x3F800000u | (bits & 0x7FFFFFu)))); }}",
++            inst.rd, inst.rd, inst.vectorInfo.fsf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRXOR(const Instruction &inst)
+     {
+-        uint8_t fs_reg = inst.rd;
+-        uint8_t fsf = inst.vectorInfo.fsf;
+-
++        // R ^= fs.fsf (23 bits)
+         return fmt::format(
+-            "{{\n"
+-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
+-            "    uint32_t src_bits; std::memcpy(&src_bits, &src, sizeof(src_bits));\n"
+-            "    __m128i r_current = _mm_castps_si128(ctx->vu0_r);\n"
+-            "    __m128i fs_data = _mm_set1_epi32((int)src_bits);\n"
+-            "\n"
+-            "    // XOR the current random value with the data from the VU vector register\n"
+-            "    __m128i xored = _mm_xor_si128(r_current, fs_data);\n"
+-            "\n"
+-            "    // Apply a simple mixing function similar to PS2's LFSR\n"
+-            "    __m128i mixed = _mm_xor_si128(xored, _mm_slli_epi32(xored, 7));\n"
+-            "    mixed = _mm_xor_si128(mixed, _mm_srli_epi32(mixed, 9));\n"
+-            "\n"
+-            "    ctx->vu0_r = _mm_castsi128_ps(mixed);\n"
+-            "}}",
+-            fs_reg, fs_reg, fsf);
++            "{{ const float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++            "uint32_t bits; std::memcpy(&bits, &src, 4); uint32_t r; std::memcpy(&r, &ctx->vu0_r, 4); "
++            "ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32((int)(0x3F800000u | ((r ^ bits) & 0x7FFFFFu)))); }}",
++            inst.rd, inst.rd, inst.vectorInfo.fsf);
+     }
+ 
+ }
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index f3c1ab4..65a2444 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -156,7 +156,10 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
+ #define PS2_FLOAT_NOINLINE __attribute__((noinline))
+ #endif
+ 
+-constexpr uint32_t PS2_FLOAT_MAX_BITS = 0x7FFFFFFFu;
++// The largest finite host float. The PS2 itself returns 0x7FFFFFFF, but on the host that pattern is a NaN which
++// then poisons VU0 maths, compares and conversions; PCSX2 and the PAL port use 0x7F7FFFFF (Ape Escape 2 recomp
++// patch 0028).
++constexpr uint32_t PS2_FLOAT_MAX_BITS = 0x7F7FFFFFu;
+ constexpr uint32_t PS2_FLOAT_EXP_MASK = 0x7F800000u;
+ constexpr uint32_t PS2_FLOAT_SIGN_MASK = 0x80000000u;
+ 
+@@ -855,7 +858,18 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++// CVT.W.S truncates toward zero and saturates (it does not use the rounding mode).
++inline int32_t ps2_cvt_w_s(float f)
++{
++    if (f >= 2147483648.0f)
++        return 0x7FFFFFFF;
++    if (f <= -2147483648.0f)
++        return static_cast<int32_t>(0x80000000u);
++    if (f != f)
++        return 0x7FFFFFFF;
++    return static_cast<int32_t>(f);
++}
++#define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+ #define FPU_C_F_S(a, b) (0)
+ #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 6189783..87a9f18 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2147,6 +2147,18 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         selected = displayFrame;
+         pixels.clear();
+         usedPreferred = false;
++        // Present what DISPFB points at, like the hardware (and the PAL port). The two guesses below (show
++        // the source of a full-screen copy sprite; show a render target when the display buffer is black)
++        // made the picture flicker: at low frame rates they presented the back buffer while the game was
++        // still drawing the next frame into it. APE2_DISPLAY_HEURISTICS=1 brings them back (Ape Escape 2
++        // recomp patch 0028).
++        static const bool heuristics = []
++        {
++            const char *v = std::getenv("APE2_DISPLAY_HEURISTICS");
++            return v && v[0] == '1';
++        }();
++        if (!heuristics)
++            allowPreferred = false;
+         if (allowPreferred && request.hasPreferredSource && request.preferredDestFbp == displayFrame.fbp &&
+             (request.preferredSource.fbw != 0u || request.preferredSource.fbp != displayFrame.fbp) &&
+             CopyFrameToHostRgba(request.preferredSource, width, height, pixels, preserveAlpha, true, false, 0u, 0u))
+@@ -2157,7 +2169,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+         if (pixels.empty() && !CopyFrameToHostRgba(displayFrame, width, height, pixels, preserveAlpha, true, true, origin.x, origin.y))
+             return false;
+ 
+-        if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
++        if (heuristics && !usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
+         {
+             for (const GSFrameReg &candidate : request.contextFrames)
+             {
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 20f7dd4..7a73030 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,3 +1,4 @@
++#include <map>
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "ps2_log.h"
+@@ -547,7 +548,17 @@ static void dumpPresentationFrame(const PresentationFrame &frame, const GSPresen
+     }();
+     static uint32_t presented = 0u;
+     static uint32_t dumped = 0u;
+-    if ((presented++ % every) != 0u || dumped >= 200u)
++    static const uint32_t start = []
++    {
++        const char *e = std::getenv("APE2_FRAME_DUMP_START");
++        return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
++    }();
++    if (presented < start)
++    {
++        ++presented;
++        return;
++    }
++    if (((presented++ - start) % every) != 0u || dumped >= 200u)
+         return;
+     char path[512];
+     std::snprintf(path, sizeof(path), "%s/frame_%04u.ppm", dir, dumped);
+@@ -1613,6 +1624,83 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     recordRegisterDebugEventUnlocked(regAddr, value);
+ }
+ 
++namespace
++{
++    // APE2_DRAW_LOG=<first vsync>,<count>: per vsync, one line per distinct draw state with its primitive
++    // count, the first vertex's colour/fog and the union of the vertices' screen rectangles (Ape Escape 2
++    // recomp debugging aid).
++    struct Ape2DrawLogEntry
++    {
++        uint32_t count = 0;
++        int x0 = 1 << 30, y0 = 1 << 30, x1 = -(1 << 30), y1 = -(1 << 30);
++        uint32_t order = 0;
++    };
++    void ape2DrawLog(uint64_t vsync, const GSPrimitiveBatch &batch)
++    {
++        static const std::pair<uint64_t, uint64_t> range = []
++        {
++            const char *e = std::getenv("APE2_DRAW_LOG");
++            if (!e)
++                return std::pair<uint64_t, uint64_t>{~0ull, 0ull};
++            char *end = nullptr;
++            const uint64_t from = std::strtoull(e, &end, 0);
++            const uint64_t count = (end && *end == ',') ? std::strtoull(end + 1, nullptr, 0) : 1ull;
++            return std::pair<uint64_t, uint64_t>{from, count};
++        }();
++        static uint64_t current = ~0ull;
++        static std::map<std::string, Ape2DrawLogEntry> entries;
++        static uint32_t order = 0;
++        auto flush = [&]()
++        {
++            if (current == ~0ull)
++                return;
++            std::vector<std::pair<uint32_t, std::string>> lines;
++            for (const auto &[key, e] : entries)
++            {
++                char t[96];
++                std::snprintf(t, sizeof(t), " n=%u rect=(%d,%d)-(%d,%d)", e.count, e.x0, e.y0, e.x1, e.y1);
++                lines.emplace_back(e.order, key + t);
++            }
++            std::sort(lines.begin(), lines.end());
++            std::fprintf(stderr, "[draw] ---- vsync %llu: %zu states\n", static_cast<unsigned long long>(current), lines.size());
++            for (const auto &l : lines)
++                std::fprintf(stderr, "[draw] %s\n", l.second.c_str());
++            entries.clear();
++            order = 0;
++        };
++        const bool inRange = vsync >= range.first && vsync < range.first + range.second;
++        if (vsync != current)
++        {
++            flush();
++            current = inRange ? vsync : ~0ull;
++        }
++        if (!inRange)
++            return;
++        const GSDrawState &st = batch.state;
++        const GSContext &c = st.context;
++        const GSVertex &v = batch.vertices[0];
++        char key[512];
++        std::snprintf(key, sizeof(key),
++                      "fbp=%x fbmsk=%08x prim=%u tme=%u abe=%u fge=%u ctx=%u tex=%x/%x/w%u tfx=%u tcc=%u alpha=%llx test=%llx zbp=%x zmsk=%u fba=%llu pabe=%u fog=%02x%02x%02x col0=%02x%02x%02x%02x f0=%02x",
++                      c.frame.fbp, c.frame.fbmsk, static_cast<unsigned>(st.prim.type), st.prim.tme, st.prim.abe, st.prim.fge,
++                      st.prim.ctxt, c.tex0.tbp0, c.tex0.psm, c.tex0.tbw, c.tex0.tfx, c.tex0.tcc,
++                      static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test), c.zbuf.zbp, c.zbuf.zmask,
++                      static_cast<unsigned long long>(c.fba & 1ull), st.pabe, st.fogR, st.fogG, st.fogB, v.r, v.g, v.b, v.a, v.fog);
++        Ape2DrawLogEntry &e = entries[key];
++        if (e.count++ == 0u)
++            e.order = order++;
++        for (uint32_t i = 0; i < batch.vertexCount; ++i)
++        {
++            const int x = static_cast<int>(batch.vertices[i].x) - (c.xyoffset.ofx >> 4);
++            const int y = static_cast<int>(batch.vertices[i].y) - (c.xyoffset.ofy >> 4);
++            e.x0 = std::min(e.x0, x);
++            e.y0 = std::min(e.y0, y);
++            e.x1 = std::max(e.x1, x);
++            e.y1 = std::max(e.y1, y);
++        }
++    }
++}
++
+ void GS::vertexKick(bool drawing)
+ {
+     ++m_vtxCount;
+@@ -1664,6 +1752,8 @@ void GS::vertexKick(bool drawing)
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
++        if (m_privRegs)
++            ape2DrawLog(m_privRegs->vsyncTick.load(std::memory_order_relaxed), batch);
+         updatePreferredDisplaySourceForDraw(batch);
+         {
+             ps2perf::Scope perfRaster(ps2perf::GsRaster);
