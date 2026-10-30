@@ -20,10 +20,19 @@ but ~1 frame per 6-7 s. 2D screens 9-22 fps with the software rasterizer at ~86%
 ## Current step: performance
 Profiler patches 0003-0005 print `[perf]` (per-zone time) and `[perf:pc]` (hottest guest PCs) every ~2 s.
 Known: ee-wait ~0%, so "other" (EE game code / runtime helpers) dominates the 3D intro. Suspect a guest
-busy-wait polling a HW flag. Next: run 30 s into the 3D intro, then
-`Select-String -Path boot.log -Pattern '^\[perf' | % { $_.Line }`, read the top PCs, disassemble them in
-generated/output (regenerate locally with ps2_recomp + config/ape2.toml if needed).
-Nice to have: an auto-exit after N seconds for unattended runs.
+busy-wait polling a HW flag. 0005 has been committed but NOT yet built/run on the user's PC (no `[perf:pc]`
+lines in any log so far).
+Next (user runs, unattended, ~2 min; the 3D intro starts ~55 s after boot):
+`git pull`, then
+`.\tools\build_windows.ps1 -GameDir "..." -IsoPath "..." -SkipToolBuild -SkipRecomp -RunSeconds 120`
+It applies 0005, rebuilds, stops the game after 120 s and writes `perf.txt` (tools/perf_summary.ps1:
+merged PC ranking for slow frames + whole run, then the raw `[perf]` lines; plain ASCII).
+Then read the top PCs: `python tools/mdis.py game/SLUS_206.85 0x<pc> 64` (capstone; R5900 COP2/MMI ops
+mis-decode) or the generated C++ in generated/output.
+Do NOT use `[run:tick] pc=` for profiling: that PC is only stored at scheduler dispatch, so it lands on
+function entries / call-return points (0x353320, 0x208B60, 0x19BD34...). The 0005 sampler reads the live
+`ctx->pc`, which generated code writes before every instruction.
+Known code: 0x19BCB8 = per-frame loop (calls main frame function 0x19BCE0 until nonzero, then sceGsSyncPath).
 
 ## After performance (user's order)
 1. Picture: 512x512 FB region with a duplicated bottom band (display rect vs 640x448), washed colours,

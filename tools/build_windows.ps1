@@ -8,6 +8,8 @@
   -GameDir : folder with the extracted contents of YOUR Ape Escape 2 (USA) ISO
              (must contain SLUS_206.85 and SYSTEM.CNF at the top level).
   Steps you can skip on re-runs: -SkipToolBuild, -SkipRecomp, or -RunOnly to just boot
+  -RunSeconds N : stop the game automatically after N seconds (unattended runs), then write the
+                  [perf] / [perf:pc] summary to perf.txt (tools/perf_summary.ps1)
 #>
 param(
     [Parameter(Mandatory = $true)][string]$GameDir,
@@ -18,7 +20,8 @@ param(
     [switch]$SkipToolBuild,
     [switch]$SkipRecomp,
     [switch]$NoRun,
-    [switch]$RunOnly   # just boot the already-built exe
+    [switch]$RunOnly,  # just boot the already-built exe
+    [int]$RunSeconds = 0   # >0: kill the game after this many seconds and summarize perf into perf.txt
 )
 if ($RunOnly) { $SkipToolBuild = $true; $SkipRecomp = $true }
 
@@ -143,9 +146,29 @@ if (-not $NoRun) {
         Write-Host "No -IsoPath given: reads by real disc sector will fail" -ForegroundColor Yellow
     }
     $ErrorActionPreference = "Continue"
-    cmd /c "`"$($Runner.FullName)`" `"$Elf`" > `"$Log`" 2>&1"
-    Write-Host "Exit code: $LASTEXITCODE"
+    if ($RunSeconds -gt 0) {
+        # Same cmd redirection, but in a child process we can time out. Killing cmd does not kill
+        # the game, so stop ps2EntryRunner itself (matched by path).
+        Write-Host "Timed run: stopping the game after $RunSeconds s"
+        $cmdArgs = "/c `"`"$($Runner.FullName)`" `"$Elf`" > `"$Log`" 2>&1`""
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList $cmdArgs -NoNewWindow -PassThru
+        if (-not $proc.WaitForExit($RunSeconds * 1000)) {
+            Get-Process -Name "ps2EntryRunner" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $Runner.FullName } |
+                Stop-Process -Force
+            [void]$proc.WaitForExit(10000)
+            Write-Host "Stopped after $RunSeconds s"
+        } else {
+            Write-Host "Exit code: $($proc.ExitCode)"
+        }
+    } else {
+        cmd /c "`"$($Runner.FullName)`" `"$Elf`" > `"$Log`" 2>&1"
+        Write-Host "Exit code: $LASTEXITCODE"
+    }
     Write-Host "--- last 40 lines of boot.log ---"
     Get-Content $Log -Tail 40
+    if ($RunSeconds -gt 0) {
+        & "$PSScriptRoot\perf_summary.ps1" -Log $Log -Out "$Repo\perf.txt"
+    }
     Write-Host "`nFull log: $Log. Attach it to the chat."
 }

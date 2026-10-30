@@ -172,3 +172,15 @@
 - patches/ps2recomp/0005-perf-guest-pc-sampler.patch: EeScheduler::publishDebugContext publishes &context.pc
   (generated code writes ctx->pc before every instruction); a detached sampler thread reads it every ~1ms
   and prints the top 12 guest PCs every ~2s as "[perf:pc] ...".
+
+## Unattended perf runs
+- Checked the user's PC: local repo was at d2c6774 (before 0005), perf.txt / boot.log there are the ee-wait
+  run, so no `[perf:pc]` data exists yet.
+- `[run:tick] pc=` histogram of the 3D intro is misleading: EeScheduler stores m_debugPc only when it dispatches,
+  so samples sit on function entries and call-return points (0x19BD34 x13, 0x353320, 0x208B60...). The 0005
+  sampler reads the live context (activeContext().pc; codegen writes ctx->pc before each instruction), so trust it.
+- 0x19BCB8: per-frame loop, `do { v0 = 0x19BCE0(); } while (!v0); sceGsSyncPath(0,0)`. 0x19BCE0 is the
+  main frame function (calls 0x19BF98, 0x1A0AD0, 0x1920F8, 0x1ADFE0, 0x26F938/0x26F5E8, 0x3530D0, 0x1C8510...).
+- build_windows.ps1 -RunSeconds N: runs the game in a child cmd, kills ps2EntryRunner after N s, then runs
+  tools/perf_summary.ps1 (boot.log -> perf.txt, ASCII; merged [perf:pc] ranking weighted by samples).
+- tools/mdis.py: capstone disassembly of the ELF by guest address.
