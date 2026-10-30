@@ -332,3 +332,15 @@
   word 0x00200030 passed LooksLikeCallableEntry's short-tail-thunk check), cutting 0x1FFFE8 short in the
   middle; 0x200030 is a jal delay slot. patches/ps2recomp/0025-recomp-no-entry-in-delay-slot.patch: an
   address-taken start is rejected when it is a branch/jump delay slot or the return site after a call.
+
+## Models were "a mess of shapes": the runtime's sceVu0* stubs (0026)
+- patches/ps2recomp/0026-vu1-program-hash-and-verify.patch: APE2_VU_HASHES=1 logs each VU1 program (entry +
+  hash of its reachable code, the PAL port's hash); APE2_VU_VERIFY=1 runs a reference of the skinned-model
+  program (0x60) and the stage strip kernel (0x40 / 0x2360), adapted from the PAL port's vu1_native.c,
+  on a snapshot of each batch and compares the GIF output with the interpreter's.
+- All 12 VU1 programs the game runs have the PAL hashes: NTSC and PAL microcode are identical.
+- The interpreter's output matches the references (only depth rounding differs), so VU1 was not the cause.
+- config/ape2.toml stubbed 29 libvu0 functions (sceVu0MulMatrix, InversMatrix, CameraMatrix, RotMatrix*,
+  ...) with the runtime's hand-written versions. Removed: the game's own recompiled code now runs. Stage
+  scenery that drew as flat pink/grey now renders (statue, trees, fence, pillars); remaining: some thin
+  streaks and shapes in the stage intro / near the camera, to check.

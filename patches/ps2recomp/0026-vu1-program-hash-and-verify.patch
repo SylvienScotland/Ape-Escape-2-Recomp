@@ -1,0 +1,642 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 255bfe3..f30e42b 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,4 +1,5 @@
+ #include "ps2_runtime.h"
++#include "ps2_vu1_verify.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -679,9 +680,13 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     ps2vu1verify::Snapshot *vuVerify = ps2vu1verify::before(
++                                         m_memory.getVU1Code(), m_memory.getVU1Data(), m_memory.getVU1CodeGeneration(),
++                                         startPC, top, itop, m_vu1.state());
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
++                                     ps2vu1verify::after(vuVerify, m_memory.getVU1Data(), m_vu1.state());
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+diff --git a/ps2xRuntime/src/lib/ps2_vu1_verify.h b/ps2xRuntime/src/lib/ps2_vu1_verify.h
+new file mode 100644
+index 0000000..bf2ec71
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vu1_verify.h
+@@ -0,0 +1,26 @@
++// VU1 program identification and native-reference verification (Ape Escape 2 recomp patch).
++//
++// APE2_VU_HASHES=1  log each VU1 program (entry + hash of its reachable code) the first time it runs.
++//                   The hash is the one the PAL port JackyPendrag0n/ae2-recomp uses (port/src/vu.c),
++//                   so equal hashes mean byte-identical microcode.
++// APE2_VU_VERIFY=1  for programs with a reference implementation (zz_ape2_vu1_verify.cpp), run the
++//                   reference on a snapshot of the program's input after the interpreter has run and
++//                   compare the GIF output the two produced.
++#pragma once
++
++#include <cstdint>
++
++struct VU1State;
++
++namespace ps2vu1verify
++{
++    struct Snapshot;
++
++    // Called before the interpreter starts a program (MSCAL). Returns a snapshot to pass to after(),
++    // or nullptr when there is nothing to verify (cheap when both env switches are off).
++    Snapshot *before(const uint8_t *vuCode, const uint8_t *vuData, uint64_t codeGeneration,
++                     uint32_t startPc, uint32_t top, uint32_t itop, const VU1State &state);
++
++    // Called after the interpreter has run the program: compares its output with the reference.
++    void after(Snapshot *snapshot, const uint8_t *vuData, const VU1State &state);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp
+new file mode 100644
+index 0000000..1143621
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp
+@@ -0,0 +1,580 @@
++// VU1 program hashes and native-reference verification (Ape Escape 2 recomp patch); see ps2_vu1_verify.h.
++//
++// The program hash and the reference programs are adapted from the PAL port
++// JackyPendrag0n/ae2-recomp (port/src/vu.c, port/src/vu1_native.c), used with the author's permission.
++// The references compute what each program writes to its output buffer (GIF tag + STQ, RGBA, XYZ2 per
++// vertex); register side effects are not modelled, only the output is compared.
++#include "../ps2_vu1_verify.h"
++#include "runtime/ps2_vu1.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <map>
++#include <mutex>
++#include <set>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace ps2vu1verify
++{
++    namespace
++    {
++        constexpr uint32_t kCodeMask = 0x3FFFu;
++        constexpr uint32_t kDataSize = 0x4000u;
++
++        bool envOn(const char *name)
++        {
++            const char *v = std::getenv(name);
++            return v && v[0] && v[0] != '0';
++        }
++
++        // ---- program hash (PAL port vu.c: vu_reach + vu_prog_hash)
++        bool isBranch(uint32_t lower)
++        {
++            const uint32_t op = lower >> 25;
++            return op == 0x20 || op == 0x21 || op == 0x24 || op == 0x25 || (op >= 0x28 && op <= 0x2f && op != 0x2a && op != 0x2b);
++        }
++
++        uint64_t programHash(const uint8_t *code, uint32_t entry)
++        {
++            const uint32_t npairs = (kCodeMask + 1u) / 8u;
++            std::vector<uint8_t> mark(npairs, 0u);
++            std::vector<uint32_t> stack;
++            stack.push_back((entry & kCodeMask) | 0x80000000u);
++            while (!stack.empty())
++            {
++                const uint32_t e = stack.back();
++                stack.pop_back();
++                const uint32_t pc = e & kCodeMask;
++                const bool follow = (e >> 31) != 0u;
++                const uint32_t idx = pc >> 3;
++                mark[idx] |= 1u;
++                if (!follow || (mark[idx] & 2u))
++                    continue;
++                mark[idx] |= 2u;
++                uint32_t lower = 0, upper = 0;
++                std::memcpy(&lower, code + pc, 4);
++                std::memcpy(&upper, code + ((pc + 4u) & kCodeMask), 4);
++                const bool ibit = (upper >> 31) != 0u, ebit = ((upper >> 30) & 1u) != 0u;
++                auto push = [&](uint32_t a, bool f) { if (stack.size() < 8190u) stack.push_back((a & kCodeMask) | (f ? 0x80000000u : 0u)); };
++                if (ebit)
++                {
++                    push(pc + 8u, false);
++                    continue;
++                }
++                if (!ibit && isBranch(lower))
++                {
++                    const uint32_t op = lower >> 25;
++                    const int32_t imm11 = static_cast<int32_t>(lower << 21) >> 21;
++                    const uint32_t tgt = pc + 8u + static_cast<uint32_t>(imm11 * 8);
++                    push(pc + 8u, true);
++                    if (op != 0x24 && op != 0x25)
++                        push(tgt, true);
++                    if (op != 0x20 && op != 0x24)
++                        push(pc + 16u, true);
++                }
++                else
++                {
++                    push(pc + 8u, true);
++                }
++            }
++            uint64_t h = 1469598103934665603ull ^ (entry & kCodeMask);
++            for (uint32_t i = 0; i < npairs; ++i)
++            {
++                if (!(mark[i] & 1u))
++                    continue;
++                uint32_t w[3] = {i, 0u, 0u};
++                std::memcpy(&w[1], code + i * 8u, 8);
++                for (uint32_t k = 0; k < 3; ++k)
++                {
++                    h ^= w[k];
++                    h *= 1099511628211ull;
++                    h ^= h >> 29;
++                }
++            }
++            return h;
++        }
++
++        // ---- PS2 float helpers (approximations: results are compared with a tolerance)
++        float clampf(float v)
++        {
++            if (std::isnan(v))
++                return std::signbit(v) ? -3.4028235e38f : 3.4028235e38f;
++            if (std::isinf(v))
++                return v > 0 ? 3.4028235e38f : -3.4028235e38f;
++            return v;
++        }
++        uint32_t vfBits(float f)
++        {
++            uint32_t u = 0;
++            std::memcpy(&u, &f, 4);
++            return u;
++        }
++        struct V4
++        {
++            float f[4];
++        };
++        V4 ld(const uint8_t *mem, uint32_t qw)
++        {
++            V4 v;
++            std::memcpy(v.f, mem + ((qw * 16u) & (kDataSize - 1u)), 16);
++            return v;
++        }
++        const uint32_t *qu(const uint8_t *mem, uint32_t qw) { return reinterpret_cast<const uint32_t *>(mem + ((qw * 16u) & (kDataSize - 1u))); }
++        const int32_t *qi(const uint8_t *mem, uint32_t qw) { return reinterpret_cast<const int32_t *>(mem + ((qw * 16u) & (kDataSize - 1u))); }
++        V4 bc(float f) { return V4{{f, f, f, f}}; }
++        V4 mul(const V4 &a, const V4 &b)
++        {
++            V4 r;
++            for (int i = 0; i < 4; ++i)
++                r.f[i] = clampf(a.f[i] * b.f[i]);
++            return r;
++        }
++        V4 madd(const V4 &acc, const V4 &a, const V4 &b)
++        {
++            V4 r;
++            for (int i = 0; i < 4; ++i)
++                r.f[i] = clampf(acc.f[i] + a.f[i] * b.f[i]);
++            return r;
++        }
++        V4 xform4(const V4 &r0, const V4 &r1, const V4 &r2, const V4 &r3, const float *v)
++        {
++            V4 a = mul(r0, bc(v[0]));
++            a = madd(a, r1, bc(v[1]));
++            a = madd(a, r2, bc(v[2]));
++            return madd(a, r3, bc(1.0f));
++        }
++        V4 xform3(const V4 &r0, const V4 &r1, const V4 &r2, const float *v)
++        {
++            V4 a = mul(r0, bc(v[0]));
++            a = madd(a, r1, bc(v[1]));
++            return madd(a, r2, bc(v[2]));
++        }
++        int32_t cvtws(float v)
++        {
++            if (std::isnan(v))
++                return 0x7fffffff;
++            if (v >= 2147483520.0f)
++                return 0x7fffffff;
++            if (v <= -2147483648.0f)
++                return static_cast<int32_t>(0x80000000u);
++            return static_cast<int32_t>(v);
++        }
++        float fdiv(float a, float b)
++        {
++            if (b == 0.0f)
++                return (std::signbit(a) != std::signbit(b)) ? -3.4028235e38f : 3.4028235e38f;
++            return clampf(a / b);
++        }
++        uint32_t clipflags(const float *s)
++        {
++            const float w = std::fabs(s[3]);
++            uint32_t cf = 0;
++            if (s[0] > +w) cf |= 1;
++            if (s[0] < -w) cf |= 2;
++            if (s[1] > +w) cf |= 4;
++            if (s[1] < -w) cf |= 8;
++            if (s[2] > +w) cf |= 16;
++            if (s[2] < -w) cf |= 32;
++            return cf;
++        }
++        uint32_t stripCull(uint32_t c)
++        {
++            if (!(c & 0x3ffffu))
++                return 0;
++            if (c & 0x20820u)
++                return 0xffff;
++            if ((c & 0x002082u) == 0x002082u || (c & 0x001041u) == 0x001041u ||
++                (c & 0x008208u) == 0x008208u || (c & 0x004104u) == 0x004104u)
++                return 0xffff;
++            if (c & 0x10410u)
++                return 0xffff;
++            return 0;
++        }
++
++        struct OutVertex
++        {
++            float stq[4];
++            int32_t rgba[4];
++            int32_t xyz[4];
++        };
++
++        // Reference result: output buffer address (qwords) and the vertices written after the tag.
++        struct Reference
++        {
++            const char *name = "";
++            uint32_t out = 0;
++            std::vector<OutVertex> verts;
++        };
++
++        // Entry 0x60 (hash dc92a79486c148f1), the skinned model program; PAL vn1_0060_dc92.
++        // mem is a private copy (positions/normals are skinned in place).
++        bool refSkinned(std::vector<uint8_t> &mem, const VU1State &s, uint32_t top, uint32_t itop, Reference &ref)
++        {
++            uint8_t *m = mem.data();
++            auto qw = [&](uint32_t a) { return reinterpret_cast<float *>(m + ((a * 16u) & (kDataSize - 1u))); };
++            top &= 0xffffu;
++            const uint32_t flags = itop & 0xffffu;
++            const uint32_t n = qu(m, top)[0] & 0x7fffu;
++            if (n == 0u || (flags & 6u))
++                return false;
++            const bool env = (flags & 1u) != 0u;
++            if (flags & 8u)
++            {
++                const uint32_t mtx = qu(m, top + 5u)[2] & 0xffffu;
++                const V4 r0 = ld(m, mtx), r1 = ld(m, mtx + 1), r2 = ld(m, mtx + 2), r3 = ld(m, mtx + 3);
++                for (uint32_t j = 0; j < n; ++j)
++                {
++                    const uint32_t b = top + 1u + 5u * j;
++                    V4 nn = xform3(r0, r1, r2, qw(b + 1));
++                    const float l2 = clampf(clampf(nn.f[0] * nn.f[0] + nn.f[1] * nn.f[1]) + nn.f[2] * nn.f[2]);
++                    const float q = l2 > 0.0f ? clampf(1.0f / std::sqrt(l2)) : 3.4028235e38f;
++                    nn = mul(nn, bc(q));
++                    std::memcpy(qw(b + 1), nn.f, 12);
++                    const V4 p = xform4(r0, r1, r2, r3, qw(b));
++                    std::memcpy(qw(b), p.f, 12);
++                }
++            }
++            else
++            {
++                for (uint32_t j = 0; j < n; ++j)
++                {
++                    const uint32_t b = top + 1u + 5u * j;
++                    const int32_t *sk = qi(m, b + 4);
++                    const uint32_t ma = static_cast<uint32_t>(sk[2]) & 0xffffu, mb = static_cast<uint32_t>(sk[3]) & 0xffffu;
++                    const float wa = static_cast<float>(sk[0]) / 4096.0f, wb = static_cast<float>(sk[1]) / 4096.0f;
++                    const V4 na = xform3(ld(m, ma), ld(m, ma + 1), ld(m, ma + 2), qw(b + 1));
++                    const V4 nb = xform3(ld(m, mb), ld(m, mb + 1), ld(m, mb + 2), qw(b + 1));
++                    V4 nn = madd(mul(na, bc(wa)), nb, bc(wb));
++                    const float l2 = clampf(clampf(nn.f[0] * nn.f[0] + nn.f[1] * nn.f[1]) + nn.f[2] * nn.f[2]);
++                    const float q = l2 > 0.0f ? clampf(1.0f / std::sqrt(l2)) : 3.4028235e38f;
++                    nn = mul(nn, bc(q));
++                    std::memcpy(qw(b + 1), nn.f, 12);
++                }
++                for (uint32_t j = 0; j < n; ++j)
++                {
++                    const uint32_t b = top + 1u + 5u * j;
++                    const int32_t *sk = qi(m, b + 4);
++                    const uint32_t ma = static_cast<uint32_t>(sk[2]) & 0xffffu, mb = static_cast<uint32_t>(sk[3]) & 0xffffu;
++                    const float wa = static_cast<float>(sk[0]) / 4096.0f, wb = static_cast<float>(sk[1]) / 4096.0f;
++                    const V4 pa = xform4(ld(m, ma), ld(m, ma + 1), ld(m, ma + 2), ld(m, ma + 3), qw(b));
++                    const V4 pb = xform4(ld(m, mb), ld(m, mb + 1), ld(m, mb + 2), ld(m, mb + 3), qw(b));
++                    const V4 p = madd(mul(pa, bc(wa)), pb, bc(wb));
++                    std::memcpy(qw(b), p.f, 12);
++                }
++            }
++
++            ref.name = env ? "skinned/env" : "skinned";
++            ref.out = vfBits(s.vf[31][0]) & 0xffffu;
++            V4 c27{}, c28{}, c29{}, c30{}, c25{}, c26{}, l18{}, l19{}, l20{}, l21{}, l22{}, l23{}, l24{}, e15{}, e16{}, e17{};
++            auto reg = [&](int r) { V4 v; std::memcpy(v.f, s.vf[r], 16); return v; };
++            c27 = reg(27); c28 = reg(28); c29 = reg(29); c30 = reg(30); c25 = reg(25); c26 = reg(26);
++            l18 = reg(18); l19 = reg(19); l20 = reg(20); l21 = reg(21); l22 = reg(22); l23 = reg(23); l24 = reg(24);
++            e15 = reg(15); e16 = reg(16); e17 = reg(17);
++            uint32_t clip = s.clip;
++            const uint32_t nx = env ? n + 1u : n + 2u;
++            for (uint32_t j = 0; j < nx; ++j)
++            {
++                const uint32_t b = top + 1u + 5u * j;
++                const V4 P = xform4(c27, c28, c29, c30, qw(b));
++                clip = ((clip << 6) | clipflags(P.f)) & 0xffffffu;
++                const float q = fdiv(1.0f, P.f[3]);
++                uint32_t adc = 0;
++                if (j == 0)
++                    adc = env ? 0x7fffu : 0u;
++                else if (j <= n)
++                    adc = stripCull(clip);
++                if (j >= n)
++                    continue;
++                V4 proj = mul(P, bc(q));
++                if (!env && j && (clip & 0x3ffffu))
++                {
++                    proj.f[0] = std::max(std::min(proj.f[0], 7.0f), -7.0f);
++                    proj.f[1] = std::max(std::min(proj.f[1], 7.0f), -7.0f);
++                }
++                OutVertex o{};
++                const float *nv = qw(b + 1);
++                const int32_t *uv = qi(m, b + 2), *rgba = qi(m, b + 3);
++                if (env)
++                {
++                    const V4 e = xform3(e15, e16, e17, nv);
++                    o.stq[0] = clampf(clampf(0.5f + e.f[0] * 0.35f) + proj.f[0] * 0.15f);
++                    o.stq[1] = clampf(clampf(0.5f + e.f[1] * 0.35f) + proj.f[1] * 0.15f);
++                    o.stq[2] = 1.0f;
++                    o.stq[3] = NAN; // stale register lane: not compared
++                }
++                else
++                {
++                    o.stq[0] = clampf(static_cast<float>(uv[0]) / 4096.0f * q);
++                    o.stq[1] = clampf(static_cast<float>(uv[1]) / 4096.0f * q);
++                    o.stq[2] = q;
++                    o.stq[3] = NAN;
++                }
++                V4 l = xform3(l22, l23, l24, nv);
++                for (float &f : l.f)
++                    f = std::max(f, 0.0f);
++                V4 col = xform4(l18, l19, l20, l21, l.f);
++                const V4 c{{static_cast<float>(rgba[0]), static_cast<float>(rgba[1]), static_cast<float>(rgba[2]), static_cast<float>(rgba[3])}};
++                col = mul(col, c);
++                for (int k = 0; k < 4; ++k)
++                    o.rgba[k] = cvtws(std::min(col.f[k], 255.0f));
++                const V4 v = madd(mul(proj, c25), c26, bc(1.0f));
++                for (int k = 0; k < 3; ++k)
++                    o.xyz[k] = cvtws(v.f[k] * 16.0f);
++                o.xyz[3] = static_cast<int16_t>((qu(m, b)[3] | adc) & 0xffffu);
++                ref.verts.push_back(o);
++            }
++            return true;
++        }
++
++        // Stage strip kernel at 0x2138 (entries 0x40 hash 88573ff209022f30, 0x2360 hash 2ff05f48cd596d4c
++        // with vi15 == 0x427); PAL stage_kernel. Batches that need the clipper are not handled.
++        bool refStage(const std::vector<uint8_t> &mem, const VU1State &s, uint32_t top, Reference &ref)
++        {
++            const uint8_t *m = mem.data();
++            top &= 0xffffu;
++            const uint32_t n = qu(m, top)[0] & 0x7fffu;
++            if (n == 0u || n + 2u > 0x400u / 3u)
++                return false;
++            auto reg = [&](int r) { V4 v; std::memcpy(v.f, s.vf[r], 16); return v; };
++            const V4 c27 = reg(27), c28 = reg(28), c29 = reg(29), c30 = reg(30), c25 = reg(25), c26 = reg(26);
++            std::vector<V4> P(n + 2u);
++            std::vector<uint32_t> hist(n + 2u), adc(n + 2u);
++            std::vector<float> qv(n + 2u);
++            uint32_t clip = s.clip;
++            for (uint32_t j = 0; j < n + 2u; ++j)
++            {
++                V4 v = ld(m, top + 1u + 3u * j);
++                P[j] = xform4(c27, c28, c29, c30, v.f);
++                clip = ((clip << 6) | clipflags(P[j].f)) & 0xffffffu;
++                hist[j] = clip;
++                qv[j] = fdiv(1.0f, P[j].f[3]);
++            }
++            adc[0] = (hist[0] & 0x3ffffu) != 0u;
++            for (uint32_t j = 1; j <= n; ++j)
++            {
++                const uint32_t c = hist[j];
++                adc[j] = 0;
++                if (!(c & 0x3ffffu))
++                    continue;
++                adc[j] = 0xffff;
++                if (static_cast<int16_t>(qu(m, top + 1u + 3u * j)[3]) < 0)
++                    continue;
++                if ((c & 0x020820u) == 0x020820u || (c & 0x002082u) == 0x002082u || (c & 0x001041u) == 0x001041u ||
++                    (c & 0x008208u) == 0x008208u || (c & 0x004104u) == 0x004104u || (c & 0x010410u) == 0x010410u)
++                    continue;
++                return false; // needs the clipper
++            }
++            ref.name = "stage";
++            ref.out = vfBits(s.vf[31][0]) & 0xffffu;
++            for (uint32_t j = 0; j < n; ++j)
++            {
++                const uint32_t b = top + 1u + 3u * j;
++                const int32_t *uv = qi(m, b + 1), *col = qi(m, b + 2);
++                OutVertex o{};
++                const float q = qv[j];
++                o.stq[0] = clampf(static_cast<float>(uv[0]) / 4096.0f * q);
++                o.stq[1] = clampf(static_cast<float>(uv[1]) / 4096.0f * q);
++                o.stq[2] = clampf(static_cast<float>(uv[2]) / 4096.0f * q);
++                o.stq[3] = NAN;
++                for (int k = 0; k < 4; ++k)
++                    o.rgba[k] = col[k];
++                const V4 pq = mul(P[j], bc(q));
++                const V4 v = madd(mul(pq, c25), c26, bc(1.0f));
++                for (int k = 0; k < 3; ++k)
++                    o.xyz[k] = cvtws(v.f[k] * 16.0f);
++                o.xyz[3] = static_cast<int16_t>((qu(m, b)[3] | adc[j]) & 0xffffu);
++                ref.verts.push_back(o);
++            }
++            return true;
++        }
++
++        enum class Kind
++        {
++            None,
++            Skinned,
++            Stage
++        };
++
++        struct Stats
++        {
++            uint64_t runs = 0, skipped = 0, bad = 0, badVerts = 0, verts = 0;
++        };
++
++        std::mutex g_mutex;
++        std::map<std::pair<uint32_t, uint64_t>, uint64_t> g_seen;
++        std::map<std::pair<uint32_t, uint64_t>, Stats> g_stats;
++        uint64_t g_cachedGeneration = ~0ull;
++        std::map<uint32_t, uint64_t> g_hashByEntry;
++        std::map<std::string, uint64_t> g_reportsByKind;
++        uint64_t g_totalRuns = 0;
++    }
++
++    struct Snapshot
++    {
++        Kind kind = Kind::None;
++        uint32_t entry = 0;
++        uint64_t hash = 0;
++        uint32_t top = 0, itop = 0;
++        VU1State state{};
++        std::vector<uint8_t> mem;
++    };
++
++    Snapshot *before(const uint8_t *vuCode, const uint8_t *vuData, uint64_t codeGeneration,
++                     uint32_t startPc, uint32_t top, uint32_t itop, const VU1State &state)
++    {
++        static const bool hashes = envOn("APE2_VU_HASHES");
++        static const bool verify = envOn("APE2_VU_VERIFY");
++        if (!hashes && !verify)
++            return nullptr;
++
++        std::lock_guard<std::mutex> lock(g_mutex);
++        if (codeGeneration != g_cachedGeneration)
++        {
++            g_hashByEntry.clear();
++            g_cachedGeneration = codeGeneration;
++        }
++        const uint32_t entry = startPc & kCodeMask;
++        auto it = g_hashByEntry.find(entry);
++        if (it == g_hashByEntry.end())
++            it = g_hashByEntry.emplace(entry, programHash(vuCode, entry)).first;
++        const uint64_t hash = it->second;
++        const auto key = std::make_pair(entry, hash);
++        if (hashes && g_seen[key]++ == 0u)
++        {
++            char line[128];
++            std::snprintf(line, sizeof(line), "[vu1:prog] entry %04x hash %016llx top=%03x itop=%03x", entry,
++                          static_cast<unsigned long long>(hash), top, itop);
++            std::cerr << line << std::endl;
++        }
++        if (!verify)
++            return nullptr;
++
++        Kind kind = Kind::None;
++        if (entry == 0x0060u && hash == 0xdc92a79486c148f1ull)
++            kind = Kind::Skinned;
++        else if (entry == 0x0040u && hash == 0x88573ff209022f30ull)
++            kind = Kind::Stage;
++        else if (entry == 0x2360u && hash == 0x2ff05f48cd596d4cull && (state.vi[15] & 0xffff) == 0x427)
++            kind = Kind::Stage;
++        if (kind == Kind::None)
++            return nullptr;
++
++        auto *snap = new Snapshot();
++        snap->kind = kind;
++        snap->entry = entry;
++        snap->hash = hash;
++        snap->top = top;
++        snap->itop = itop;
++        snap->state = state;
++        snap->mem.assign(vuData, vuData + kDataSize);
++        return snap;
++    }
++
++    void after(Snapshot *snap, const uint8_t *vuData, const VU1State & /*state*/)
++    {
++        if (!snap)
++            return;
++        Reference ref;
++        bool handled = false;
++        if (snap->kind == Kind::Skinned)
++            handled = refSkinned(snap->mem, snap->state, snap->top, snap->itop, ref);
++        else
++            handled = refStage(snap->mem, snap->state, snap->top, ref);
++
++        std::lock_guard<std::mutex> lock(g_mutex);
++        Stats &st = g_stats[std::make_pair(snap->entry, snap->hash)];
++        if (!handled)
++        {
++            ++st.skipped;
++            delete snap;
++            return;
++        }
++        ++st.runs;
++        uint32_t badVerts = 0;
++        for (size_t j = 0; j < ref.verts.size(); ++j)
++        {
++            const OutVertex &r = ref.verts[j];
++            const uint32_t base = ref.out + 1u + 3u * static_cast<uint32_t>(j);
++            float stq[4];
++            int32_t rgba[4], xyz[4];
++            std::memcpy(stq, vuData + ((base * 16u) & (kDataSize - 1u)), 16);
++            std::memcpy(rgba, vuData + (((base + 1u) * 16u) & (kDataSize - 1u)), 16);
++            std::memcpy(xyz, vuData + (((base + 2u) * 16u) & (kDataSize - 1u)), 16);
++            bool bad = false;
++            const char *what = "";
++            for (int k = 0; k < 3 && !bad; ++k)
++            {
++                const float tol = 1e-3f * std::max(1.0f, std::fabs(r.stq[k]));
++                if (!(std::fabs(stq[k] - r.stq[k]) <= tol))
++                {
++                    bad = true;
++                    what = "STQ";
++                }
++            }
++            for (int k = 0; k < 4 && !bad; ++k)
++                if (std::abs(rgba[k] - r.rgba[k]) > 2)
++                {
++                    bad = true;
++                    what = "RGBA";
++                }
++            for (int k = 0; k < 2 && !bad; ++k)
++                if (std::llabs(static_cast<int64_t>(xyz[k]) - r.xyz[k]) > 4)
++                {
++                    bad = true;
++                    what = "XYZ";
++                }
++            if (!bad && static_cast<double>(std::llabs(static_cast<int64_t>(xyz[2]) - r.xyz[2])) > 64.0 + 1e-3 * std::fabs(static_cast<double>(r.xyz[2])))
++            {
++                bad = true;
++                what = "Z";
++            }
++            if (!bad && (xyz[3] & 0xffff) != (r.xyz[3] & 0xffff))
++            {
++                bad = true;
++                what = "ADC";
++            }
++            if (!bad)
++                continue;
++            ++badVerts;
++            uint64_t &reports = g_reportsByKind[ref.name];
++            if (reports < 30u)
++            {
++                ++reports;
++                char line[512];
++                std::snprintf(line, sizeof(line),
++                              "[vu1:verify] %s entry %04x run %llu vertex %zu/%zu out=%03x: %s differs\n"
++                              "  interp STQ %g %g %g RGBA %d %d %d %d XYZ %d %d %d %04x\n"
++                              "  ref    STQ %g %g %g RGBA %d %d %d %d XYZ %d %d %d %04x",
++                              ref.name, snap->entry, static_cast<unsigned long long>(st.runs), j, ref.verts.size(), ref.out, what,
++                              stq[0], stq[1], stq[2], rgba[0], rgba[1], rgba[2], rgba[3], xyz[0], xyz[1], xyz[2], xyz[3] & 0xffff,
++                              r.stq[0], r.stq[1], r.stq[2], r.rgba[0], r.rgba[1], r.rgba[2], r.rgba[3], r.xyz[0], r.xyz[1], r.xyz[2],
++                              r.xyz[3] & 0xffff);
++                std::cerr << line << std::endl;
++            }
++        }
++        st.verts += ref.verts.size();
++        st.badVerts += badVerts;
++        if (badVerts)
++            ++st.bad;
++        if ((++g_totalRuns % 2000u) == 0u)
++        {
++            for (const auto &[key, s] : g_stats)
++            {
++                char line[256];
++                std::snprintf(line, sizeof(line),
++                              "[vu1:verify] entry %04x hash %016llx: runs %llu (bad %llu), vertices %llu (bad %llu), not handled %llu",
++                              key.first, static_cast<unsigned long long>(key.second), static_cast<unsigned long long>(s.runs),
++                              static_cast<unsigned long long>(s.bad), static_cast<unsigned long long>(s.verts),
++                              static_cast<unsigned long long>(s.badVerts), static_cast<unsigned long long>(s.skipped));
++                std::cerr << line << std::endl;
++            }
++        }
++        delete snap;
++    }
++}

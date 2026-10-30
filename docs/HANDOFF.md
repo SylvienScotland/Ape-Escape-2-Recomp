@@ -35,4 +35,4 @@ Speed: 2D screens ~20 fps; 3D intro / title ~0.5-1 fps. The IOP SPU2 AutoDMA sto
 3. Picture details still open: PMODE anti-flicker merge ignores the 1-line DISPLAY offset between the two
    CRTs (harmless); check the 3D intro frames for remaining issues.
 Later: real FMV playback (sceMpegGetPictureRAW8 + IPU CSC), proper guest heap layout (see LOG), remove trace overrides.
-Not pushed: this PC has no GitHub credentials for git push; push from a shell where they are set up.
+Pushing: `git push origin main` works from this PC (Windows credential manager). No git identity is configured; commits use -c user.name=Claude -c user.email=noreply@anthropic.com.

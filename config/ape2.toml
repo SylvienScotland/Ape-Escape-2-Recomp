@@ -21,6 +21,9 @@ patch_cache = true
 
 # Functions to stub (only names with runtime syscall/stub handlers)
 stubs = [
+  # sceVu0* (libvu0 matrix/vector helpers) are NOT stubbed: the runtime's hand-written versions
+  # differ from this game's library (models and title background came out as shards). The game's
+  # own recompiled code runs instead.
   "sceCdDiskReady@0x0036E3A8", # unnamed by SCE DB; identified by hand (mode arg, returns 2/6, binds CD RPC 0x8000059A)
   "__ieee754_rem_pio2f@0x00368CF0",
   "__kernel_cosf@0x00369490",
@@ -44,35 +47,6 @@ stubs = [
   "sceDmaSync@0x0036AFE8",
   "sceDmaWatch@0x0036B0B0",
   "sceDmaPause@0x0036B180",
-  "sceVu0ApplyMatrix@0x0036C608",
-  "sceVu0MulMatrix@0x0036C638",
-  "sceVu0InnerProduct@0x0036C6A0",
-  "sceVu0Normalize@0x0036C6C8",
-  "sceVu0TransposeMatrix@0x0036C708",
-  "sceVu0InversMatrix@0x0036C750",
-  "sceVu0DivVector@0x0036C7C0",
-  "sceVu0DivVectorXYZ@0x0036C7E0",
-  "sceVu0InterVector@0x0036C800",
-  "sceVu0TransMatrix@0x0036C888",
-  "sceVu0CopyMatrix@0x0036C8C8",
-  "sceVu0UnitMatrix@0x0036C930",
-  "_sceVu0ecossin@0x0036C958",
-  "sceVu0RotMatrixZ@0x0036C9D0",
-  "sceVu0RotMatrixX@0x0036CA78",
-  "sceVu0RotMatrixY@0x0036CB20",
-  "sceVu0RotMatrix@0x0036CBC8",
-  "sceVu0ClampVector@0x0036CC18",
-  "sceVu0CameraMatrix@0x0036CC40",
-  "sceVu0NormalLightMatrix@0x0036CCF0",
-  "sceVu0LightColorMatrix@0x0036CDB0",
-  "sceVu0ViewScreenMatrix@0x0036CE18",
-  "sceVu0DropShadowMatrix@0x0036CF20",
-  "sceVu0RotTransPersN@0x0036D0B0",
-  "sceVu0RotTransPers@0x0036D108",
-  "sceVu0InterVectorXYZ@0x0036D170",
-  "sceVu0ClipScreen@0x0036D1B8",
-  "sceVu0ClipScreen3@0x0036D200",
-  "sceVu0ClipAll@0x0036D260",
   "sceVpu0Reset@0x0036D2F0",
   "sceCdDelayThread@0x0036D378",
   "sceCdCallback@0x0036D3E0",
