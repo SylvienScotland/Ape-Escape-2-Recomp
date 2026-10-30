@@ -1,0 +1,1218 @@
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index f8d3e44..848a46e 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_library(ps2_iop STATIC
+     src/emulator/core/iop_cpu.cpp
+     src/emulator/core/iop_kernel.cpp
+     src/emulator/core/iop_memory.cpp
++    src/emulator/core/iop_sio2.cpp
+     src/emulator/services/iop_module_loader.cpp
+     src/emulator/services/iop_rpc.cpp
+     src/emulator/imports/iop_cdvd.cpp
+diff --git a/ps2xIOP/include/ps2x/iop/iop_pad_input.h b/ps2xIOP/include/ps2x/iop/iop_pad_input.h
+new file mode 100644
+index 0000000..10eacf5
+--- /dev/null
++++ b/ps2xIOP/include/ps2x/iop/iop_pad_input.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include <cstdint>
++
++// Host controller state for the emulated SIO2 DualShock 2 (Ape Escape 2 recomp patch 0018).
++// The host registers one source; the IOP's SIO2 device polls it whenever the guest reads a pad.
++namespace ps2x::iop
++{
++    struct PadInput
++    {
++        bool connected = true;
++        uint16_t buttons = 0xFFFFu; // DualShock 2 order, active low (bit 0 SELECT ... bit 15 SQUARE)
++        uint8_t rightX = 0x80u;
++        uint8_t rightY = 0x80u;
++        uint8_t leftX = 0x80u;
++        uint8_t leftY = 0x80u;
++        // Pressure, 0 = released .. 0xFF: Right, Left, Up, Down, Triangle, Circle, Cross, Square, L1, R1, L2, R2
++        uint8_t pressure[12]{};
++    };
++
++    // Returns false when no state is available for that port (reported as "no device").
++    using PadInputSource = bool (*)(int port, PadInput &out);
++
++    void setPadInputSource(PadInputSource source) noexcept;
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 4f16409..ac23843 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -45,6 +45,7 @@ namespace ps2x::iop::detail
+         m_interruptMask = 0;
+         m_interruptControl = 1;
+         m_dmaStart.reset();
++        m_sio2.reset();
+     }
+ 
+     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+@@ -59,6 +60,8 @@ namespace ps2x::iop::detail
+             return m_ram[phys];
+         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
+             return m_scratch[phys - ScratchBase];
++        if (IopSio2::contains(phys))
++            return static_cast<uint8_t>(readSio2(phys, 1u) >> ((phys & 3u) * 8u));
+         const uint32_t value = readHardware32(phys & ~3u);
+         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
+     }
+@@ -72,6 +75,8 @@ namespace ps2x::iop::detail
+             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
+             return value;
+         }
++        if (IopSio2::contains(phys))
++            return static_cast<uint16_t>(readSio2(phys, 2u) >> ((phys & 2u) * 8u));
+         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
+     }
+ 
+@@ -90,6 +95,8 @@ namespace ps2x::iop::detail
+             std::memcpy(&value, m_scratch.data() + (phys - ScratchBase), sizeof(value));
+             return value;
+         }
++        if (IopSio2::contains(phys))
++            return readSio2(phys, 4u);
+         if ((phys & 3u) == 0u && isHardwareAddress(phys))
+             return readHardware32(phys);
+ 
+@@ -113,6 +120,11 @@ namespace ps2x::iop::detail
+             m_scratch[phys - ScratchBase] = value;
+             return;
+         }
++        if (IopSio2::contains(phys))
++        {
++            writeSio2(phys, value, 1u);
++            return;
++        }
+         const uint32_t aligned = phys & ~3u;
+         uint32_t current = readHardware32(aligned);
+         const uint32_t shift = (phys & 3u) * 8u;
+@@ -129,6 +141,11 @@ namespace ps2x::iop::detail
+             markOwned(phys, sizeof(value));
+             return;
+         }
++        if (IopSio2::contains(phys))
++        {
++            writeSio2(phys, value, 2u);
++            return;
++        }
+         write8(address, static_cast<uint8_t>(value));
+         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+     }
+@@ -147,6 +164,11 @@ namespace ps2x::iop::detail
+             std::memcpy(m_scratch.data() + (phys - ScratchBase), &value, sizeof(value));
+             return;
+         }
++        if (IopSio2::contains(phys))
++        {
++            writeSio2(phys, value, 4u);
++            return;
++        }
+         if ((phys & 3u) == 0u)
+         {
+             writeHardware32(phys, value);
+@@ -306,6 +328,25 @@ namespace ps2x::iop::detail
+         return result;
+     }
+ 
++    uint32_t IopMemory::readSio2(uint32_t phys, unsigned sizeBytes) const
++    {
++        return m_sio2.read(phys, sizeBytes);
++    }
++
++    void IopMemory::writeSio2(uint32_t phys, uint32_t value, unsigned sizeBytes)
++    {
++        const IopSio2::RamAccess ram{
++            [this](uint32_t address, void *dst, size_t size) { return readRam(address, dst, size); },
++            [this](uint32_t address, const void *src, size_t size) { return writeRam(address, src, size); },
++            [this](uint32_t address) { return readHardware32(address); },
++            [this](uint32_t address, uint32_t v) { m_hardware[address] = v; },
++        };
++        // A finished transfer raises the SIO2 interrupt through the same scheduled-interrupt queue the SPU2
++        // DMA uses (the HLE intrman dispatches it to SIO2MAN's handler).
++        if (m_sio2.write(phys, value, sizeBytes, ram))
++            m_dmaStart = DmaStart{IopSio2::Irq, 2000u};
++    }
++
+     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
+     {
+         size = alignUp(std::max(size, 1u), 16u);
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a20d000..623aea2 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "iop_sio2.h"
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <optional>
+@@ -76,6 +78,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+         void writeHardware32(uint32_t address, uint32_t value);
+         void markOwned(uint32_t address, size_t size);
++        [[nodiscard]] uint32_t readSio2(uint32_t phys, unsigned sizeBytes) const;
++        void writeSio2(uint32_t phys, uint32_t value, unsigned sizeBytes);
+ 
+         std::vector<uint8_t> m_ram;
+         std::vector<uint8_t> m_owned;
+@@ -87,5 +91,6 @@ namespace ps2x::iop::detail
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
+         std::optional<DmaStart> m_dmaStart;
++        mutable IopSio2 m_sio2; // mutable: reading DATAOUT pops its FIFO (patch 0018)
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_sio2.cpp b/ps2xIOP/src/emulator/core/iop_sio2.cpp
+new file mode 100644
+index 0000000..d2f8103
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_sio2.cpp
+@@ -0,0 +1,347 @@
++#include "iop_sio2.h"
++
++#include "ps2x/iop/iop_pad_input.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++namespace ps2x::iop
++{
++    namespace
++    {
++        std::atomic<PadInputSource> g_padSource{nullptr};
++    }
++
++    void setPadInputSource(PadInputSource source) noexcept
++    {
++        g_padSource.store(source);
++    }
++}
++
++namespace ps2x::iop::detail
++{
++    namespace
++    {
++        constexpr uint32_t kRegCtrl = 0x1F808268u;
++        constexpr uint32_t kRegDataIn = 0x1F808260u;
++        constexpr uint32_t kRegDataOut = 0x1F808264u;
++        constexpr uint32_t kRegRecv1 = 0x1F80826Cu;
++        constexpr uint32_t kRegRecv2 = 0x1F808270u;
++        constexpr uint32_t kRegRecv3 = 0x1F808274u;
++        constexpr uint32_t kRegUnknown0 = 0x1F808278u;
++        constexpr uint32_t kRegUnknown1 = 0x1F80827Cu;
++        constexpr uint32_t kRegIstat = 0x1F808280u;
++
++        constexpr uint32_t kRecv1DeviceOk = 0x1100u;
++        constexpr uint32_t kRecv1NoDevice = 0x1D100u;
++
++        // IOP DMA channel 11 (SIO2in: RAM -> SIO2) and 12 (SIO2out: SIO2 -> RAM).
++        constexpr uint32_t kDma11Base = 0x1F801540u;
++        constexpr uint32_t kDma12Base = 0x1F801550u;
++        constexpr uint32_t kDmaStart = 1u << 24;
++
++        constexpr uint8_t kModeDigital = 0x41u;
++        constexpr uint8_t kModeAnalog = 0x73u;
++        constexpr uint8_t kModePressure = 0x79u;
++        constexpr uint8_t kModeConfig = 0xF3u;
++
++        bool traceEnabled()
++        {
++            static const bool enabled = []
++            {
++                const char *e = std::getenv("APE2_SIO2_TRACE");
++                return e && *e && *e != '0';
++            }();
++            return enabled;
++        }
++
++        std::string hex(const std::vector<uint8_t> &bytes)
++        {
++            std::string s;
++            char b[4];
++            for (uint8_t v : bytes)
++            {
++                std::snprintf(b, sizeof(b), "%02x", v);
++                s += b;
++            }
++            return s;
++        }
++    }
++
++    void IopSio2::reset()
++    {
++        *this = IopSio2{};
++    }
++
++    uint32_t IopSio2::read(uint32_t phys, unsigned sizeBytes)
++    {
++        (void)sizeBytes;
++        if (phys >= Base && phys < Base + 0x40u)
++            return m_send3[(phys - Base) / 4u];
++        if (phys >= Base + 0x40u && phys < kRegDataIn)
++            return m_send12[(phys - Base - 0x40u) / 4u];
++        switch (phys & ~3u)
++        {
++        case kRegDataOut:
++        {
++            if (m_fifoOut.empty())
++                return 0u;
++            const uint8_t v = m_fifoOut.front();
++            m_fifoOut.pop_front();
++            return v;
++        }
++        case kRegCtrl:
++            return m_ctrl;
++        case kRegRecv1:
++            return m_recv1;
++        case kRegRecv2:
++            return m_recv2;
++        case kRegRecv3:
++            return m_recv3;
++        case kRegUnknown0:
++            return m_unknown[0];
++        case kRegUnknown1:
++            return m_unknown[1];
++        case kRegIstat:
++            return m_istat;
++        default:
++            return 0u;
++        }
++    }
++
++    bool IopSio2::write(uint32_t phys, uint32_t value, unsigned sizeBytes, const RamAccess &ram)
++    {
++        (void)sizeBytes;
++        if (phys >= Base && phys < Base + 0x40u)
++        {
++            m_send3[(phys - Base) / 4u] = value;
++            return false;
++        }
++        if (phys >= Base + 0x40u && phys < kRegDataIn)
++        {
++            m_send12[(phys - Base - 0x40u) / 4u] = value;
++            return false;
++        }
++        switch (phys & ~3u)
++        {
++        case kRegDataIn:
++            m_fifoIn.push_back(static_cast<uint8_t>(value));
++            return false;
++        case kRegCtrl:
++            m_ctrl = value;
++            if (traceEnabled() && m_traceCount < 60u)
++            {
++                ++m_traceCount;
++                std::fprintf(stderr, "[sio2] ctrl=0x%x fifoIn=%zu chcr11=0x%x chcr12=0x%x\n", value, m_fifoIn.size(),
++                             ram.readReg(kDma11Base + 8u), ram.readReg(kDma12Base + 8u));
++            }
++            if ((value & 1u) != 0u)
++            {
++                // SIO2MAN starts with 0x3BC | 1: the queued DATAIN bytes are the command, so the reset bits
++                // must not discard them; the transfer consumes the input FIFO itself.
++                m_ctrl &= ~1u;
++                m_fifoOut.clear();
++                return runTransfers(ram);
++            }
++            if ((value & 0xCu) != 0u) // reset the FIFOs
++            {
++                m_fifoIn.clear();
++                m_fifoOut.clear();
++            }
++            return false;
++        case kRegUnknown0:
++            m_unknown[0] = value;
++            return false;
++        case kRegUnknown1:
++            m_unknown[1] = value;
++            return false;
++        case kRegIstat:
++            m_istat &= ~value;
++            return false;
++        default:
++            return false;
++        }
++    }
++
++    bool IopSio2::runTransfers(const RamAccess &ram)
++    {
++        // Command bytes: DMA channel 11 when armed, else whatever was pushed to DATAIN.
++        std::deque<uint8_t> input;
++        const uint32_t chcr11 = ram.readReg(kDma11Base + 8u);
++        const bool dmaIn = (chcr11 & kDmaStart) != 0u;
++        if (dmaIn)
++        {
++            const uint32_t madr = ram.readReg(kDma11Base) & 0x1FFFFFu;
++            const uint32_t bcr = ram.readReg(kDma11Base + 4u);
++            const uint32_t words = (bcr & 0xFFFFu) * std::max<uint32_t>(bcr >> 16, 1u);
++            std::vector<uint8_t> buf(static_cast<size_t>(words) * 4u);
++            if (!buf.empty() && ram.read(madr, buf.data(), buf.size()))
++                input.insert(input.end(), buf.begin(), buf.end());
++            ram.writeReg(kDma11Base + 8u, chcr11 & ~kDmaStart);
++        }
++        else
++        {
++            input.swap(m_fifoIn);
++        }
++
++        std::vector<uint8_t> output;
++        for (uint32_t i = 0; i < m_send3.size(); ++i)
++        {
++            const uint32_t send3 = m_send3[i];
++            if (send3 == 0u)
++                break;
++            const uint32_t port = send3 & 3u;
++            const uint32_t inSize = (send3 >> 8) & 0x1FFu;
++            const uint32_t outSize = (send3 >> 18) & 0x1FFu;
++            std::vector<uint8_t> in;
++            for (uint32_t b = 0; b < inSize && !input.empty(); ++b)
++            {
++                in.push_back(input.front());
++                input.pop_front();
++            }
++            std::vector<uint8_t> out(outSize, 0xFFu);
++            const bool present = exchange(port, in, out);
++            m_recv1 = present ? kRecv1DeviceOk : kRecv1NoDevice;
++            output.insert(output.end(), out.begin(), out.end());
++
++            if (traceEnabled() && m_traceCount < 400u)
++            {
++                ++m_traceCount;
++                std::fprintf(stderr, "[sio2] send3=0x%08x port=%u in=%s out=%s%s%s\n", send3, port, hex(in).c_str(),
++                             hex(out).c_str(), present ? "" : " (no device)", dmaIn ? " dma" : "");
++            }
++        }
++        m_recv2 = 0xFu;
++        m_recv3 = 0u;
++        m_istat |= 1u;
++
++        // Replies: DMA channel 12 when armed, else DATAOUT.
++        const uint32_t chcr12 = ram.readReg(kDma12Base + 8u);
++        if ((chcr12 & kDmaStart) != 0u)
++        {
++            const uint32_t madr = ram.readReg(kDma12Base) & 0x1FFFFFu;
++            const uint32_t bcr = ram.readReg(kDma12Base + 4u);
++            const uint32_t bytes = (bcr & 0xFFFFu) * std::max<uint32_t>(bcr >> 16, 1u) * 4u;
++            output.resize(std::max<size_t>(output.size(), bytes), 0u);
++            if (bytes != 0u)
++                (void)ram.write(madr, output.data(), bytes);
++            ram.writeReg(kDma12Base + 8u, chcr12 & ~kDmaStart);
++        }
++        else
++        {
++            m_fifoOut.insert(m_fifoOut.end(), output.begin(), output.end());
++        }
++        return true;
++    }
++
++    bool IopSio2::exchange(uint32_t port, const std::vector<uint8_t> &in, std::vector<uint8_t> &out)
++    {
++        // Only controllers on ports 0/1 (device address 0x01); memory cards / multitap answer "no device".
++        if (port > 1u || in.size() < 2u || in[0] != 0x01u)
++            return false;
++        PadInput pad{};
++        const PadInputSource source = g_padSource.load();
++        if (!source || !source(static_cast<int>(port), pad) || !pad.connected)
++            return false;
++
++        DualShock2 &ds = m_pads[port];
++        const uint8_t cmd = in[1];
++        const auto arg = [&](size_t i) -> uint8_t { return i < in.size() ? in[i] : 0u; };
++        std::vector<uint8_t> data;
++        auto buttonData = [&]()
++        {
++            data.push_back(static_cast<uint8_t>(pad.buttons & 0xFFu));
++            data.push_back(static_cast<uint8_t>(pad.buttons >> 8));
++            if (ds.analog || ds.pressure)
++            {
++                data.push_back(pad.rightX);
++                data.push_back(pad.rightY);
++                data.push_back(pad.leftX);
++                data.push_back(pad.leftY);
++            }
++            if (ds.pressure)
++                data.insert(data.end(), pad.pressure, pad.pressure + 12);
++        };
++
++        if (traceEnabled() && cmd == 0x42u && pad.buttons != m_lastTracedButtons[port])
++        {
++            m_lastTracedButtons[port] = pad.buttons;
++            std::fprintf(stderr, "[sio2] pad%u buttons=0x%04x sticks L=%02x,%02x R=%02x,%02x\n", port, pad.buttons,
++                         pad.leftX, pad.leftY, pad.rightX, pad.rightY);
++        }
++
++        const uint8_t mode = ds.config ? kModeConfig : ds.pressure ? kModePressure : ds.analog ? kModeAnalog : kModeDigital;
++        switch (cmd)
++        {
++        case 0x42: // read data
++            if (ds.config)
++                data.assign(6, 0u);
++            else
++                buttonData();
++            break;
++        case 0x43: // enter / exit config mode
++            if (ds.config)
++                data.assign(6, 0u);
++            else
++                buttonData();
++            ds.config = arg(3) == 1u;
++            break;
++        case 0x44: // set mode (digital / analog) and lock
++            if (ds.config)
++            {
++                ds.analog = arg(3) == 1u;
++                if (!ds.analog)
++                    ds.pressure = false;
++            }
++            data.assign(6, 0u);
++            break;
++        case 0x45: // query model: DualShock 2
++            data = {0x03u, 0x02u, static_cast<uint8_t>(ds.analog ? 1u : 0u), 0x02u, 0x01u, 0x00u};
++            break;
++        case 0x46: // query actuator
++            data = arg(3) == 0u ? std::vector<uint8_t>{0x00, 0x00, 0x01, 0x02, 0x00, 0x0A}
++                                : std::vector<uint8_t>{0x00, 0x00, 0x01, 0x01, 0x01, 0x14};
++            break;
++        case 0x47: // query combination
++            data = {0x00, 0x00, 0x02, 0x00, 0x01, 0x00};
++            break;
++        case 0x4C: // query mode
++            data = arg(3) == 0u ? std::vector<uint8_t>{0x00, 0x00, 0x00, 0x04, 0x00, 0x00}
++                                : std::vector<uint8_t>{0x00, 0x00, 0x00, 0x07, 0x00, 0x00};
++            break;
++        case 0x4D: // vibration map
++            data.assign(ds.vibrationMap.begin(), ds.vibrationMap.end());
++            for (size_t i = 0; i < ds.vibrationMap.size(); ++i)
++                ds.vibrationMap[i] = arg(3 + i);
++            break;
++        case 0x4F: // button response mask: enables pressure data
++            ds.pressure = true;
++            ds.analog = true;
++            data = {0x00, 0x00, 0x00, 0x00, 0x00, 0x5A};
++            break;
++        case 0x40: // set VREF parameter
++            data = {0x00, 0x00, 0x02, 0x00, 0x00, 0x5A};
++            break;
++        case 0x41: // query button mask
++            data = ds.analog ? std::vector<uint8_t>{0xFF, 0xFF, 0x03, 0x00, 0x00, 0x5A} : std::vector<uint8_t>(6, 0u);
++            break;
++        default:
++            data.assign(6, 0u);
++            break;
++        }
++
++        std::fill(out.begin(), out.end(), 0x00u);
++        if (!out.empty())
++            out[0] = 0xFFu;
++        if (out.size() > 1u)
++            out[1] = mode;
++        if (out.size() > 2u)
++            out[2] = 0x5Au;
++        for (size_t i = 0; i < data.size() && 3u + i < out.size(); ++i)
++            out[3u + i] = data[i];
++        return true;
++    }
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_sio2.h b/ps2xIOP/src/emulator/core/iop_sio2.h
+new file mode 100644
+index 0000000..ea80167
+--- /dev/null
++++ b/ps2xIOP/src/emulator/core/iop_sio2.h
+@@ -0,0 +1,66 @@
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <deque>
++#include <functional>
++#include <vector>
++
++// SIO2 (controller / memory card serial port) with a DualShock 2 on port 0 (Ape Escape 2 recomp patch 0018).
++// Games that load the real SIO2MAN/PADMAN/DBCMAN modules talk to these registers directly:
++//   0x1F808200-23F SEND3[16] (one word per queued transfer: port, in/out byte counts)
++//   0x1F808240-25F SEND1/SEND2 per port, 0x1F808260 DATAIN (FIFO in), 0x1F808264 DATAOUT (FIFO out)
++//   0x1F808268 CTRL (bit 0 starts the queued transfers), 0x1F80826C/70/74 RECV1/2/3, 0x1F808280 ISTAT
++// Command bytes come from DATAIN or IOP DMA channel 11, replies go to DATAOUT or DMA channel 12; completion
++// raises IOP IRQ 17. APE2_SIO2_TRACE=1 logs the traffic.
++namespace ps2x::iop::detail
++{
++    class IopSio2
++    {
++    public:
++        static constexpr uint32_t Base = 0x1F808200u;
++        static constexpr uint32_t End = 0x1F808284u;
++        static constexpr int Irq = 17;
++
++        struct RamAccess
++        {
++            std::function<bool(uint32_t address, void *dst, size_t size)> read;
++            std::function<bool(uint32_t address, const void *src, size_t size)> write;
++            std::function<uint32_t(uint32_t address)> readReg;
++            std::function<void(uint32_t address, uint32_t value)> writeReg;
++        };
++
++        void reset();
++        [[nodiscard]] static bool contains(uint32_t phys) noexcept { return phys >= Base && phys < End; }
++
++        uint32_t read(uint32_t phys, unsigned sizeBytes);
++        // Returns true when a transfer finished (the caller raises IRQ 17).
++        bool write(uint32_t phys, uint32_t value, unsigned sizeBytes, const RamAccess &ram);
++
++    private:
++        struct DualShock2
++        {
++            bool analog = false;
++            bool config = false;
++            bool pressure = false;
++            std::array<uint8_t, 6> vibrationMap{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
++        };
++
++        bool runTransfers(const RamAccess &ram);
++        bool exchange(uint32_t port, const std::vector<uint8_t> &in, std::vector<uint8_t> &out);
++
++        std::array<uint32_t, 16> m_send3{};
++        std::array<uint32_t, 8> m_send12{};
++        uint32_t m_ctrl = 0;
++        uint32_t m_recv1 = 0x1D100u;
++        uint32_t m_recv2 = 0xFu;
++        uint32_t m_recv3 = 0;
++        uint32_t m_istat = 0;
++        uint32_t m_unknown[2]{};
++        std::deque<uint8_t> m_fifoIn;
++        std::deque<uint8_t> m_fifoOut;
++        std::array<DualShock2, 2> m_pads{};
++        uint32_t m_traceCount = 0;
++        std::array<uint16_t, 2> m_lastTracedButtons{0xFFFFu, 0xFFFFu};
++    };
++}
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..fc56de4 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,28 +1,495 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include "ps2x/iop/iop_pad_input.h"
++
++#include <algorithm>
++#include <cctype>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
+ 
++// Controller mapping (Ape Escape 2 recomp patch 0018). One mapping feeds both the HLE scePad stubs
++// (PSPadBackend::readState) and the emulated SIO2 DualShock 2 that games using the real SIO2MAN/DBCMAN
++// modules read. Defaults are an Xbox-style layout plus keyboard; pad.ini (current directory, or the path
++// in APE2_PAD_CONFIG) is written with the defaults on first run and can be edited:
++//   cross = A, KEY_SPACE        (any number of gamepad / keyboard bindings per PS2 control)
++//   left_stick = LSTICK          (LSTICK, RSTICK or NONE)
+ namespace
+ {
+     constexpr uint8_t kPadAnalogMarker = 0x73;
+-    constexpr uint8_t kPadStickCenter = 0x80;
+ 
+-    constexpr uint16_t PAD_LEFT = 0x0080u;
+-    constexpr uint16_t PAD_DOWN = 0x0040u;
+-    constexpr uint16_t PAD_RIGHT = 0x0020u;
+-    constexpr uint16_t PAD_UP = 0x0010u;
+-    constexpr uint16_t PAD_START = 0x0008u;
+-    constexpr uint16_t PAD_R3 = 0x0004u;
+-    constexpr uint16_t PAD_L3 = 0x0002u;
++    // DualShock 2 button bits (active low in the data the game reads).
+     constexpr uint16_t PAD_SELECT = 0x0001u;
+-    constexpr uint16_t PAD_SQUARE = 0x8000u;
+-    constexpr uint16_t PAD_CROSS = 0x4000u;
+-    constexpr uint16_t PAD_CIRCLE = 0x2000u;
+-    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
+-    constexpr uint16_t PAD_R1 = 0x0800u;
+-    constexpr uint16_t PAD_L1 = 0x0400u;
+-    constexpr uint16_t PAD_R2 = 0x0200u;
++    constexpr uint16_t PAD_L3 = 0x0002u;
++    constexpr uint16_t PAD_R3 = 0x0004u;
++    constexpr uint16_t PAD_START = 0x0008u;
++    constexpr uint16_t PAD_UP = 0x0010u;
++    constexpr uint16_t PAD_RIGHT = 0x0020u;
++    constexpr uint16_t PAD_DOWN = 0x0040u;
++    constexpr uint16_t PAD_LEFT = 0x0080u;
+     constexpr uint16_t PAD_L2 = 0x0100u;
++    constexpr uint16_t PAD_R2 = 0x0200u;
++    constexpr uint16_t PAD_L1 = 0x0400u;
++    constexpr uint16_t PAD_R1 = 0x0800u;
++    constexpr uint16_t PAD_TRIANGLE = 0x1000u;
++    constexpr uint16_t PAD_CIRCLE = 0x2000u;
++    constexpr uint16_t PAD_CROSS = 0x4000u;
++    constexpr uint16_t PAD_SQUARE = 0x8000u;
++
++    constexpr float kStickDeadzone = 0.12f;
++    constexpr float kTriggerThreshold = 0.3f; // of the 0..1 trigger travel
++
++    enum class Control
++    {
++        Up, Down, Left, Right, Triangle, Circle, Cross, Square, L1, R1, L2, R2, L3, R3, Start, Select,
++        LeftUp, LeftDown, LeftLeft, LeftRight, RightUp, RightDown, RightLeft, RightRight,
++        Count
++    };
++
++    struct ControlInfo
++    {
++        const char *name;
++        uint16_t bit;      // 0 for stick directions
++        int pressureIndex; // index into PadInput::pressure, -1 if none
++    };
++
++    constexpr ControlInfo kControls[] = {
++        {"up", PAD_UP, 2}, {"down", PAD_DOWN, 3}, {"left", PAD_LEFT, 1}, {"right", PAD_RIGHT, 0},
++        {"triangle", PAD_TRIANGLE, 4}, {"circle", PAD_CIRCLE, 5}, {"cross", PAD_CROSS, 6}, {"square", PAD_SQUARE, 7},
++        {"l1", PAD_L1, 8}, {"r1", PAD_R1, 9}, {"l2", PAD_L2, 10}, {"r2", PAD_R2, 11},
++        {"l3", PAD_L3, -1}, {"r3", PAD_R3, -1}, {"start", PAD_START, -1}, {"select", PAD_SELECT, -1},
++        {"left_up", 0, -1}, {"left_down", 0, -1}, {"left_left", 0, -1}, {"left_right", 0, -1},
++        {"right_up", 0, -1}, {"right_down", 0, -1}, {"right_left", 0, -1}, {"right_right", 0, -1},
++    };
++    static_assert(sizeof(kControls) / sizeof(kControls[0]) == static_cast<size_t>(Control::Count));
++
++    // Gamepad inputs by Xbox name. LT/RT are read from the trigger axes.
++    enum class PadInputKind
++    {
++        Button,
++        LeftTrigger,
++        RightTrigger
++    };
++    struct GamepadName
++    {
++        const char *name;
++        PadInputKind kind;
++        int button;
++    };
++    constexpr GamepadName kGamepadNames[] = {
++        {"A", PadInputKind::Button, GAMEPAD_BUTTON_RIGHT_FACE_DOWN},
++        {"B", PadInputKind::Button, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT},
++        {"X", PadInputKind::Button, GAMEPAD_BUTTON_RIGHT_FACE_LEFT},
++        {"Y", PadInputKind::Button, GAMEPAD_BUTTON_RIGHT_FACE_UP},
++        {"LB", PadInputKind::Button, GAMEPAD_BUTTON_LEFT_TRIGGER_1},
++        {"RB", PadInputKind::Button, GAMEPAD_BUTTON_RIGHT_TRIGGER_1},
++        {"LT", PadInputKind::LeftTrigger, 0},
++        {"RT", PadInputKind::RightTrigger, 0},
++        {"BACK", PadInputKind::Button, GAMEPAD_BUTTON_MIDDLE_LEFT},
++        {"START", PadInputKind::Button, GAMEPAD_BUTTON_MIDDLE_RIGHT},
++        {"GUIDE", PadInputKind::Button, GAMEPAD_BUTTON_MIDDLE},
++        {"LS", PadInputKind::Button, GAMEPAD_BUTTON_LEFT_THUMB},
++        {"RS", PadInputKind::Button, GAMEPAD_BUTTON_RIGHT_THUMB},
++        {"DPAD_UP", PadInputKind::Button, GAMEPAD_BUTTON_LEFT_FACE_UP},
++        {"DPAD_DOWN", PadInputKind::Button, GAMEPAD_BUTTON_LEFT_FACE_DOWN},
++        {"DPAD_LEFT", PadInputKind::Button, GAMEPAD_BUTTON_LEFT_FACE_LEFT},
++        {"DPAD_RIGHT", PadInputKind::Button, GAMEPAD_BUTTON_LEFT_FACE_RIGHT},
++    };
++
++    struct Binding
++    {
++        bool keyboard = false;
++        int key = 0;
++        PadInputKind kind = PadInputKind::Button;
++        int button = 0;
++    };
++
++    enum class StickSource
++    {
++        None,
++        LeftStick,
++        RightStick
++    };
++
++    struct Mapping
++    {
++        std::vector<Binding> bindings[static_cast<size_t>(Control::Count)];
++        StickSource leftStick = StickSource::LeftStick;
++        StickSource rightStick = StickSource::RightStick;
++    };
++
++    constexpr const char *kDefaultConfig =
++        "# Ape Escape 2 recomp controller mapping (generated with the defaults; edit freely).\n"
++        "# <ps2 control> = <binding>, <binding>, ...\n"
++        "# Gamepad (Xbox names): A B X Y LB RB LT RT BACK START GUIDE LS RS DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT\n"
++        "# Keyboard: KEY_<name>, e.g. KEY_W KEY_SPACE KEY_ENTER KEY_LEFT_SHIFT KEY_UP KEY_1 (raylib key names)\n"
++        "# Sticks: left_stick / right_stick = LSTICK, RSTICK or NONE; left_up ... right_right add keyboard directions.\n"
++        "# The first connected gamepad is used.\n"
++        "\n"
++        "cross    = A, KEY_SPACE\n"
++        "circle   = B, KEY_E\n"
++        "square   = X, KEY_Q\n"
++        "triangle = Y, KEY_R\n"
++        "l1       = LB, KEY_Z\n"
++        "r1       = RB, KEY_C\n"
++        "l2       = LT, KEY_LEFT_SHIFT\n"
++        "r2       = RT, KEY_LEFT_CONTROL\n"
++        "l3       = LS, KEY_V\n"
++        "r3       = RS, KEY_B\n"
++        "start    = START, KEY_ENTER\n"
++        "select   = BACK, KEY_TAB\n"
++        "up       = DPAD_UP, KEY_T\n"
++        "down     = DPAD_DOWN, KEY_G\n"
++        "left     = DPAD_LEFT, KEY_F\n"
++        "right    = DPAD_RIGHT, KEY_H\n"
++        "\n"
++        "left_stick  = LSTICK\n"
++        "right_stick = RSTICK\n"
++        "left_up     = KEY_W\n"
++        "left_down   = KEY_S\n"
++        "left_left   = KEY_A\n"
++        "left_right  = KEY_D\n"
++        "right_up    = KEY_UP\n"
++        "right_down  = KEY_DOWN\n"
++        "right_left  = KEY_LEFT\n"
++        "right_right = KEY_RIGHT\n";
++
++    std::string trim(std::string s)
++    {
++        const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
++        s.erase(s.begin(), std::find_if(s.begin(), s.end(), notSpace));
++        s.erase(std::find_if(s.rbegin(), s.rend(), notSpace).base(), s.end());
++        return s;
++    }
++
++    std::string upper(std::string s)
++    {
++        for (char &c : s)
++            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++        return s;
++    }
++
++    int keyFromName(const std::string &nameUpper)
++    {
++        static const struct
++        {
++            const char *name;
++            int key;
++        } kKeys[] = {
++            {"SPACE", KEY_SPACE}, {"ENTER", KEY_ENTER}, {"TAB", KEY_TAB}, {"ESCAPE", KEY_ESCAPE},
++            {"BACKSPACE", KEY_BACKSPACE}, {"UP", KEY_UP}, {"DOWN", KEY_DOWN}, {"LEFT", KEY_LEFT}, {"RIGHT", KEY_RIGHT},
++            {"LEFT_SHIFT", KEY_LEFT_SHIFT}, {"RIGHT_SHIFT", KEY_RIGHT_SHIFT}, {"LEFT_CONTROL", KEY_LEFT_CONTROL},
++            {"RIGHT_CONTROL", KEY_RIGHT_CONTROL}, {"LEFT_ALT", KEY_LEFT_ALT}, {"RIGHT_ALT", KEY_RIGHT_ALT},
++            {"COMMA", KEY_COMMA}, {"PERIOD", KEY_PERIOD}, {"SLASH", KEY_SLASH}, {"SEMICOLON", KEY_SEMICOLON},
++            {"APOSTROPHE", KEY_APOSTROPHE}, {"MINUS", KEY_MINUS}, {"EQUAL", KEY_EQUAL},
++            {"LEFT_BRACKET", KEY_LEFT_BRACKET}, {"RIGHT_BRACKET", KEY_RIGHT_BRACKET}, {"BACKSLASH", KEY_BACKSLASH},
++            {"GRAVE", KEY_GRAVE}, {"KP_0", KEY_KP_0}, {"KP_1", KEY_KP_1}, {"KP_2", KEY_KP_2}, {"KP_3", KEY_KP_3},
++            {"KP_4", KEY_KP_4}, {"KP_5", KEY_KP_5}, {"KP_6", KEY_KP_6}, {"KP_7", KEY_KP_7}, {"KP_8", KEY_KP_8},
++            {"KP_9", KEY_KP_9},
++        };
++        if (nameUpper.size() == 1 && nameUpper[0] >= 'A' && nameUpper[0] <= 'Z')
++            return KEY_A + (nameUpper[0] - 'A');
++        if (nameUpper.size() == 1 && nameUpper[0] >= '0' && nameUpper[0] <= '9')
++            return KEY_ZERO + (nameUpper[0] - '0');
++        if (nameUpper.size() >= 2 && nameUpper[0] == 'F')
++        {
++            const int n = std::atoi(nameUpper.c_str() + 1);
++            if (n >= 1 && n <= 12)
++                return KEY_F1 + (n - 1);
++        }
++        for (const auto &k : kKeys)
++            if (nameUpper == k.name)
++                return k.key;
++        return 0;
++    }
++
++    bool parseBinding(const std::string &token, Binding &out)
++    {
++        const std::string t = upper(trim(token));
++        if (t.rfind("KEY_", 0) == 0)
++        {
++            const int key = keyFromName(t.substr(4));
++            if (key == 0)
++                return false;
++            out.keyboard = true;
++            out.key = key;
++            return true;
++        }
++        for (const GamepadName &g : kGamepadNames)
++        {
++            if (t == g.name)
++            {
++                out.keyboard = false;
++                out.kind = g.kind;
++                out.button = g.button;
++                return true;
++            }
++        }
++        return false;
++    }
++
++    bool parseStick(const std::string &value, StickSource &out)
++    {
++        const std::string v = upper(trim(value));
++        if (v == "LSTICK")
++            out = StickSource::LeftStick;
++        else if (v == "RSTICK")
++            out = StickSource::RightStick;
++        else if (v == "NONE")
++            out = StickSource::None;
++        else
++            return false;
++        return true;
++    }
++
++    void parseConfig(const std::string &text, Mapping &m, const std::string &origin)
++    {
++        std::istringstream in(text);
++        std::string line;
++        int lineNo = 0;
++        while (std::getline(in, line))
++        {
++            ++lineNo;
++            const size_t hash = line.find('#');
++            if (hash != std::string::npos)
++                line.resize(hash);
++            const size_t eq = line.find('=');
++            if (eq == std::string::npos)
++                continue;
++            const std::string key = upper(trim(line.substr(0, eq)));
++            const std::string value = line.substr(eq + 1);
++            if (key.empty())
++                continue;
++            if (key == "LEFT_STICK" || key == "RIGHT_STICK")
++            {
++                StickSource &s = key == "LEFT_STICK" ? m.leftStick : m.rightStick;
++                if (!parseStick(value, s))
++                    std::fprintf(stderr, "[pad] %s:%d: unknown stick source '%s'\n", origin.c_str(), lineNo, trim(value).c_str());
++                continue;
++            }
++            int control = -1;
++            for (int i = 0; i < static_cast<int>(Control::Count); ++i)
++                if (key == upper(kControls[i].name))
++                    control = i;
++            if (control < 0)
++            {
++                std::fprintf(stderr, "[pad] %s:%d: unknown control '%s'\n", origin.c_str(), lineNo, key.c_str());
++                continue;
++            }
++            std::vector<Binding> &list = m.bindings[control];
++            list.clear();
++            std::istringstream tokens(value);
++            std::string token;
++            while (std::getline(tokens, token, ','))
++            {
++                if (trim(token).empty())
++                    continue;
++                Binding b;
++                if (parseBinding(token, b))
++                    list.push_back(b);
++                else
++                    std::fprintf(stderr, "[pad] %s:%d: unknown binding '%s'\n", origin.c_str(), lineNo, trim(token).c_str());
++            }
++        }
++    }
++
++    const Mapping &mapping()
++    {
++        static Mapping m;
++        static std::once_flag once;
++        std::call_once(once, []
++        {
++            parseConfig(kDefaultConfig, m, "defaults");
++            const char *env = std::getenv("APE2_PAD_CONFIG");
++            const std::string path = (env && *env) ? env : "pad.ini";
++            std::ifstream file(path, std::ios::binary);
++            if (file)
++            {
++                std::stringstream ss;
++                ss << file.rdbuf();
++                parseConfig(ss.str(), m, path);
++                std::fprintf(stderr, "[pad] mapping loaded from %s\n", path.c_str());
++            }
++            else if (std::ofstream outFile{path, std::ios::binary})
++            {
++                outFile << kDefaultConfig;
++                std::fprintf(stderr, "[pad] wrote default mapping to %s (edit it to remap)\n", path.c_str());
++            }
++        });
++        return m;
++    }
++
++    int activeGamepad()
++    {
++        static int reported = -2;
++        int found = -1;
++        for (int i = 0; i < 4; ++i)
++        {
++            if (IsGamepadAvailable(i))
++            {
++                found = i;
++                break;
++            }
++        }
++        if (found != reported)
++        {
++            reported = found;
++            if (found >= 0)
++                std::fprintf(stderr, "[pad] using gamepad %d: %s\n", found, GetGamepadName(found));
++            else
++                std::fprintf(stderr, "[pad] no gamepad connected (keyboard only)\n");
++        }
++        return found;
++    }
++
++    // Trigger axes report -1 (released) .. 1 (fully pressed). Some drivers report 0 until the trigger is first
++    // moved, so the axis is only trusted once it has been seen near -1; until then the digital LT/RT state is used.
++    float triggerTravel(int gamepad, PadInputKind kind)
++    {
++        static bool axisSeenReleased[2] = {false, false};
++        const bool left = kind == PadInputKind::LeftTrigger;
++        const float axis = GetGamepadAxisMovement(gamepad, left ? GAMEPAD_AXIS_LEFT_TRIGGER : GAMEPAD_AXIS_RIGHT_TRIGGER);
++        if (axis < -0.9f)
++            axisSeenReleased[left ? 0 : 1] = true;
++        if (axisSeenReleased[left ? 0 : 1])
++            return std::clamp((axis + 1.0f) * 0.5f, 0.0f, 1.0f);
++        return IsGamepadButtonDown(gamepad, left ? GAMEPAD_BUTTON_LEFT_TRIGGER_2 : GAMEPAD_BUTTON_RIGHT_TRIGGER_2) ? 1.0f : 0.0f;
++    }
++
++    // 0 = released .. 1 = fully pressed.
++    float bindingValue(const Binding &b, int gamepad)
++    {
++        if (b.keyboard)
++            return IsKeyDown(b.key) ? 1.0f : 0.0f;
++        if (gamepad < 0)
++            return 0.0f;
++        if (b.kind == PadInputKind::Button)
++            return IsGamepadButtonDown(gamepad, b.button) ? 1.0f : 0.0f;
++        const float travel = triggerTravel(gamepad, b.kind);
++        return travel >= kTriggerThreshold ? travel : 0.0f;
++    }
++
++    uint8_t stickByte(float v)
++    {
++        if (std::fabs(v) < kStickDeadzone)
++            v = 0.0f;
++        v = std::clamp(v, -1.0f, 1.0f);
++        return static_cast<uint8_t>(std::lround((v + 1.0f) * 127.5f));
++    }
++
++    // Scripted input for unattended test runs: APE2_PAD_SCRIPT="120-121:start;130-131.5:cross" holds each
++    // control during [start, end) seconds after process start.
++    struct ScriptedPress
++    {
++        double start = 0.0;
++        double end = 0.0;
++        int control = 0;
++    };
++
++    const std::vector<ScriptedPress> &padScript()
++    {
++        static std::vector<ScriptedPress> script;
++        static std::once_flag once;
++        std::call_once(once, []
++        {
++            const char *env = std::getenv("APE2_PAD_SCRIPT");
++            if (!env || !*env)
++                return;
++            std::istringstream in(env);
++            std::string item;
++            while (std::getline(in, item, ';'))
++            {
++                ScriptedPress p;
++                char name[32] = {};
++                if (std::sscanf(item.c_str(), " %lf - %lf : %31s", &p.start, &p.end, name) != 3)
++                    continue;
++                const std::string n = upper(name);
++                for (int i = 0; i < static_cast<int>(Control::Count); ++i)
++                    if (n == upper(kControls[i].name))
++                    {
++                        p.control = i;
++                        script.push_back(p);
++                        std::fprintf(stderr, "[pad] script: %s %.1f-%.1fs\n", kControls[i].name, p.start, p.end);
++                    }
++            }
++        });
++        return script;
++    }
++
++    const auto g_processStart = std::chrono::steady_clock::now();
++
++    double padClockSeconds()
++    {
++        return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_processStart).count();
++    }
++
++    void readHostPad(ps2x::iop::PadInput &out)
++    {
++        const Mapping &m = mapping();
++        const int gamepad = activeGamepad();
++        out = {};
++        float value[static_cast<size_t>(Control::Count)]{};
++        for (int c = 0; c < static_cast<int>(Control::Count); ++c)
++            for (const Binding &b : m.bindings[c])
++                value[c] = std::max(value[c], bindingValue(b, gamepad));
++        if (!padScript().empty())
++        {
++            const double now = padClockSeconds();
++            for (const ScriptedPress &p : padScript())
++                if (now >= p.start && now < p.end)
++                    value[p.control] = 1.0f;
++        }
++
++        uint16_t buttons = 0xFFFFu;
++        for (int c = 0; c < static_cast<int>(Control::Count); ++c)
++        {
++            const ControlInfo &info = kControls[c];
++            if (info.bit != 0u && value[c] > 0.0f)
++                buttons &= static_cast<uint16_t>(~info.bit);
++            if (info.pressureIndex >= 0)
++                out.pressure[info.pressureIndex] = static_cast<uint8_t>(std::lround(value[c] * 255.0f));
++        }
++        out.buttons = buttons;
++
++        auto stick = [&](StickSource source, Control up, Control down, Control left, Control right, uint8_t &x, uint8_t &y)
++        {
++            float sx = 0.0f, sy = 0.0f;
++            if (gamepad >= 0 && source != StickSource::None)
++            {
++                const bool l = source == StickSource::LeftStick;
++                sx = GetGamepadAxisMovement(gamepad, l ? GAMEPAD_AXIS_LEFT_X : GAMEPAD_AXIS_RIGHT_X);
++                sy = GetGamepadAxisMovement(gamepad, l ? GAMEPAD_AXIS_LEFT_Y : GAMEPAD_AXIS_RIGHT_Y);
++            }
++            sx += value[static_cast<int>(right)] - value[static_cast<int>(left)];
++            sy += value[static_cast<int>(down)] - value[static_cast<int>(up)];
++            x = stickByte(sx);
++            y = stickByte(sy);
++        };
++        stick(m.leftStick, Control::LeftUp, Control::LeftDown, Control::LeftLeft, Control::LeftRight, out.leftX, out.leftY);
++        stick(m.rightStick, Control::RightUp, Control::RightDown, Control::RightLeft, Control::RightRight, out.rightX,
++              out.rightY);
++    }
++
++    bool sio2PadSource(int port, ps2x::iop::PadInput &out)
++    {
++        if (port != 0)
++            return false; // one controller, on port 1
++        readHostPad(out);
++        return true;
++    }
++
++    const bool s_registered = []
++    {
++        ps2x::iop::setPadInputSource(&sio2PadSource);
++        return true;
++    }();
+ }
+ 
+ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+@@ -30,96 +497,17 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     if (!data || size < 32)
+         return false;
+ 
++    ps2x::iop::PadInput pad{};
++    readHostPad(pad);
++
+     std::memset(data, 0, 32);
+     data[0] = 0x01;
+     data[1] = kPadAnalogMarker;
+-    data[2] = 0xFF;
+-    data[3] = 0xFF;
+-    data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+-
+-    uint16_t btns = 0xFFFFu;
+-    constexpr int kGamepad = 0;
+-    const bool useGamepad = IsGamepadAvailable(kGamepad);
+-    auto clearBit = [&btns](uint16_t mask)
+-    { btns &= ~mask; };
+-
+-    if (useGamepad)
+-    {
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_UP))
+-            clearBit(PAD_UP);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+-            clearBit(PAD_DOWN);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+-            clearBit(PAD_LEFT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+-            clearBit(PAD_RIGHT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+-            clearBit(PAD_CROSS);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))
+-            clearBit(PAD_CIRCLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))
+-            clearBit(PAD_SQUARE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+-            clearBit(PAD_L1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+-            clearBit(PAD_R1);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_2))
+-            clearBit(PAD_L2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_2))
+-            clearBit(PAD_R2);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))
+-            clearBit(PAD_START);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))
+-            clearBit(PAD_SELECT);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_LEFT_THUMB))
+-            clearBit(PAD_L3);
+-        if (IsGamepadButtonDown(kGamepad, GAMEPAD_BUTTON_RIGHT_THUMB))
+-            clearBit(PAD_R3);
+-
+-        float lx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_X);
+-        float ly = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_LEFT_Y);
+-        float rx = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_X);
+-        float ry = GetGamepadAxisMovement(kGamepad, GAMEPAD_AXIS_RIGHT_Y);
+-        data[6] = static_cast<uint8_t>(128 + lx * 127);
+-        data[7] = static_cast<uint8_t>(128 + ly * 127);
+-        data[4] = static_cast<uint8_t>(128 + rx * 127);
+-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+-    }
+-    else
+-    {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
+-            clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
+-            clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
+-            clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
+-    }
+-
+-    data[2] = static_cast<uint8_t>(btns & 0xFF);
+-    data[3] = static_cast<uint8_t>(btns >> 8);
++    data[2] = static_cast<uint8_t>(pad.buttons & 0xFF);
++    data[3] = static_cast<uint8_t>(pad.buttons >> 8);
++    data[4] = pad.rightX;
++    data[5] = pad.rightY;
++    data[6] = pad.leftX;
++    data[7] = pad.leftY;
+     return true;
+ }

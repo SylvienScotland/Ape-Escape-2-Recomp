@@ -250,3 +250,49 @@
 - Result: memory card text, UbiSoft / SCE logos and the Ape Escape 2 title screen ("Press the START
   button") render correctly; the game reaches the title in < 150 s unattended.
 - build_windows.ps1 now throws when the runner build fails (it used to boot the previous exe).
+
+## Perf micro-optimisations (patch 0017): small gain, expensive rebuild
+- patches/ps2recomp/0017-perf-raster-span-vu-commit-gate.patch: DrawTriangle walks only each row's covered
+  span (edge equations, exact per-pixel test kept); lerpChannel without lroundf; VU1 commitReadyPipelines
+  skips its scan before the earliest queued readyCycle (new member in ps2_vu1.h).
+- Frames are pixel-identical to the previous build. Title screen still ~1 fps: DrawTriangle self 9.2% -> 6.1%,
+  but the VU commit gate rarely skips (an entry is due almost every cycle).
+- ps2_vu1.h is in the runner PCH: this patch cost a full rebuild of ~267 unity TUs = 30 minutes on this PC.
+  Avoid PCH headers unless the change is worth it.
+- Remaining cost is structural: software GS raster ~55-60% (LookupCLUT, SampleTexture, combineTexture) and the
+  cycle-accurate VU1 interpreter ~35-40%. Real wins need a threaded GS rasterizer and native/recompiled VU1
+  microprograms (the PAL port JackyPendrag0n/ae2-recomp does both; its docs are a design reference only, the
+  repo has no licence, so do not copy its code).
+
+## Controller: SIO2 + DualShock 2 emulation (patches 0018-0020), remappable Xbox layout
+- AE2 does not use libpad: it loads the real SIO2MAN.IRX, DBCMAN.IRX, SIO2D.IRX, DS1O.IRX from disc (run in the
+  IOP interpreter) and reads pads with libpad2 (scePad2*) + libdbc on the EE. Upstream only had a DBCMAN
+  version-query HLE and no SIO2 hardware, so no controller ever answered.
+- patches/ps2recomp/0018-sio2-dualshock2-pad-mapping.patch:
+  - ps2xIOP core/iop_sio2.{h,cpp}: SIO2 registers 0x1F808200-283 (SEND3/SEND1/2, DATAIN/DATAOUT FIFOs, CTRL,
+    RECV1-3, ISTAT), IOP DMA ch11/12, IRQ 17 via the scheduled-interrupt queue; DualShock 2 on port 0
+    (0x40-0x4F protocol: read, config, set analog mode, model/act/comb/mode queries, vibration map, pressure).
+    Others answer "no device" (RECV1 0x1D100). SIO2MAN starts transfers with CTRL=0x3BD: the FIFO-reset bits
+    must not discard the queued command (first attempt sent empty commands).
+  - include/ps2x/iop/iop_pad_input.h: PadInput + setPadInputSource(); the runtime registers its pad there.
+  - ps2xRuntime ps2_pad.cpp: one mapping for both SIO2 and the HLE scePad stubs. Xbox defaults (A=cross,
+    B=circle, X=square, Y=triangle, LB/RB=L1/R1, LT/RT=L2/R2 from the trigger axes incl. pressure, Back=select,
+    Start=start, LS/RS=L3/R3, sticks analog) + keyboard; pad.ini (cwd, or APE2_PAD_CONFIG) is written with the
+    defaults on first run and can be edited. First connected gamepad is used ("[pad] using gamepad 0: Xbox
+    Controller"). APE2_PAD_SCRIPT="100-108:start;125-133:cross" holds controls (seconds since process start)
+    for unattended tests; hold presses for several seconds at ~2 fps. APE2_SIO2_TRACE=1 logs the traffic.
+  - Trace of the game's init: 42, 43 01 (config), 45, 46 00/01, 47, 4C 00/01, 44 01 03 (analog, locked), 4D,
+    43 00, then 5-byte 42 reads in analog mode (ff 73 5a ...).
+- patches/ps2recomp/0019-iop-vblank-handlers.patch: RegisterVblankHandler/ReleaseVblankHandler were no-ops;
+  handlers are now delivered at vblank start/end edges (priority order, released when they return 0).
+- patches/ps2recomp/0020-iop-sifsetdma-no-ownership-check.patch: "dbcman: sceSifSetDma faild" = sifman import
+  32 (isceSifSetDma) was unimplemented; it now shares sceSifSetDma. The ownership check on the source buffer
+  (guest must have written it before) was dropped (bounds check instead); failures and unknown sifman
+  ordinals are logged.
+- User confirmed START works on the title screen with a physical Xbox controller.
+
+## Perf: row-parallel GS rasterizer (patch 0021) = 2x
+- Large triangles/sprites (bbox >= 8192 px) are drawn by a worker pool (default min(cores-1, 8);
+  APE2_GS_THREADS=N, 1 disables), 4-row blocks from an atomic counter; per-row code unchanged.
+- Title / 3D intro: ~1.0 -> 1.9 fps. gs-raster 55-60% -> 15-21%; VU1 interpreter is now ~70% of the frame.
+- Frames compared to the previous build: identical where the game state matches.

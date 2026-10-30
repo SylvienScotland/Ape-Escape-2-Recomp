@@ -1,0 +1,212 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..cef3a22 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -216,6 +216,9 @@ private:
+     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
+     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
+     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
++    // Earliest readyCycle of any queued flag/FDIV/EFU/store/VF/VI/ACC entry; commitReadyPipelines() skips
++    // its scan before then (Ape Escape 2 recomp patch 0017).
++    uint64_t m_nextPipelineCommitCycle = 0;
+     XgkickPipeline m_xgkick{};
+     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
+     std::array<uint64_t, 16> m_viReady{};
+@@ -278,6 +281,12 @@ private:
+ 
+     void resetScheduler();
+     void commitReadyPipelines();
++    void commitDuePipelineEntries();
++    void notePipelineReady(uint64_t readyCycle)
++    {
++        if (readyCycle < m_nextPipelineCommitCycle)
++            m_nextPipelineCommitCycle = readyCycle;
++    }
+     void advanceOneCycle();
+     void advanceTo(uint64_t targetCycle);
+     void flushPipelines();
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index df853b0..2dd6d59 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -300,7 +300,8 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // Values are in [0, 255]: +0.5 truncation rounds exactly like lround, without the libm call.
++        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
+     }
+ }
+ 
+@@ -1386,11 +1387,40 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
++    // Per-row covered span from the edge equations w_i(x) = a_i * x + b_i(y) >= -eps, widened by a pixel;
++    // the exact per-pixel test below still decides coverage, this only skips the empty part of the
++    // bounding box (Ape Escape 2 recomp patch 0017).
++    const float a0 = (fy1 - fy2) * winding * invAbsDenom;
++    const float a1 = (fy2 - fy0) * winding * invAbsDenom;
++    const float a2 = -(a0 + a1);
++
+     for (int y = minY; y <= maxY; ++y)
+     {
+         // GS pixel centres are at integer coordinates (patch 0014; see DrawSprite).
+         float py = static_cast<float>(y);
+-        for (int x = minX; x <= maxX; ++x)
++        const float b0 = ((fy1 - fy2) * (-fx2) + (fx2 - fx1) * (py - fy2)) * winding * invAbsDenom;
++        const float b1 = ((fy2 - fy0) * (-fx2) + (fx0 - fx2) * (py - fy2)) * winding * invAbsDenom;
++        const float b2 = 1.0f - b0 - b1;
++        float spanLo = static_cast<float>(minX);
++        float spanHi = static_cast<float>(maxX);
++        bool emptyRow = false;
++        auto clipEdge = [&](float a, float b)
++        {
++            if (a > 0.0f)
++                spanLo = std::max(spanLo, (-kEdgeEpsilon - b) / a);
++            else if (a < 0.0f)
++                spanHi = std::min(spanHi, (-kEdgeEpsilon - b) / a);
++            else if (b < -kEdgeEpsilon)
++                emptyRow = true;
++        };
++        clipEdge(a0, b0);
++        clipEdge(a1, b1);
++        clipEdge(a2, b2);
++        if (emptyRow || spanLo > spanHi + 1.0f)
++            continue;
++        const int rowX0 = std::max(minX, static_cast<int>(std::floor(spanLo)) - 1);
++        const int rowX1 = std::min(maxX, static_cast<int>(std::ceil(spanHi)) + 1);
++        for (int x = rowX0; x <= rowX1; ++x)
+         {
+             float px = static_cast<float>(x);
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index df60c49..9be6fd4 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -74,6 +74,7 @@ void VU1Interpreter::resetScheduler()
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
++    m_nextPipelineCommitCycle = 0;
+     m_xgkick = {};
+     m_vfReady = {};
+     m_viReady = {};
+@@ -534,6 +535,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    notePipelineReady(entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -573,6 +575,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            notePipelineReady(entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -592,6 +595,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            notePipelineReady(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -616,6 +620,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            notePipelineReady(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -630,6 +635,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    notePipelineReady(m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -644,6 +650,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            notePipelineReady(entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -661,6 +668,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            notePipelineReady(store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -682,6 +690,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            notePipelineReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -708,6 +717,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            notePipelineReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -729,6 +739,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            notePipelineReady(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,6 +755,36 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ }
+ 
+ void VU1Interpreter::commitReadyPipelines()
++{
++    // Called every VU cycle; scanning ~50 slots each time dominated VU1 time. Nothing can commit before
++    // the earliest queued readyCycle, which every queue* function lowers (patch 0017).
++    if (m_cycle < m_nextPipelineCommitCycle)
++        return;
++    commitDuePipelineEntries();
++
++    uint64_t next = UINT64_MAX;
++    auto consider = [&next](bool valid, uint64_t readyCycle)
++    {
++        if (valid && readyCycle < next)
++            next = readyCycle;
++    };
++    for (const FlagPipelineEntry &entry : m_flagPipeline)
++        consider(entry.valid, entry.readyCycle);
++    consider(m_fdiv.valid, m_fdiv.readyCycle);
++    for (const ScalarPipelineEntry &entry : m_efu)
++        consider(entry.valid, entry.readyCycle);
++    for (const PendingStore &store : m_storePipeline)
++        consider(store.valid, store.readyCycle);
++    for (const PendingVfWrite &write : m_vfWritePipeline)
++        consider(write.valid, write.readyCycle);
++    for (const PendingViWrite &write : m_viWritePipeline)
++        consider(write.valid, write.readyCycle);
++    for (const PendingAccWrite &write : m_accWritePipeline)
++        consider(write.valid, write.readyCycle);
++    m_nextPipelineCommitCycle = next;
++}
++
++void VU1Interpreter::commitDuePipelineEntries()
+ {
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {

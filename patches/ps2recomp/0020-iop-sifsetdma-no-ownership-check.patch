@@ -1,0 +1,90 @@
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index cf4fdc6..dd70af2 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+@@ -38,7 +39,8 @@ namespace ps2x::iop::detail
+             m_sifInitialized = true;
+             setV0(0u);
+             return true;
+-        case 7: // sceSifSetDma
++        case 7:  // sceSifSetDma
++        case 32: // isceSifSetDma (interrupt-context variant; DBCMAN sends pad data with it, patch 0020)
+         {
+             constexpr uint32_t kDescriptorSize = 16u;
+             constexpr uint32_t kMaxDescriptors = 32u;
+@@ -46,6 +48,7 @@ namespace ps2x::iop::detail
+             const uint32_t descriptorCount = cpu.gpr[5];
+             if (descriptorAddress == 0u || descriptorCount == 0u || descriptorCount > kMaxDescriptors)
+             {
++                std::fprintf(stderr, "[IOP] sceSifSetDma: bad descriptor list 0x%x count %u\n", descriptorAddress, descriptorCount);
+                 setV0(0u);
+                 return true;
+             }
+@@ -61,6 +64,7 @@ namespace ps2x::iop::detail
+             const size_t descriptorBytes = static_cast<size_t>(descriptorCount) * kDescriptorSize;
+             if (!m_memory.readRam(descriptorAddress, descriptorWords.data(), descriptorBytes))
+             {
++                std::fprintf(stderr, "[IOP] sceSifSetDma: descriptor list 0x%x count %u not in IOP RAM\n", descriptorAddress, descriptorCount);
+                 setV0(0u);
+                 return true;
+             }
+@@ -77,8 +81,13 @@ namespace ps2x::iop::detail
+                     continue;
+ 
+                 const uint32_t size = static_cast<uint32_t>(signedSize);
+-                if (!m_memory.ownsRamRange(source, size))
++                // Bounds only: the source may legitimately be a buffer the guest never wrote (zeroed .bss).
++                // Requiring "owned" RAM here made DBCMAN's first pad-data DMA fail ("sceSifSetDma faild"),
++                // after which it never polled the connected pad again (Ape Escape 2 recomp patch 0020).
++                const uint32_t sourcePhys = source & 0x1FFFFFu;
++                if (sourcePhys + static_cast<uint64_t>(size) > IopMemory::RamSize)
+                 {
++                    std::fprintf(stderr, "[IOP] sceSifSetDma: source 0x%x size 0x%x outside IOP RAM\n", source, size);
+                     setV0(0u);
+                     return true;
+                 }
+@@ -96,6 +105,8 @@ namespace ps2x::iop::detail
+                 const PendingTransfer &transfer = pending[i];
+                 if (!m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
+                 {
++                    std::fprintf(stderr, "[IOP] sceSifSetDma: EE destination 0x%x size 0x%x not accessible\n",
++                                 transfer.destination, transfer.size);
+                     setV0(0u);
+                     return true;
+                 }
+@@ -106,6 +117,8 @@ namespace ps2x::iop::detail
+                 const PendingTransfer &transfer = pending[i];
+                 if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
+                 {
++                    std::fprintf(stderr, "[IOP] sceSifSetDma: copy 0x%x -> EE 0x%x size 0x%x failed\n", transfer.source,
++                                 transfer.destination, transfer.size);
+                     setV0(0u);
+                     return true;
+                 }
+@@ -126,9 +139,18 @@ namespace ps2x::iop::detail
+             setV0(m_sifInitialized ? 1u : 0u);
+             return true;
+         default:
++        {
++            static uint32_t logged = 0;
++            if (logged < 32u)
++            {
++                ++logged;
++                std::fprintf(stderr, "[IOP] sifman import %u not implemented (a0=0x%x a1=0x%x a2=0x%x pc=0x%x ra=0x%x)\n",
++                             ordinal, cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.pc, cpu.gpr[31]);
++            }
+             setV0(0u);
+             return true;
+         }
++        }
+     }
+ 
+     bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu)
