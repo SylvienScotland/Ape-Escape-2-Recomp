@@ -344,3 +344,25 @@
   ...) with the runtime's hand-written versions. Removed: the game's own recompiled code now runs. Stage
   scenery that drew as flat pink/grey now renders (statue, trees, fence, pillars); remaining: some thin
   streaks and shapes in the stage intro / near the camera, to check.
+
+## Characters fixed: mistranslated MMI shuffles (0027)
+- Logged the bone matrices the skinned VU1 program receives (APE2_VU_BONES=1): every row was (0, 0, 0, w).
+  The VIF unpack copied them faithfully from EE RAM; a host write-watch (APE2_RAM_WATCH=<addr>[,bytes]:
+  write-protects the host page, logs the recompiled function behind each store, zz_ape2_ram_watch.cpp)
+  found the writer 0x349B90, which multiplies by the global matrix at 0x3DD300; watching that showed it
+  stored with shuffled lanes ((0 0 0 1) (1 0 0 0) ...), built with MMI transposes.
+- patches/ps2recomp/0027: 8 MMI lane shuffles were wrong, checked against the R5900 manual and the PAL
+  port's port/include/mmi.h: PROT3W (w1 w2 w0 w3), PEXEW (w2 w1 w0 w3), PEXCW (w0 w2 w1 w3), PEXEH (h0<->h2),
+  PEXCH (h1<->h2), PREVH (per 64-bit half), PINTH (rs upper halfwords), PINTEH (even halfwords). Fixed in
+  the recompiler emitters and the runtime macros. Characters render correctly (user confirmed).
+- Same patch, real fixes found on the way (not the character bug):
+  - VIF1 UNPACK whose payload continues in the next DMA chunk was dropped; now carried over like DIRECT.
+    Unpack rewritten with the hardware lane rules (as PAL vif.c): V2 writes x y x y, V3 reads a 4th
+    component, V4-5 scales 5-bit channels (<<3, alpha 0x80), MODE 3, fill/skip cycles.
+  - DMA addresses (tag ADDR, TADR, MADR) with bit 31 set mean the scratchpad; the bit was masked off and
+    main RAM read instead.
+  - VU0 microprograms ran with a 4096-cycle budget (longest seen 1187 cycles; raised anyway).
+  - VU1 native programs (skinned 0x60, stage 0x40/0x2360) ported from PAL vu1_native.c behind
+    APE2_VU_NATIVE=1 / verify (off by default until verify is clean: clip/Q of the past-end vertices differ).
+  - Debug aids: APE2_VIF_TRACE=1 (unpacks into low VU1 memory + source), APE2_STORE_WATCH=<addr>.
+- Lesson: compare with the PAL port first (its mmi.h would have shown the shuffles at once).
