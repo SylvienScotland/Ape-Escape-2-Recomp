@@ -503,3 +503,11 @@
   issued while another awaits sceMcSync is now refused (-1), so the poller retries later.
 - 0041: the real cause: the save code (0x21BC20) writes to and closes fd 0 without using the descriptor its
   open returned; libmc hands out the lowest free descriptor from 0, ours counted up from 1. Now lowest free from 0.
+
+## Root cause of the stray upper halves: MOVN/MOVZ (0042)
+- APE2_CALLCHECK=1 (dispatchGuestBranch) reports calls that return with the upper 64 bits of s0-s7/fp changed.
+  It found libc's __sfvwrite (0x39A550) putting string bytes into the caller's s0: `movn $s0, $s2, $v0` was
+  translated as a 128-bit move. On the R5900 MOVN/MOVZ write the lower 64 bits only (as PCSX2). This was the
+  stray word in the title archive name (TIT_A -> no collision, actors under the hill) and the 0x64 "mode" in
+  the save request (last save file opened read-only, final write -5). Zero reports after the fix.
+- overrides/zz_ape2_archive_name.cpp (the title workaround) is no longer needed; kept for now (harmless).

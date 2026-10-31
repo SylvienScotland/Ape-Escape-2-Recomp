@@ -1,0 +1,59 @@
+diff --git a/ps2xRecomp/src/lib/special_translator.cpp b/ps2xRecomp/src/lib/special_translator.cpp
+index b01a937..8bb2131 100644
+--- a/ps2xRecomp/src/lib/special_translator.cpp
++++ b/ps2xRecomp/src/lib/special_translator.cpp
+@@ -121,9 +121,10 @@ namespace ps2recomp
+         case SPECIAL_SLTU:
+             return fmt::format("SET_GPR_U64(ctx, {}, ((uint64_t)GPR_U64(ctx, {}) < (uint64_t)GPR_U64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
+         case SPECIAL_MOVZ:
+-            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            // R5900 MOVZ/MOVN move the lower 64 bits; the upper 64 bits of rd are kept (Ape Escape 2 recomp patch 0042)
++            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MOVN:
+-            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
++            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
+         case SPECIAL_MFSA:
+             return fmt::format("SET_GPR_U32(ctx, {}, ctx->sa);", inst.rd);
+         case SPECIAL_MTSA:
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9970dd4..d4ed8fc 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1439,7 +1439,37 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ 
+     RecompiledFunction targetFn = lookupFunction(targetPc);
+     const uint32_t entryPc = ctx->pc;
++    // APE2_CALLCHECK=1: report calls that return with the upper 64 bits of s0-s7/fp changed (callee-saved
++    // registers; compiled code never changes their upper halves without restoring them) (debugging aid)
++    static const bool callCheck = std::getenv("APE2_CALLCHECK") != nullptr;
++    uint64_t upperBefore[9] = {};
++    if (callCheck)
++    {
++        for (int k = 0; k < 9; ++k)
++        {
++            uint64_t w[2];
++            std::memcpy(w, &ctx->r[k < 8 ? 16 + k : 30], 16);
++            upperBefore[k] = w[1];
++        }
++    }
+     targetFn(rdram, ctx, this);
++    if (callCheck && ctx->pc == fallthroughPc)
++    {
++        for (int k = 0; k < 9; ++k)
++        {
++            uint64_t w[2];
++            std::memcpy(w, &ctx->r[k < 8 ? 16 + k : 30], 16);
++            if (w[1] != upperBefore[k])
++            {
++                static int reports = 0;
++                if (reports++ < 30)
++                    std::fprintf(stderr, "[callcheck] call %x from %x changed %s upper %016llx -> %016llx\n", targetPc, sourcePc,
++                                 k < 8 ? (k == 0 ? "s0" : k == 1 ? "s1" : k == 2 ? "s2" : k == 3 ? "s3" : k == 4 ? "s4" : k == 5 ? "s5" : k == 6 ? "s6" : "s7") : "fp",
++                                 static_cast<unsigned long long>(upperBefore[k]), static_cast<unsigned long long>(w[1]));
++                break;
++            }
++        }
++    }
+ 
+     if (isStopRequested() || ctx->pc == 0u)
+     {
