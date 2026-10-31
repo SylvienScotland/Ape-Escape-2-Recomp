@@ -1,0 +1,22 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 9c2eb6d..523c5d3 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -417,14 +417,10 @@ namespace ps2_stubs
+                 return kMcResultUpLimitHandle;
+             }
+ 
+-            for (int attempt = 0; attempt < 0x10000; ++attempt)
++            // the lowest free descriptor, from 0, as libmc: Ape Escape 2's save code writes to and closes fd 0
++            // without reading the descriptor its open returned (Ape Escape 2 recomp)
++            for (int32_t fd = 0; fd < 0x10000; ++fd)
+             {
+-                if (g_mcNextFd <= 0)
+-                {
+-                    g_mcNextFd = 1;
+-                }
+-
+-                const int32_t fd = g_mcNextFd++;
+                 if (g_mcFiles.find(fd) != g_mcFiles.end())
+                 {
+                     continue;

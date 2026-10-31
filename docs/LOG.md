@@ -501,3 +501,5 @@
   sceMcSync, and our libmc kept one "last command" result: the game's GetInfo poller ran a command between the
   save's open and its sync and replaced the result with its own 0. libmc runs one command at a time; a command
   issued while another awaits sceMcSync is now refused (-1), so the poller retries later.
+- 0041: the real cause: the save code (0x21BC20) writes to and closes fd 0 without using the descriptor its
+  open returned; libmc hands out the lowest free descriptor from 0, ours counted up from 1. Now lowest free from 0.
