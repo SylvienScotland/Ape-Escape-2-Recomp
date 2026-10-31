@@ -475,3 +475,7 @@
   presentation). The scripted run now gets much further into Liberty Island in the same time (catches George
   and Cruiser); gameplay 15-25 fps.
 - Next: the EE thread still runs VIF1 + VU1 (~25%), the GS front end (~40%) and the game (~20%) in series.
+- 0036: each decoded texture keeps a private copy of the raw VRAM pages it covers (taken when it is (re)decoded,
+  typically 32-64 KB), and the raster workers decode from that copy. Texture uploads into pages that queued or
+  in-flight primitives sample no longer wait for the raster (the EE thread had spent ~28% there).
+  Gameplay ~30 fps; the scripted run plays through the first stage into the Travel Station.

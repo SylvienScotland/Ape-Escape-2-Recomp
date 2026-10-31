@@ -1,0 +1,178 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 400dfd9..c3a3863 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -52,7 +52,7 @@ private:
+     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm,
+                         const uint16_t *clutTable = nullptr);
+-    uint32_t DecodeTexel(const GSDrawState &state, int u, int v, const uint16_t *clut);
++    uint32_t DecodeTexel(const GSDrawState &state, int u, int v, const uint16_t *clut, const uint8_t *vramBase);
+ 
+     // Decoded-texture cache (Ape Escape 2 recomp patch 0033): each texture is converted once (format, TEXA,
+     // CLUT) to linear RGBA and sampled with one array read, until a VRAM page it covers (or its CLUT) is
+@@ -75,11 +75,13 @@ private:
+         std::atomic<uint64_t> tilesDecoded{0};
+         mutable uint64_t queuedGen = ~0ull; // flush generation of the queue that last used it
+         GSDrawState decodeState{};          // TEX0/TEXA the texels are decoded with
++        std::vector<uint8_t> raw;            // copy of the VRAM pages the texture covers
++        const uint8_t *rawBase = nullptr;    // raw.data() - offset of its first page (a VRAM-shaped base pointer)
+         DecodedTexture() = default;
+         DecodedTexture(DecodedTexture &&o) noexcept
+             : decodeEpoch(o.decodeEpoch), clutVersion(o.clutVersion), firstPage(o.firstPage), pageRows(o.pageRows),
+               pageCols(o.pageCols), pagesPerRow(o.pagesPerRow), clutPage(o.clutPage), indexed(o.indexed), w(o.w), h(o.h),
+-              texels(std::move(o.texels)), clut(o.clut), decodeState(o.decodeState), tilesW(o.tilesW), tileCount(o.tileCount), tileReady(std::move(o.tileReady))
++              texels(std::move(o.texels)), clut(o.clut), decodeState(o.decodeState), raw(std::move(o.raw)), rawBase(o.rawBase), tilesW(o.tilesW), tileCount(o.tileCount), tileReady(std::move(o.tileReady))
+         {
+             key[0] = o.key[0];
+             key[1] = o.key[1];
+@@ -134,7 +136,8 @@ private:
+     void DrainUnlocked();        // both: VRAM is up to date afterwards
+     std::vector<QueuedPrimitive> m_inflight;
+     std::array<bool, 512> m_inflightPages{};
+-    std::array<bool, 512> m_inflightTexPages{};
++    std::array<bool, 512> m_inflightRawPages{};
++    std::array<bool, 512> m_queueRawPages{};
+     bool m_inflightBusy = false;
+     uint64_t m_inflightGen = ~0ull;
+     std::function<void(int)> m_inflightTask;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index db134db..dbea7e5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -872,10 +872,11 @@ void GSCpuBackend::QueueTexture(const DecodedTexture *texture)
+     if (!texture || texture->queuedGen == m_flushGen)
+         return;
+     texture->queuedGen = m_flushGen;
+-    m_queuedTextures.push_back({texture, texture->decodeState});
++    if (texture->rawBase)
++        return;
+     for (uint32_t r = 0; r < texture->pageRows; ++r)
+         for (uint32_t c = 0; c < texture->pageCols; ++c)
+-            m_queueTexPages[(texture->firstPage + r * texture->pagesPerRow + c) & 511u] = true;
++            m_queueRawPages[(texture->firstPage + r * texture->pagesPerRow + c) & 511u] = true;
+ }
+ 
+ void GSCpuBackend::FlushQueueUnlocked()
+@@ -935,10 +936,9 @@ void GSCpuBackend::FlushQueueUnlocked()
+     m_inflight.swap(m_queue);
+     m_queue.clear();
+     m_inflightPages = m_queuePages;
+-    m_inflightTexPages = m_queueTexPages;
++    m_inflightRawPages = m_queueRawPages;
+     m_queuePages.fill(false);
+-    m_queueTexPages.fill(false);
+-    m_queuedTextures.clear();
++    m_queueRawPages.fill(false);
+     m_inflightGen = m_flushGen;
+     ++m_flushGen;
+     m_inflightBusy = true;
+@@ -970,7 +970,7 @@ void GSCpuBackend::WaitInflightUnlocked()
+     m_inflightBusy = false;
+     m_inflight.clear();
+     m_inflightPages.fill(false);
+-    m_inflightTexPages.fill(false);
++    m_inflightRawPages.fill(false);
+ }
+ 
+ void GSCpuBackend::DrainUnlocked()
+@@ -1601,10 +1601,11 @@ uint32_t GSCpuBackend::VramPageOf(uint32_t psm, uint32_t base, uint32_t bw, uint
+     return ((base >> 5) + (y / ph) * vramPagesPerRow(psm, bw) + (x / pw)) & 511u;
+ }
+ 
+-uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int u, int v, const uint16_t *clut)
++uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int u, int v, const uint16_t *clut, const uint8_t *vramBase)
+ {
+     const auto &tex = state.context.tex0;
+-    const u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++    const u32 out = GSMem::ReadTexture(m_texturePageCache, vramBase ? vramBase : m_vram, tex.psm, tex.tbp0, tex.tbw,
++                                       static_cast<uint32_t>(u), static_cast<uint32_t>(v));
+     switch (tex.psm)
+     {
+     case GS_PSM_CT32:
+@@ -1633,7 +1634,7 @@ bool GSCpuBackend::SettleQueuedTextures(uint32_t p0, uint32_t p1)
+ {
+     for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
+     {
+-        if (m_queuePages[pg] || m_inflightPages[pg] || m_inflightTexPages[pg])
++        if (m_queuePages[pg] || m_inflightPages[pg])
+             return false;
+         if (pg == ((p1 + 1u) & 511u))
+             break;
+@@ -1660,7 +1661,7 @@ bool GSCpuBackend::SettleQueuedTextures(uint32_t p0, uint32_t p1)
+             for (int vv = v0; vv < v1; ++vv)
+                 for (int uu = u0; uu < u1; ++uu)
+                     t.texels[static_cast<size_t>(vv) * static_cast<size_t>(t.w) + static_cast<size_t>(uu)] =
+-                        DecodeTexel(use.state, uu, vv, t.clut.data());
++                        DecodeTexel(use.state, uu, vv, t.clut.data(), t.rawBase);
+             t.tileReady[i].store(1u, std::memory_order_relaxed);
+         }
+     }
+@@ -1807,6 +1808,22 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTexture(const GSDrawSta
+     t.pagesPerRow = vramPagesPerRow(tex.psm, tex.tbw);
+     t.pageRows = (static_cast<uint32_t>(h) + ph - 1u) / ph + 1u;
+     t.pageCols = std::min(t.pagesPerRow, (static_cast<uint32_t>(w) + pw - 1u) / pw + 1u);
++    // private copy of the texture's VRAM pages: decoding (later, on the raster workers) never reads VRAM that an
++    // upload may have changed in the meantime (patch 0036)
++    {
++        const size_t start = static_cast<size_t>(t.firstPage) * GSMem::TexturePageCache::kPageSize;
++        const size_t bytes = static_cast<size_t>(t.pageRows) * t.pagesPerRow * GSMem::TexturePageCache::kPageSize;
++        if (start + bytes <= m_vramSize)
++        {
++            t.raw.assign(m_vram + start, m_vram + start + bytes);
++            t.rawBase = t.raw.data() - start;
++        }
++        else
++        {
++            t.raw.clear();
++            t.rawBase = nullptr; // wraps around VRAM: decode from VRAM directly
++        }
++    }
+     t.decodeEpoch = m_vramEpoch;
+     ++m_vramEpoch; // writes from here on (this draw included) are newer than the decode
+     return &t;
+@@ -1857,7 +1874,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+                 const int u1 = std::min(u0 + 8, d.w), v1 = std::min(v0 + 8, d.h);
+                 for (int vv = v0; vv < v1; ++vv)
+                     for (int uu = u0; uu < u1; ++uu)
+-                        d.texels[static_cast<size_t>(vv) * static_cast<size_t>(d.w) + static_cast<size_t>(uu)] = DecodeTexel(state, uu, vv, d.clut.data());
++                        d.texels[static_cast<size_t>(vv) * static_cast<size_t>(d.w) + static_cast<size_t>(uu)] = DecodeTexel(state, uu, vv, d.clut.data(), d.rawBase);
+                 d.tileReady[tile].store(1u, std::memory_order_release);
+                 d.tilesDecoded.fetch_add(1u, std::memory_order_relaxed);
+             }
+@@ -2298,16 +2315,12 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+             bool sampled = false;
+             for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
+             {
+-                if (m_queuePages[pg] || m_inflightPages[pg] || (written && m_inflightTexPages[pg]))
+-                    conflict = true; // a page being drawn (or sampled by the batch in flight)
+-                if (written && m_queueTexPages[pg])
+-                    sampled = true;
++                if (m_queuePages[pg] || m_inflightPages[pg] || (written && (m_inflightRawPages[pg] || m_queueRawPages[pg])))
++                    conflict = true; // a page being drawn, or sampled straight from VRAM
+                 if (pg == ((p1 + 1u) & 511u) || conflict)
+                     break;
+             }
+-            // a write to pages queued primitives only sample: decode those textures now
+-            if (!conflict && sampled && !SettleQueuedTextures(p0, p1))
+-                conflict = true;
++            (void)sampled;
+         };
+         if (command.direction == 0u || command.direction == 2u)
+             check(b.dpsm, b.dbp, b.dbw, command.trxpos.dsax, command.trxpos.dsay, true);
+@@ -2354,12 +2367,12 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         bool sampled = false, drawn = false;
+         for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
+         {
+-            drawn = drawn || m_queuePages[pg] || m_inflightPages[pg] || m_inflightTexPages[pg];
+-            sampled = sampled || m_queueTexPages[pg];
++            drawn = drawn || m_queuePages[pg] || m_inflightPages[pg] || m_inflightRawPages[pg] || m_queueRawPages[pg];
+             if (pg == ((p1 + 1u) & 511u))
+                 break;
+         }
+-        if (drawn || (sampled && !SettleQueuedTextures(p0, p1)))
++        (void)sampled;
++        if (drawn)
+             { m_flushReason = 4; DrainUnlocked(); }
+     }
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
