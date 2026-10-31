@@ -408,3 +408,16 @@
 - Title screen: Jimmy and the monkeys are drawn (walking around, visible with APE2_GS_ZTEST_OFF=1) but the
   grass in front of them has larger depth (14.7M-19.8M vs ~5.7M) when the game runs fast; with the slow
   interpreter they show. Under investigation.
+
+## FPU float ordering, depth precision (0030); title characters still hidden
+- FPU compares, MIN.S, MAX.S: PS2 floats have no NaN/Inf, so exponent-255 patterns are just large numbers;
+  the host compares called them unordered (false). Now ordered as sign-magnitude keys like the PAL port's
+  fkey (recompiler emits FPU_MIN_S/FPU_MAX_S). FPU harness: compares/min/max match PAL.
+- GS triangles: depth interpolated as a double-precision plane. Float barycentric weights were off by
+  +-2 at depths ~2e7, so the title grass's second layer (GEQUAL against the first) failed on scattered
+  pixels: the dotted lines on the title grass are gone.
+- overrides/zz_ape2_camlog.cpp: APE2_CAMLOG=<first>,<count> logs camlook 0x19FEA0 (eye, target), as the PAL
+  port's AE2_CAMLOG.
+- Title: the kid and monkeys are drawn ~72 units below the camera target (bone matrices in view space,
+  back-projected with the logged camera), i.e. under the hill; the grass hides them (not a compiled-VU or
+  depth-test bug: identical in the interpreter). Next: why the title actors' height is wrong.

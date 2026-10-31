@@ -1,0 +1,153 @@
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 435db3a..bc4a48c 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -93,9 +93,9 @@ namespace ps2recomp
+             case COP1_S_MSUBA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
+             case COP1_S_MAX:
+-                return fmt::format("ctx->f[{}] = std::max(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
++                return fmt::format("ctx->f[{}] = FPU_MAX_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_MIN:
+-                return fmt::format("ctx->f[{}] = std::min(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
++                return fmt::format("ctx->f[{}] = FPU_MIN_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_C_F:
+                 return fmt::format("ctx->fcr31 &= ~0x800000;");
+             case COP1_S_C_UN:
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 65a2444..8f7cca0 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -871,22 +871,38 @@ inline int32_t ps2_cvt_w_s(float f)
+ }
+ #define FPU_CVT_W_S(a) ps2_cvt_w_s((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
++// PS2 compares, MIN and MAX: there is no NaN or Inf and denormals are zero, so values are ordered as
++// sign-magnitude numbers (exponent 255 is just bigger than the largest host float). The host's own compares
++// call those patterns unordered and return false, which broke searches that start from a 0x7FFFFFFF-style
++// "largest" value. As the PAL port JackyPendrag0n/ae2-recomp (port/include/ps2.h, fkey; Ape Escape 2 recomp
++// patch 0030).
++inline int32_t ps2_fkey(float f)
++{
++    const uint32_t u = std::bit_cast<uint32_t>(f);
++    if ((u & 0x7F800000u) == 0u)
++        return 0;
++    return (u & 0x80000000u) ? -static_cast<int32_t>(u & 0x7FFFFFFFu) : static_cast<int32_t>(u);
++}
++inline float ps2_fmax(float a, float b) { return ps2_fkey(a) > ps2_fkey(b) ? a : b; }
++inline float ps2_fmin(float a, float b) { return ps2_fkey(a) < ps2_fkey(b) ? a : b; }
++#define FPU_MAX_S(a, b) ps2_fmax((float)(a), (float)(b))
++#define FPU_MIN_S(a, b) ps2_fmin((float)(a), (float)(b))
+ #define FPU_C_F_S(a, b) (0)
+-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_UN_S(a, b) (0)
++#define FPU_C_EQ_S(a, b) (ps2_fkey((float)(a)) == ps2_fkey((float)(b)))
++#define FPU_C_UEQ_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_OLT_S(a, b) (ps2_fkey((float)(a)) < ps2_fkey((float)(b)))
++#define FPU_C_ULT_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_OLE_S(a, b) (ps2_fkey((float)(a)) <= ps2_fkey((float)(b)))
++#define FPU_C_ULE_S(a, b) FPU_C_OLE_S(a, b)
+ #define FPU_C_SF_S(a, b) (0)
+-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGLE_S(a, b) (0)
++#define FPU_C_SEQ_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_NGL_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_LT_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_NGE_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_LE_S(a, b) FPU_C_OLE_S(a, b)
++#define FPU_C_NGT_S(a, b) FPU_C_OLE_S(a, b)
+ 
+ // QFSRV: Quadword Funnel Shift Right Variable
+ // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp
+index 975fdad..3cd5693 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu1_verify.cpp
+@@ -683,8 +683,9 @@ namespace ps2vu1verify
+         const Kind kind = classify(vuCode, codeGeneration, startPc, state, top, itop, entry, hash);
+         if (kind == Kind::Skinned && std::getenv("APE2_VU_BONES"))
+         {
+-            static uint32_t logged = 0;
+-            if (logged < 40u)
++            static uint32_t logged = 0, seen = 0;
++            static const uint32_t skip = static_cast<uint32_t>(std::atoi(std::getenv("APE2_VU_BONES"))); // runs to skip first
++            if (seen++ >= skip && logged < 40u)
+             {
+                 ++logged;
+                 Mem mem{const_cast<uint8_t *>(vuData)};
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
+index 7fa03ef..5d79ba8 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
+@@ -307,6 +307,28 @@ namespace ape2vu
+             g_lastQ = state.q + 1.0f; // force Q/P in on the first run
+             g_lastP = state.p + 1.0f;
+         }
++        {
++            // APE2_VU_REGS=<entry hex>[,count]: print vf25-vf30 and top/itop at that program's start (debugging)
++            static const std::pair<long, long> want = []
++            {
++                const char *e = std::getenv("APE2_VU_REGS");
++                if (!e)
++                    return std::pair<long, long>{-1, 0};
++                char *end = nullptr;
++                const long a = std::strtol(e, &end, 16);
++                return std::pair<long, long>{a, (end && *end == ',') ? std::atol(end + 1) : 20};
++            }();
++            static long shown = 0;
++            if (want.first >= 0 && static_cast<uint32_t>(want.first) == (startPc & kCodeMask) && shown < want.second)
++            {
++                ++shown;
++                char line[600];
++                int n = std::snprintf(line, sizeof(line), "[vu1:regs] %04x top=%x itop=%x", startPc & kCodeMask, top, itop);
++                for (int r = 25; r <= 30 && n < 560; ++r)
++                    n += std::snprintf(line + n, sizeof(line) - n, " vf%d(%g %g %g %g)", r, state.vf[r][0], state.vf[r][1], state.vf[r][2], state.vf[r][3]);
++                std::cerr << line << std::endl;
++            }
++        }
+         VU &u = g_vu1;
+         u.mem = vuData;
+         u.kickContext = memory;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index e904c6c..1b73272 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1540,6 +1540,16 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float a1 = (fy2 - fy0) * winding * invAbsDenom;
+     const float a2 = -(a0 + a1);
+ 
++    // Depth as a plane in double precision: float barycentric weights are only good to ~1e-7, i.e. +-2 at
++    // the depths of 2e7 the game uses, and a second pass over the same triangles (the title grass layers,
++    // depth test GEQUAL) then failed on scattered pixels (Ape Escape 2 recomp patch 0030).
++    const double zdx1 = static_cast<double>(fx1) - fx0, zdy1 = static_cast<double>(fy1) - fy0;
++    const double zdx2 = static_cast<double>(fx2) - fx0, zdy2 = static_cast<double>(fy2) - fy0;
++    const double zdet = zdx1 * zdy2 - zdx2 * zdy1;
++    const double zd1 = v1.z - v0.z, zd2 = v2.z - v0.z;
++    const double zPerX = zdet != 0.0 ? (zd1 * zdy2 - zd2 * zdy1) / zdet : 0.0;
++    const double zPerY = zdet != 0.0 ? (zd2 * zdx1 - zd1 * zdx2) / zdet : 0.0;
++
+     auto drawRow = [&](int y)
+     {
+         // GS pixel centres are at integer coordinates (patch 0014; see DrawSprite).
+@@ -1577,7 +1587,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+                 continue;
+ 
+-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
++            double z = v0.z + zPerX * (static_cast<double>(x) - fx0) + zPerY * (static_cast<double>(y) - fy0);
++            z = z < 0.0 ? 0.0 : (z > 4294967294.0 ? 4294967294.0 : z);
+ 
+             uint8_t r, g, b, a;
+             if (state.prim.iip)
