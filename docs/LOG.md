@@ -479,3 +479,7 @@
   typically 32-64 KB), and the raster workers decode from that copy. Texture uploads into pages that queued or
   in-flight primitives sample no longer wait for the raster (the EE thread had spent ~28% there).
   Gameplay ~30 fps; the scripted run plays through the first stage into the Travel Station.
+- 0037: raster workers skip primitives that do not reach their row bands before any setup; texture page ranges
+  are exact for page-aligned textures (fewer false render-to-texture drains: 15.8k -> 4.2k per run).
+  Title 33-40 fps. Gameplay 21-32 fps depending on the area; on the EE thread VIF1+VU1 is now the largest
+  share (~36%), the game ~24%.

@@ -1,0 +1,58 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index dbea7e5..849ab88 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -815,8 +815,10 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+         uint32_t pw, ph;
+         vramPageSize(tex.psm, pw, ph);
+         const uint32_t first = (tex.tbp0 >> 5) & 511u, ppr = vramPagesPerRow(tex.psm, tex.tbw);
+-        const uint32_t rows = (static_cast<uint32_t>(state.textureHeight) + ph - 1u) / ph + 1u;
+-        const uint32_t cols = std::min(ppr, (static_cast<uint32_t>(state.textureWidth) + pw - 1u) / pw + 1u);
++        // one extra row/column only when the base is not page-aligned
++        const uint32_t slack = (tex.tbp0 & 31u) ? 1u : 0u;
++        const uint32_t rows = (static_cast<uint32_t>(state.textureHeight) + ph - 1u) / ph + slack;
++        const uint32_t cols = std::min(ppr, (static_cast<uint32_t>(state.textureWidth) + pw - 1u) / pw + slack);
+         bool conflict = false;
+         for (uint32_t r = 0; r < rows && !conflict; ++r)
+             for (uint32_t c = 0; c < cols && !conflict; ++c)
+@@ -1316,6 +1318,28 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::DrawPrimitiveRaster(const GSPrimitiveBatch &batch, const DecodedTexture *texture)
+ {
+     const GSDrawState &state = batch.state;
++    if (t_band.n > 1 && batch.vertexCount > 0u)
++    {
++        // skip primitives that do not reach this worker's bands before any setup
++        const auto &c = state.context;
++        float ymin = batch.vertices[0].y, ymax = ymin;
++        for (uint32_t i = 1; i < batch.vertexCount; ++i)
++        {
++            ymin = std::min(ymin, batch.vertices[i].y);
++            ymax = std::max(ymax, batch.vertices[i].y);
++        }
++        const float ofy = static_cast<float>(c.xyoffset.ofy >> 4);
++        int y0 = static_cast<int>(std::floor(ymin - ofy)) - 1;
++        int y1 = static_cast<int>(std::ceil(ymax - ofy)) + 1;
++        y0 = std::max(y0, static_cast<int>(c.scissor.y0));
++        y1 = std::min(y1, static_cast<int>(c.scissor.y1));
++        if (y1 < y0)
++            return;
++        const unsigned n = static_cast<unsigned>(t_band.n), k = static_cast<unsigned>(t_band.k);
++        const unsigned b0 = static_cast<unsigned>(y0) >> kBandShift, b1 = static_cast<unsigned>(y1) >> kBandShift;
++        if (b1 - b0 + 1u < n && ((k + n - (b0 % n)) % n) > b1 - b0)
++            return;
++    }
+     t_curTexture = texture;
+     switch (state.prim.type)
+     {
+@@ -1806,8 +1830,9 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTexture(const GSDrawSta
+     vramPageSize(tex.psm, pw, ph);
+     t.firstPage = (tex.tbp0 >> 5) & 511u;
+     t.pagesPerRow = vramPagesPerRow(tex.psm, tex.tbw);
+-    t.pageRows = (static_cast<uint32_t>(h) + ph - 1u) / ph + 1u;
+-    t.pageCols = std::min(t.pagesPerRow, (static_cast<uint32_t>(w) + pw - 1u) / pw + 1u);
++    const uint32_t slack = (tex.tbp0 & 31u) ? 1u : 0u;
++    t.pageRows = (static_cast<uint32_t>(h) + ph - 1u) / ph + slack;
++    t.pageCols = std::min(t.pagesPerRow, (static_cast<uint32_t>(w) + pw - 1u) / pw + slack);
+     // private copy of the texture's VRAM pages: decoding (later, on the raster workers) never reads VRAM that an
+     // upload may have changed in the meantime (patch 0036)
+     {
