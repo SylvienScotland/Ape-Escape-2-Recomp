@@ -1,0 +1,307 @@
+# VU microprogram recipe for SLUS_206.85 (NTSC-U): where each VU0/VU1 microprogram lies in the ELF.
+# From the PAL port JackyPendrag0n/ae2-recomp (recomp/vu_programs.recipe, captured from every stage there),
+# used with the author's permission. The microcode is byte-identical; NTSC-U has it 0x1500 bytes earlier
+# in the file (all 38 program hashes verified). Offsets only, no game code: tools/vu_recomp.py reads the
+# instructions from your own ELF.
+# prog <name> | <header>; run <pc> <count> <elf offset>; zero <pc> <count>
+prog vu0_0000_d61b6a005222fd81.txt | entry 0000 hash d61b6a005222fd81 unit 0
+run 0000 36 2af930
+prog vu0_01b8_a686a2c6917d9e29.txt | entry 01b8 hash a686a2c6917d9e29 unit 0
+run 01b8 201 2afae8
+run 0800 1 2a7ed8
+run 0808 1 2af968
+run 0810 1 2aa3d0
+run 0818 46 2b0150
+run 0bb0 1 2a9ce0
+run 0bb8 1 2afcd8
+run 0bc0 107 2b04f8
+prog vu0_0988_f5eeda0833e6a840.txt | entry 0988 hash f5eeda0833e6a840 unit 0
+run 0988 12 2b02c0
+prog vu0_09e8_5fc4b61b2c0a1967.txt | entry 09e8 hash 5fc4b61b2c0a1967 unit 0
+run 09e8 57 2b0320
+prog vu1_0000_2a278b687629c208.txt | entry 0000 hash 2a278b687629c208 unit 1
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 1 2ad068
+run 2140 166 2ad130
+run 2670 50 2a9d10
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0000_411eb1c27bf5f8b1.txt | entry 0000 hash 411eb1c27bf5f8b1
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0000_a73c247fec55a302.txt | entry 0000 hash a73c247fec55a302
+run 0000 2 2a8fd0
+run 0010 254 2aea10
+run 0800 1 2af0b0
+run 0808 1 2aec20
+run 0810 216 2af218
+run 0ed0 1 2a8438
+run 0ed8 6 2a8bd8
+run 0f08 1 2a7ed8
+run 0f10 2 2a8488
+run 0f20 2 2a8c20
+run 0f30 1 2a8280
+run 0f38 19 2a8c38
+prog vu1_0000_e17627d8ab618c53.txt | entry 0000 hash e17627d8ab618c53
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+zero 2138 985
+prog vu1_0000_e1eef4f9ac31f81c.txt | entry 0000 hash e1eef4f9ac31f81c unit 1
+run 0000 9 2ad680
+prog vu1_0010_2c7b072fce2d51d9.txt | entry 0010 hash 2c7b072fce2d51d9 unit 1
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 1 2ad068
+run 2140 166 2ad130
+run 2670 50 2a9d10
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0010_57e5fcc2760cd8e8.txt | entry 0010 hash 57e5fcc2760cd8e8
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0010_90d8c84d82a0d106.txt | entry 0010 hash 90d8c84d82a0d106
+run 0010 254 2aea10
+run 0800 1 2af0b0
+run 0808 1 2aec20
+run 0810 216 2af218
+run 0ed0 1 2a8438
+run 0ed8 6 2a8bd8
+run 0f08 1 2a7ed8
+run 0f10 2 2a8488
+run 0f20 2 2a8c20
+run 0f30 1 2a8280
+run 0f38 19 2a8c38
+prog vu1_0020_aca879f0623c37c3.txt | entry 0020 hash aca879f0623c37c3
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0030_1114b79f1ad67175.txt | entry 0030 hash 1114b79f1ad67175
+run 0030 13 2aea30
+run 0148 1 2a7f88
+run 0150 214 2aeb50
+run 0800 1 2af0b0
+run 0808 1 2aec20
+run 0810 216 2af218
+run 0ed0 1 2a8438
+run 0ed8 6 2a8bd8
+run 0f08 1 2a7ed8
+run 0f10 2 2a8488
+run 0f20 2 2a8c20
+run 0f30 1 2a8280
+run 0f38 19 2a8c38
+prog vu1_0040_88573ff209022f30.txt | entry 0040 hash 88573ff209022f30
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0048_2e0796824dca81fc.txt | entry 0048 hash 2e0796824dca81fc unit 1
+run 0048 1 2a7f88
+run 0050 246 2ad6d0
+run 0800 1 2a7ed8
+run 0808 1 2a7ed8
+run 0810 1 2a7ed8
+run 0818 6 2adea0
+prog vu1_0050_170584c9f7d6be8f.txt | entry 0050 hash 170584c9f7d6be8f
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0060_36cd538e9db9eb0a.txt | entry 0060 hash 36cd538e9db9eb0a unit 1
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0060_dc92a79486c148f1.txt | entry 0060 hash dc92a79486c148f1
+run 0060 7 2aea60
+run 01e8 1 2a8110
+run 01f0 194 2aebf0
+run 0800 1 2af0b0
+run 0808 1 2aec20
+run 0810 216 2af218
+run 0ed0 1 2a8438
+run 0ed8 6 2a8bd8
+run 0f08 1 2a7ed8
+run 0f10 2 2a8488
+run 0f20 2 2a8c20
+run 0f30 1 2a8280
+run 0f38 19 2a8c38
+prog vu1_01d0_afc54117a26894d8.txt | entry 01d0 hash afc54117a26894d8
+run 01d0 1 2a7f88
+run 01d8 8 2a8010
+prog vu1_2000_8c43f70c65404724.txt | entry 2000 hash 8c43f70c65404724 unit 1
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2000 206 2acff0
+run 2670 50 2a9d10
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_2000_dde31922f139e532.txt | entry 2000 hash dde31922f139e532
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2000 108 2a96a0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_2360_2ff05f48cd596d4c.txt | entry 2360 hash 2ff05f48cd596d4c
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 119 2a97f0
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_2508_7b09992fe64ebe72.txt | entry 2508 hash 7b09992fe64ebe72
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 2 2a8370
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 146 2a9a10
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu0_0120_ce3c99c8ef587132.txt | entry 0120 hash ce3c99c8ef587132 unit 0
+run 0120 2 2af940
+run 0130 17 2afa60
+prog vu0_0d70_21af3812cfcde8e8.txt | entry 0d70 hash 21af3812cfcde8e8 unit 0
+run 0d70 53 2b06a8
+prog vu1_0000_3c7a4b2787eb0ae8.txt | entry 0000 hash 3c7a4b2787eb0ae8 unit 1
+run 0000 54 2a8fb0
+prog vu1_0010_ddd1a4daebafed31.txt | entry 0010 hash ddd1a4daebafed31 unit 1
+run 0010 52 2a8fc0
+prog vu1_0020_084b7477b98f29fe.txt | entry 0020 hash 084b7477b98f29fe unit 1
+run 0020 28 2a8fd0
+prog vu1_01b0_d7780d12905dd8d2.txt | entry 01b0 hash d7780d12905dd8d2 unit 1
+run 01b0 1 2a7f88
+run 01b8 9 2a9168
+prog vu1_01d0_d01d9579011d8660.txt | entry 01d0 hash d01d9579011d8660 unit 1
+run 01d0 6 2a9180
+prog vu1_0200_9bb7e2519fee263e.txt | entry 0200 hash 9bb7e2519fee263e unit 1
+run 0000 54 2a8fb0
+run 0200 1 2a7f88
+run 0208 76 2a91b8
+run 2140 1 2a8378
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_0218_78731e572c2a89e3.txt | entry 0218 hash 78731e572c2a89e3 unit 1
+run 0218 1 2a7f88
+run 0220 4 2a8030
+prog vu1_02b8_fe55d90208301560.txt | entry 02b8 hash fe55d90208301560 unit 1
+run 0000 54 2a8fb0
+run 02b8 1 2a7f88
+run 02c0 2 2a91b8
+run 02d0 51 2a9280
+run 2140 1 2a8378
+run 2148 1 2a8388
+run 2150 66 2a97f0
+run 2370 51 2a9a10
+run 2518 93 2a9bb8
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504
+prog vu1_03a8_3ef30d46c5486bdd.txt | entry 03a8 hash 3ef30d46c5486bdd unit 1
+run 03a8 1 2a7f88
+run 03b0 2 2a91b8
+run 03c0 21 2a9370
+prog vu1_0468_706169022d935355.txt | entry 0468 hash 706169022d935355 unit 1
+run 0468 1 2a7f88
+run 0470 2 2a91b8
+run 0480 8 2a9430
+prog vu1_04c0_096a6c9333d0f976.txt | entry 04c0 hash 096a6c9333d0f976 unit 1
+run 04c0 1 2a7f88
+run 04c8 2 2a91b8
+run 04d8 1 2a9280
+run 04e0 2 2a9430
+run 04f0 3 2a9298
+run 0508 19 2a94b8
+prog vu1_2350_b3141a5a1eecf59e.txt | entry 2350 hash b3141a5a1eecf59e unit 1
+run 0000 58 2a7ed0
+run 0218 1 2a7f88
+run 0220 4 2a8030
+run 0240 143 2a8110
+run 2138 1 2ad068
+run 2140 166 2ad130
+run 2670 50 2a9d10
+run 2800 256 2a9ea8
+run 3000 8 2aa6b0
+zero 3040 504

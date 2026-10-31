@@ -387,3 +387,17 @@
 - Result: stage intro plays with a stable picture. Open: two VDIV encodings still give Q=0 in the harness
   (decoded differently), VOPMULA/VOPMSUB MAC flags, NaN-pattern operands in FPU ops (PS2 treats exponent 255 as a
   number).
+
+## Speed: VU1 microprograms compiled ahead of time (0029), ~2 fps -> ~35 fps in the stage
+- The VU1 interpreter (cycle-accurate pipeline bookkeeping) took ~70% of the frame. The PAL port compiles every
+  VU microprogram to C instead (its tools/vu_recomp.py); NTSC-U runs the same microcode, located 0x1500 bytes
+  earlier in the ELF (one offset matched all 38 program hashes of PAL's recipe).
+- tools/vu_programs.recipe (offsets into your SLUS_206.85 only) + tools/vu_recomp.py (PAL's generator, emitting
+  C++) -> generated/output/zz_ape2_vu_programs.cpp at build time (build_windows.ps1; needs Python 3, otherwise
+  the interpreter is used).
+- patches/ps2recomp/0029: ps2_vu_compiled.h (PAL vu_impl.h state + helpers), Kernel/zz_ape2_vu_compiled.cpp
+  (lookup by entry + hash, state hand-over with VU1State, XGKICK straight to PATH1, MXCSR round-to-zero/FTZ
+  while running), hooked into MSCAL/MSCNT. APE2_VU_COMPILED=0 interpreter, =verify compare.
+- Verify run (title -> stage, 200k program runs): VU memory, vi and vf15-31 identical to the interpreter;
+  only scratch vf1-14 differ (past-end pipeline iterations, not read later).
+- Now: ~35 fps in the stage; GS rasterizer ~50% of the busy thread, VU1 ~20%.

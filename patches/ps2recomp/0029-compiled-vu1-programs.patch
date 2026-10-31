@@ -1,0 +1,764 @@
+diff --git a/ps2xRuntime/include/ps2_vu_compiled.h b/ps2xRuntime/include/ps2_vu_compiled.h
+new file mode 100644
+index 0000000..dfd532c
+--- /dev/null
++++ b/ps2xRuntime/include/ps2_vu_compiled.h
+@@ -0,0 +1,203 @@
++// Compiled VU microprograms (Ape Escape 2 recomp patch).
++//
++// tools/vu_recomp.py (in the Ape Escape 2 recomp repo) turns every VU1 microprogram the game uploads into
++// C++ ahead of time, like the EE code; this header is the state and the helpers that code runs on. The
++// state, the helpers and the generator follow the PAL port JackyPendrag0n/ae2-recomp (port/src/vu_impl.h,
++// tools/vu_recomp.py), used with the author's permission: same cycle accounting, Q/P latency, delayed
++// MAC/status/clip flags, branch delay slots and E-bit delay as its VU interpreter.
++//
++// APE2_VU_COMPILED=0       run every program in the VU1 interpreter instead.
++// APE2_VU_COMPILED=verify  run the interpreter, then the compiled program on a copy of the same input, and
++//                          report differences in VU memory and registers.
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <emmintrin.h>
++
++namespace ape2vu
++{
++    union Vec
++    {
++        float f[4];
++        uint32_t uw[4];
++        int32_t sw[4];
++    };
++
++    struct VU
++    {
++        Vec vf[32];
++        uint32_t vi[16];
++        float acc[4];
++        float q, p, i;
++        uint32_t r; // 23 random bits
++        uint8_t *mem;
++        uint32_t memmask;
++        int unit;
++        uint32_t pc;
++        uint64_t cycle;
++        uint64_t vf_ready[32];
++        float q_new;
++        uint64_t q_done;
++        float p_new;
++        uint64_t p_done;
++        struct
++        {
++            uint64_t at;
++            uint32_t mac, status, clip;
++        } fh[8];
++        int fhead;
++        uint32_t clip_latest, status_sticky;
++        uint32_t tpc;
++        uint32_t top, itop; // VIF1 TOP / ITOP for XTOP / XITOP
++        void *kickContext;  // where XGKICK sends its packet (see kick())
++    };
++
++    using ProgFn = int (*)(VU *u); // 0 at the E-bit end, 1 when the code at u->pc is not part of the program
++    struct Prog
++    {
++        uint32_t entry;
++        uint64_t hash;
++        ProgFn fn;
++    };
++    // Called by the generated file's static initialiser.
++    void registerPrograms(int unit, const Prog *programs, int count);
++    void kick(VU *u, uint32_t qwordAddress);
++
++    inline float fclamp(float x)
++    {
++        uint32_t u;
++        std::memcpy(&u, &x, 4);
++        if ((u & 0x7f800000u) == 0x7f800000u)
++        {
++            u = (u & 0x80000000u) | 0x7f7fffffu;
++            std::memcpy(&x, &u, 4);
++        }
++        else if ((u & 0x7f800000u) == 0u)
++        {
++            u &= 0x80000000u;
++            std::memcpy(&x, &u, 4);
++        }
++        return x;
++    }
++    inline float fop(float x)
++    {
++        uint32_t u;
++        std::memcpy(&u, &x, 4);
++        if ((u & 0x7f800000u) == 0x7f800000u)
++        {
++            u = (u & 0x80000000u) | 0x7f7fffffu;
++            std::memcpy(&x, &u, 4);
++        }
++        return x;
++    }
++    inline float FDIV(float a, float b)
++    {
++        a = fop(a);
++        b = fop(b);
++        if (b == 0.0f)
++        {
++            uint32_t ua, ub;
++            std::memcpy(&ua, &a, 4);
++            std::memcpy(&ub, &b, 4);
++            const uint32_t r = ((ua ^ ub) & 0x80000000u) | 0x7f7fffffu;
++            float f;
++            std::memcpy(&f, &r, 4);
++            return f;
++        }
++        return fclamp(a / b);
++    }
++    inline float FRSQRT(float a, float b) { return FDIV(a, std::sqrt(std::fabs(fop(b)))); }
++    inline int32_t CVTWS(float f)
++    {
++        if (f >= 2147483648.0f)
++            return 0x7fffffff;
++        if (f <= -2147483648.0f)
++            return static_cast<int32_t>(0x80000000u);
++        if (f != f)
++            return 0x7fffffff;
++        return static_cast<int32_t>(f);
++    }
++
++    inline float vclampf(float x) { return fclamp(x); }
++    // vclampf on four lanes: Inf/NaN -> signed max float. Denormal results cannot occur: the programs run
++    // with flush-to-zero / denormals-are-zero (see the runner in zz_ape2_vu_compiled.cpp).
++    inline __m128 vclamp4(__m128 x)
++    {
++        const __m128 sm = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0x80000000u)));
++        const __m128 a = _mm_andnot_ps(sm, x), s = _mm_and_ps(sm, x);
++        return _mm_or_ps(_mm_min_ps(a, _mm_castsi128_ps(_mm_set1_epi32(0x7f7fffff))), s);
++    }
++
++    inline float getq(VU *u)
++    {
++        if (u->cycle >= u->q_done)
++            u->q = u->q_new;
++        return u->q;
++    }
++    inline float getp(VU *u)
++    {
++        if (u->cycle >= u->p_done)
++            u->p = u->p_new;
++        return u->p;
++    }
++    inline void flags_push(VU *u, uint32_t mac, uint32_t status, uint32_t clip)
++    {
++        u->fhead = (u->fhead + 1) & 7;
++        u->fh[u->fhead].at = u->cycle + 4;
++        u->fh[u->fhead].mac = mac;
++        u->fh[u->fhead].status = status;
++        u->fh[u->fhead].clip = clip;
++    }
++    inline void flags_visible(VU *u, uint32_t *mac, uint32_t *status, uint32_t *clip)
++    {
++        int idx = (u->fhead + 1) & 7; // oldest, when none is old enough
++        for (int k = 0; k < 8; ++k)
++        {
++            const int j = (u->fhead - k) & 7;
++            if (u->fh[j].at <= u->cycle)
++            {
++                idx = j;
++                break;
++            }
++        }
++        if (mac)
++            *mac = u->fh[idx].mac;
++        if (status)
++            *status = u->fh[idx].status | u->status_sticky;
++        if (clip)
++            *clip = u->fh[idx].clip;
++    }
++    inline void fmac_flags(VU *u, const float *res, int dest)
++    {
++        uint32_t mac = 0, st = 0;
++        for (int i = 0; i < 4; ++i)
++        {
++            if (!(dest & (8 >> i)))
++                continue;
++            const int bit = 3 - i;
++            if (res[i] == 0.0f)
++                mac |= 1u << bit;
++            if (std::signbit(res[i]))
++                mac |= 0x10u << bit;
++        }
++        if (mac & 0x0fu)
++            st |= 1u;
++        if (mac & 0xf0u)
++            st |= 2u;
++        u->status_sticky |= (st << 6);
++        flags_push(u, mac, st, u->clip_latest);
++    }
++    inline Vec *vmem(VU *u, uint32_t qaddr) { return reinterpret_cast<Vec *>(u->mem + ((qaddr * 16u) & u->memmask)); }
++    inline void efu(VU *u, float v, int lat)
++    {
++        u->p_new = v;
++        u->p_done = u->cycle + static_cast<uint64_t>(lat);
++    }
++    inline void vu_xgkick(VU *u, uint32_t a)
++    {
++        if (u->unit == 1)
++            kick(u, a);
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
+new file mode 100644
+index 0000000..84caf5a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
+@@ -0,0 +1,442 @@
++// Compiled VU1 microprograms: lookup, state hand-over and XGKICK (Ape Escape 2 recomp patch); see
++// ps2_vu_compiled.h. Lookup by entry + program hash and the chaining of programs follow the PAL port
++// JackyPendrag0n/ae2-recomp (port/src/vu.c), used with the author's permission.
++#include "ps2_vu_compiled.h"
++#include "../ps2_vu_compiled_run.h"
++#include "runtime/ps2_vu1.h"
++#include "runtime/ps2_memory.h"
++#include "runtime/gs/ps2_gif_arbiter.h"
++
++#include <xmmintrin.h>
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <iostream>
++#include <mutex>
++#include <vector>
++
++namespace ape2vu
++{
++    namespace
++    {
++        constexpr uint32_t kCodeMask = 0x3FFFu;
++        constexpr uint32_t kDataSize = 0x4000u;
++
++        // function-local: the generated file registers from its static initialiser
++        std::vector<Prog> *programs()
++        {
++            static std::vector<Prog> v[2];
++            return v;
++        }
++
++        struct CacheEntry
++        {
++            uint64_t generation = ~0ull;
++            ProgFn fn = nullptr;
++        };
++        CacheEntry g_cache[2048];
++
++        VU g_vu1{};
++        bool g_vu1Init = false;
++        float g_lastQ = 0.0f, g_lastP = 0.0f;
++        PS2Memory *g_kickMemory = nullptr;
++        std::vector<uint8_t> g_packet;
++
++        std::atomic<uint64_t> g_runs{0}, g_fallbacks{0}, g_unknown{0};
++
++        Mode readMode()
++        {
++            const char *v = std::getenv("APE2_VU_COMPILED");
++            if (!v || !v[0])
++                return Mode::On;
++            if (v[0] == 'v' || v[0] == 'V')
++                return Mode::Verify;
++            return v[0] == '0' ? Mode::Off : Mode::On;
++        }
++
++        bool isBranch(uint32_t lower)
++        {
++            const uint32_t op = lower >> 25;
++            return op == 0x20 || op == 0x21 || op == 0x24 || op == 0x25 || (op >= 0x28 && op <= 0x2f && op != 0x2a && op != 0x2b);
++        }
++
++        // PAL port vu.c: vu_reach + vu_prog_hash
++        uint64_t programHash(const uint8_t *code, uint32_t entry)
++        {
++            static uint8_t mark[2048];
++            static uint32_t stack[8192];
++            std::memset(mark, 0, sizeof(mark));
++            int sp = 0;
++            stack[sp++] = (entry & kCodeMask) | 0x80000000u;
++            while (sp)
++            {
++                const uint32_t e = stack[--sp];
++                const uint32_t pc = e & kCodeMask;
++                const bool follow = (e >> 31) != 0u;
++                const uint32_t idx = pc >> 3;
++                mark[idx] |= 1u;
++                if (!follow || (mark[idx] & 2u))
++                    continue;
++                mark[idx] |= 2u;
++                uint32_t lower = 0, upper = 0;
++                std::memcpy(&lower, code + pc, 4);
++                std::memcpy(&upper, code + ((pc + 4u) & kCodeMask), 4);
++                auto push = [&](uint32_t a, bool f)
++                { if (sp < 8190) stack[sp++] = (a & kCodeMask) | (f ? 0x80000000u : 0u); };
++                if ((upper >> 30) & 1u)
++                {
++                    push(pc + 8u, false);
++                    continue;
++                }
++                if (!(upper >> 31) && isBranch(lower))
++                {
++                    const uint32_t op = lower >> 25;
++                    const int32_t imm11 = static_cast<int32_t>(lower << 21) >> 21;
++                    push(pc + 8u, true);
++                    if (op != 0x24 && op != 0x25)
++                        push(pc + 8u + static_cast<uint32_t>(imm11 * 8), true);
++                    if (op != 0x20 && op != 0x24)
++                        push(pc + 16u, true);
++                }
++                else
++                {
++                    push(pc + 8u, true);
++                }
++            }
++            uint64_t h = 1469598103934665603ull ^ (entry & kCodeMask);
++            for (uint32_t i = 0; i < 2048u; ++i)
++            {
++                if (!(mark[i] & 1u))
++                    continue;
++                uint32_t w[3] = {i, 0u, 0u};
++                std::memcpy(&w[1], code + i * 8u, 8);
++                for (uint32_t k = 0; k < 3; ++k)
++                {
++                    h ^= w[k];
++                    h *= 1099511628211ull;
++                    h ^= h >> 29;
++                }
++            }
++            return h;
++        }
++
++        ProgFn find(const uint8_t *code, uint64_t generation, uint32_t entry)
++        {
++            CacheEntry &c = g_cache[(entry & kCodeMask) >> 3];
++            if (c.generation == generation)
++                return c.fn;
++            const uint64_t h = programHash(code, entry);
++            ProgFn fn = nullptr;
++            for (const Prog &p : programs()[1])
++            {
++                if (p.entry == (entry & kCodeMask) && p.hash == h)
++                {
++                    fn = p.fn;
++                    break;
++                }
++            }
++            if (!fn && g_unknown++ < 20u)
++            {
++                char line[128];
++                std::snprintf(line, sizeof(line), "[vu1:compiled] no compiled program for entry %04x hash %016llx (interpreted)",
++                              entry & kCodeMask, static_cast<unsigned long long>(h));
++                std::cerr << line << std::endl;
++            }
++            c.generation = generation;
++            c.fn = fn;
++            return fn;
++        }
++
++        uint32_t gifPacketBytes(const uint8_t *vuData, uint32_t addr)
++        {
++            uint32_t bytes = 0;
++            for (int guard = 0; guard < 1024 && bytes < kDataSize; ++guard)
++            {
++                uint64_t lo = 0;
++                std::memcpy(&lo, vuData + (((addr * 16u) + bytes) & (kDataSize - 1u)), 8);
++                const uint32_t nloop = static_cast<uint32_t>(lo & 0x7fffu);
++                const bool eop = ((lo >> 15) & 1u) != 0u;
++                const uint32_t flg = static_cast<uint32_t>((lo >> 58) & 3u);
++                uint32_t nreg = static_cast<uint32_t>((lo >> 60) & 0xfu);
++                if (nreg == 0u)
++                    nreg = 16u;
++                bytes += 16u;
++                if (flg == 0u)
++                    bytes += nloop * nreg * 16u;
++                else if (flg == 1u)
++                    bytes += ((nloop * nreg + 1u) / 2u) * 16u;
++                else
++                    bytes += nloop * 16u;
++                if (eop)
++                    break;
++            }
++            return bytes < kDataSize ? bytes : kDataSize;
++        }
++
++        void stateIn(VU &u, const VU1State &s)
++        {
++            std::memcpy(u.vf, s.vf, sizeof(u.vf));
++            for (int k = 0; k < 16; ++k)
++                u.vi[k] = static_cast<uint32_t>(s.vi[k]) & 0xffffu;
++            std::memcpy(u.acc, s.acc, sizeof(u.acc));
++            u.i = s.i;
++            u.r = s.r & 0x7fffffu;
++            // Q/P changed outside (interpreter): take them as settled
++            if (s.q != g_lastQ)
++            {
++                u.q = u.q_new = s.q;
++                u.q_done = 0;
++            }
++            if (s.p != g_lastP)
++            {
++                u.p = u.p_new = s.p;
++                u.p_done = 0;
++            }
++        }
++
++        void stateOut(VU &u, VU1State &s)
++        {
++            std::memcpy(s.vf, u.vf, sizeof(u.vf));
++            for (int k = 0; k < 16; ++k)
++                s.vi[k] = static_cast<int16_t>(u.vi[k] & 0xffffu);
++            s.vi[0] = 0;
++            std::memcpy(s.acc, u.acc, sizeof(s.acc));
++            s.q = u.q;
++            s.p = u.p;
++            s.i = u.i;
++            s.r = 0x3F800000u | (u.r & 0x7fffffu);
++            uint32_t mac = 0, status = 0, clip = 0;
++            flags_visible(&u, &mac, &status, &clip);
++            s.mac = mac;
++            s.status = status;
++            s.clip = clip;
++            s.pc = u.tpc;
++            g_lastQ = u.q;
++            g_lastP = u.p;
++        }
++
++        // From u.pc until an E bit: 0 done, 1 there is no compiled code for u.pc (interpreter continues).
++        int chain(VU &u, ProgFn fn, const uint8_t *code, uint64_t generation)
++        {
++            u.vf[0].f[0] = u.vf[0].f[1] = u.vf[0].f[2] = 0.0f;
++            u.vf[0].f[3] = 1.0f;
++            for (;;)
++            {
++                if (fn(&u) == 0)
++                {
++                    u.tpc = u.pc;
++                    u.q = u.q_new;
++                    u.p = u.p_new;
++                    return 0;
++                }
++                fn = find(code, generation, u.pc);
++                if (!fn)
++                {
++                    u.tpc = u.pc;
++                    return 1;
++                }
++            }
++        }
++
++        struct GuestFpu
++        {
++            unsigned int saved;
++            // round toward zero, flush-to-zero, denormals-are-zero, all exceptions masked (the PS2 VU)
++            GuestFpu() : saved(_mm_getcsr()) { _mm_setcsr(0xFFC0u); }
++            ~GuestFpu() { _mm_setcsr(saved); }
++        };
++    }
++
++    void registerPrograms(int unit, const Prog *table, int count)
++    {
++        if (unit < 0 || unit > 1)
++            return;
++        programs()[unit].assign(table, table + count);
++    }
++
++    void kick(VU *u, uint32_t qwordAddress)
++    {
++        PS2Memory *memory = static_cast<PS2Memory *>(u->kickContext);
++        if (!memory)
++            return;
++        const uint32_t bytes = gifPacketBytes(u->mem, qwordAddress);
++        if (!bytes)
++            return;
++        g_packet.resize(bytes);
++        const uint32_t base = qwordAddress * 16u;
++        for (uint32_t i = 0; i < bytes; i += 16u)
++            std::memcpy(g_packet.data() + i, u->mem + ((base + i) & (kDataSize - 1u)), 16);
++        memory->submitGifPacket(GifPathId::Path1, g_packet.data(), bytes);
++    }
++
++    Mode mode()
++    {
++        static const Mode m = readMode();
++        return m;
++    }
++
++    Result runVu1(const uint8_t *vuCode, uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc,
++                  uint32_t top, uint32_t itop, VU1State &state, PS2Memory *memory)
++    {
++        if (mode() != Mode::On || programs()[1].empty())
++            return Result::NotHandled;
++        ProgFn fn = find(vuCode, codeGeneration, startPc);
++        if (!fn)
++            return Result::NotHandled;
++        if (!g_vu1Init)
++        {
++            g_vu1Init = true;
++            g_vu1.memmask = kDataSize - 1u;
++            g_vu1.unit = 1;
++            g_lastQ = state.q + 1.0f; // force Q/P in on the first run
++            g_lastP = state.p + 1.0f;
++        }
++        VU &u = g_vu1;
++        u.mem = vuData;
++        u.kickContext = memory;
++        stateIn(u, state);
++        u.top = top & 0xffffu;
++        u.itop = itop & 0xffffu;
++        u.pc = startPc & kCodeMask;
++        int left;
++        {
++            GuestFpu fpu;
++            left = chain(u, fn, vuCode, codeGeneration);
++        }
++        ++g_runs;
++        stateOut(u, state);
++        state.ebit = false;
++        state.stoppedByD = false;
++        state.stoppedByT = false;
++        state.branchPending = false;
++        state.top = top;
++        state.itop = itop;
++        if (left)
++        {
++            if (g_fallbacks++ < 10u)
++            {
++                char line[96];
++                std::snprintf(line, sizeof(line), "[vu1:compiled] program from %04x left at %04x: interpreter continues",
++                              startPc & kCodeMask, u.pc);
++                std::cerr << line << std::endl;
++            }
++            return Result::ContinueInInterpreter;
++        }
++        return Result::Done;
++    }
++
++    // ---- verification: the interpreter has run; run the compiled program on the saved input and compare.
++    struct VerifyInput
++    {
++        VU1State state;
++        std::vector<uint8_t> data;
++        uint32_t startPc, top, itop;
++        ProgFn fn;
++        uint64_t generation;
++    };
++
++    void *verifyBefore(const uint8_t *vuCode, const uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc,
++                       uint32_t top, uint32_t itop, const VU1State &state)
++    {
++        if (mode() != Mode::Verify || programs()[1].empty())
++            return nullptr;
++        ProgFn fn = find(vuCode, codeGeneration, startPc);
++        if (!fn)
++            return nullptr;
++        auto *in = new VerifyInput{state, std::vector<uint8_t>(vuData, vuData + kDataSize), startPc, top, itop, fn, codeGeneration};
++        return in;
++    }
++
++    void verifyAfter(void *input, const uint8_t *vuCode, const uint8_t *vuData, const VU1State &after)
++    {
++        auto *in = static_cast<VerifyInput *>(input);
++        if (!in)
++            return;
++        static uint64_t runs = 0, bad = 0, badMem = 0, badRegs = 0, badScratch = 0;
++        static std::mutex mutex;
++        std::lock_guard<std::mutex> lock(mutex);
++        VU u{};
++        u.memmask = kDataSize - 1u;
++        u.unit = 1;
++        u.mem = in->data.data();
++        u.kickContext = nullptr;
++        g_lastQ = in->state.q + 1.0f;
++        g_lastP = in->state.p + 1.0f;
++        stateIn(u, in->state);
++        for (auto &f : u.fh)
++        {
++            f.mac = in->state.mac;
++            f.status = in->state.status & 0x3fu;
++            f.clip = in->state.clip;
++        }
++        u.status_sticky = in->state.status & 0xfc0u;
++        u.clip_latest = in->state.clip & 0xffffffu;
++        u.top = in->top & 0xffffu;
++        u.itop = in->itop & 0xffffu;
++        u.pc = in->startPc & kCodeMask;
++        int left;
++        {
++            GuestFpu fpu;
++            left = chain(u, in->fn, vuCode, in->generation);
++        }
++        VU1State got = in->state;
++        stateOut(u, got);
++        ++runs;
++        char why[256] = "";
++        int category = 0; // 1 memory/left, 2 vi or vf15-31, 3 vf1-14 only
++        if (left)
++            std::snprintf(why, sizeof(why), "left the compiled code at %04x", u.pc);
++        else
++        {
++            for (uint32_t i = 0; i < kDataSize && !why[0]; i += 16u)
++            {
++                if (std::memcmp(in->data.data() + i, vuData + i, 16))
++                {
++                    const uint32_t *a = reinterpret_cast<const uint32_t *>(in->data.data() + i);
++                    const uint32_t *b = reinterpret_cast<const uint32_t *>(vuData + i);
++                    std::snprintf(why, sizeof(why), "mem qw %03x: %08x %08x %08x %08x vs interp %08x %08x %08x %08x",
++                                  i / 16u, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
++                    category = 1;
++                }
++            }
++            for (int r = 1; r < 16 && !why[0]; ++r)
++                if ((got.vi[r] & 0xffff) != (after.vi[r] & 0xffff))
++                {
++                    std::snprintf(why, sizeof(why), "vi%d %x vs interp %x", r, got.vi[r] & 0xffff, after.vi[r] & 0xffff);
++                    category = 2;
++                }
++            for (int r = 31; r >= 1 && !why[0]; --r)
++                if (std::memcmp(got.vf[r], after.vf[r], 16))
++                    std::snprintf(why, sizeof(why), "vf%d %g %g %g %g vs interp %g %g %g %g", r, got.vf[r][0], got.vf[r][1],
++                                  got.vf[r][2], got.vf[r][3], after.vf[r][0], after.vf[r][1], after.vf[r][2], after.vf[r][3]),
++                    category = r >= 15 ? 2 : 3;
++        }
++        if (left)
++            category = 1;
++        if (why[0])
++        {
++            ++bad;
++            badMem += category == 1;
++            badRegs += category == 2;
++            badScratch += category == 3;
++            if (category != 3 ? (badMem + badRegs) <= 40u : badScratch <= 5u)
++            {
++                char line[400];
++                std::snprintf(line, sizeof(line), "[vu1:compiled] VERIFY entry %04x top=%03x itop=%03x: %s",
++                              in->startPc & kCodeMask, in->top, in->itop, why);
++                std::cerr << line << std::endl;
++            }
++        }
++        if ((runs & 0xFFFu) == 0u)
++        {
++            char line[128];
++            std::snprintf(line, sizeof(line), "[vu1:compiled] verify: %llu runs, %llu differ (memory %llu, vi/vf15-31 %llu, only vf1-14 %llu)",
++                          static_cast<unsigned long long>(runs), static_cast<unsigned long long>(bad),
++                          static_cast<unsigned long long>(badMem), static_cast<unsigned long long>(badRegs),
++                          static_cast<unsigned long long>(badScratch));
++            std::cerr << line << std::endl;
++        }
++        delete in;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5def05e..268ad7d 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1,5 +1,6 @@
+ #include "ps2_runtime.h"
+ #include "ps2_vu1_verify.h"
++#include "ps2_vu_compiled_run.h"
+ #include "ps2_log.h"
+ #include "ps2_stubs.h"
+ #include "ps2_syscalls.h"
+@@ -680,6 +681,25 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     const ape2vu::Result compiled = ape2vu::runVu1(
++                                         m_memory.getVU1Code(), m_memory.getVU1Data(), m_memory.getVU1CodeGeneration(),
++                                         startPC, top, itop, m_vu1.state(), &m_memory);
++                                     if (compiled == ape2vu::Result::Done)
++                                     {
++                                         cpuContext->vu0_vpu_stat &= ~0x0600u;
++                                         return;
++                                     }
++                                     if (compiled == ape2vu::Result::ContinueInInterpreter)
++                                     {
++                                         m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
++                                                       m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
++                                                       m_gs, &m_memory, m_vu1.state().pc, top, itop, 65536);
++                                         cpuContext->vu0_vpu_stat =
++                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
++                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
++                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u);
++                                         return;
++                                     }
+                                      if (ps2vu1verify::runNative(m_memory.getVU1Code(), m_memory.getVU1Data(),
+                                                                  m_memory.getVU1CodeGeneration(), startPC, top, itop,
+                                                                  m_vu1.state(), &m_memory))
+@@ -687,6 +707,9 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          cpuContext->vu0_vpu_stat &= ~0x0600u;
+                                          return;
+                                      }
++                                     void *compiledVerify = ape2vu::verifyBefore(
++                                         m_memory.getVU1Code(), m_memory.getVU1Data(), m_memory.getVU1CodeGeneration(),
++                                         startPC, top, itop, m_vu1.state());
+                                      ps2vu1verify::Snapshot *vuVerify = ps2vu1verify::before(
+                                          m_memory.getVU1Code(), m_memory.getVU1Data(), m_memory.getVU1CodeGeneration(),
+                                          startPC, top, itop, m_vu1.state());
+@@ -694,6 +717,7 @@ bool PS2Runtime::syncCoreSubsystems()
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                      ps2vu1verify::after(vuVerify, m_memory.getVU1Data(), m_vu1.state());
++                                     ape2vu::verifyAfter(compiledVerify, m_memory.getVU1Code(), m_memory.getVU1Data(), m_vu1.state());
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -709,6 +733,13 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     if (ape2vu::runVu1(m_memory.getVU1Code(), m_memory.getVU1Data(),
++                                                        m_memory.getVU1CodeGeneration(), m_vu1.state().pc, top, itop,
++                                                        m_vu1.state(), &m_memory) == ape2vu::Result::Done)
++                                     {
++                                         cpuContext->vu0_vpu_stat &= ~0x0600u;
++                                         return;
++                                     }
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, 65536);
+diff --git a/ps2xRuntime/src/lib/ps2_vu_compiled_run.h b/ps2xRuntime/src/lib/ps2_vu_compiled_run.h
+new file mode 100644
+index 0000000..411fc98
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_vu_compiled_run.h
+@@ -0,0 +1,32 @@
++// Running the compiled VU1 microprograms in place of the interpreter (Ape Escape 2 recomp patch);
++// see ps2_vu_compiled.h.
++#pragma once
++
++#include <cstdint>
++
++struct VU1State;
++class PS2Memory;
++
++namespace ape2vu
++{
++    enum class Mode
++    {
++        Off,
++        On,
++        Verify
++    };
++    Mode mode();
++
++    enum class Result
++    {
++        NotHandled,           // no compiled program for this entry: run the interpreter
++        Done,                 // ran to its E bit (state, VU memory and GIF kicks done)
++        ContinueInInterpreter // left the compiled code; the interpreter continues at state.pc
++    };
++    Result runVu1(const uint8_t *vuCode, uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc,
++                  uint32_t top, uint32_t itop, VU1State &state, PS2Memory *memory);
++
++    void *verifyBefore(const uint8_t *vuCode, const uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc,
++                       uint32_t top, uint32_t itop, const VU1State &state);
++    void verifyAfter(void *input, const uint8_t *vuCode, const uint8_t *vuData, const VU1State &after);
++}

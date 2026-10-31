@@ -114,6 +114,16 @@ function Copy-IfChanged($src, $dstDir) {
     Copy-Item $src $dst -Force
     return $true
 }
+# VU microprograms -> C++ (tools/vu_recomp.py; needs Python 3). Without it every VU1 program runs in the
+# much slower VU interpreter.
+$Python = Get-Command python -ErrorAction SilentlyContinue
+if (-not $Python) { $Python = Get-Command py -ErrorAction SilentlyContinue }
+if ($Python) {
+    & $Python.Source "$Repo\tools\vu_recomp.py" "$Repo\tools\vu_programs.recipe" "$Repo\game\SLUS_206.85" "$Gen\zz_ape2_vu_programs.cpp" | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0) { throw "tools/vu_recomp.py failed" }
+} else {
+    Write-Warning "Python 3 not found: VU1 programs will run in the (slow) VU interpreter"
+}
 $changed = 0
 foreach ($f in Get-ChildItem "$Gen\*.cpp") { if (Copy-IfChanged $f.FullName $RunnerSrc) { $changed++ } }
 foreach ($h in "ps2_recompiled_functions.h", "ps2_recompiled_stubs.h") { if (Copy-IfChanged "$Gen\$h" $RunnerInc) { $changed++; Write-Host "header changed: $h (expect a full rebuild)" } }
