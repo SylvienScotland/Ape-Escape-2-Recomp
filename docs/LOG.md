@@ -511,3 +511,12 @@
   stray word in the title archive name (TIT_A -> no collision, actors under the hill) and the 0x64 "mode" in
   the save request (last save file opened read-only, final write -5). Zero reports after the fix.
 - overrides/zz_ape2_archive_name.cpp (the title workaround) is no longer needed; kept for now (harmless).
+
+## GS worker thread (0043)
+- After the PAL port's MTGS/MTVU: GIF and VIF1 DMA data is copied at kick time and processed on one worker
+  thread (VIF1, VU1 programs, GIF, GS front end) in kick order. The EE waits for it (syncGsWorker) before
+  VU1 memory, VIF1/GIF registers, VIF1 FIFO and the sceGs* stubs that write the GS. APE2_MTGS=0 disables it;
+  APE2_MTGS_STATS=1 prints worker load and EE waits per reason every 5 s.
+- Title 40 -> 48-58 fps, gameplay 27-35 -> 38-50 fps. The worker is now ~96% busy in gameplay (VIF1/VU1 ~1/3,
+  GS front end + raster submit ~2/3); the EE waits on VIF1 register reads (sceGsSyncPath) about half the time.
+  Next: split VIF1/VU1 and the GS front end onto two threads (PAL does), and avoid the per-frame VIF1_STAT wait.

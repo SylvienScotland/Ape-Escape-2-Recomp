@@ -1,0 +1,444 @@
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..11bf436 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -10,6 +10,9 @@
+ #include <atomic>
+ #include <iostream>
+ #include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <thread>
+ 
+ #include "gs/ps2_gif_arbiter.h"
+ #if defined(_MSC_VER)
+@@ -346,6 +349,14 @@ public:
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
+ 
++    // GS worker (Ape Escape 2 recomp patch 0043, after the PAL port's MTGS/MTVU): GIF and VIF1 DMA data is
++    // copied when the DMA is kicked and processed (VIF1, VU1 microprograms, GIF, GS front end) on a worker
++    // thread, in kick order. The EE waits for the worker (syncGsWorker) before it touches VU1 memory, VIF1 or
++    // GIF registers or calls into the GS directly. APE2_MTGS=0 processes everything on the EE thread as before.
++    void syncGsWorker(int reason = 0);
++    static bool onGsWorker();
++    bool gsWorkerEnabled() const { return m_gsWorkerEnabled; }
++
+     int pollDmaRegisters();
+ 
+     // Track code modifications for self-modifying code
+@@ -421,6 +432,27 @@ public:
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
++
++    struct GsWorkItem
++    {
++        bool vif1 = false; // VIF1 data, else a PATH3 GIF packet
++        std::vector<uint8_t> data;
++    };
++    bool m_gsWorkerEnabled = false;
++    bool m_gsWorkerStop = false;
++    bool m_gsWorkerBusy = false;
++    size_t m_gsWorkBytes = 0;
++    std::deque<GsWorkItem> m_gsWork;
++    std::mutex m_gsWorkMutex;
++    std::condition_variable m_gsWorkCv, m_gsIdleCv;
++    std::thread m_gsWorker;
++    std::atomic<uint64_t> m_gsSyncCount[8]{};
++    std::atomic<uint64_t> m_gsSyncWaitUs[8]{};
++    void startGsWorker();
++    void stopGsWorker();
++    void gsWorkerMain();
++    void enqueueGsWork(bool vif1, std::vector<uint8_t> &&data);
++    void enqueueGsWork(bool vif1, bool fromScratchpad, uint32_t srcAddr, uint32_t qwc);
+     std::mutex m_completedDmacMutex;
+     std::vector<uint32_t> m_completedDmacCauses;
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index aed4cb5..ed79c67 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -592,6 +592,7 @@ namespace ps2_stubs
+ 
+     void sceGsExecLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         uint32_t imgAddr = getRegU32(ctx, 4);
+         uint32_t srcAddr = getRegU32(ctx, 5);
+ 
+@@ -669,6 +670,7 @@ namespace ps2_stubs
+ 
+     void sceGsExecStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         uint32_t imgAddr = getRegU32(ctx, 4);
+         uint32_t dstAddr = getRegU32(ctx, 5);
+ 
+@@ -772,6 +774,7 @@ namespace ps2_stubs
+ 
+     void sceGsPutDrawEnv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         uint32_t envAddr = getRegU32(ctx, 4);
+         GsRegPairMem pairs[8]{};
+         if (!readGsRegPairs(rdram, envAddr, pairs, 8u))
+@@ -785,6 +788,7 @@ namespace ps2_stubs
+ 
+     void sceGsResetGraph(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         uint32_t mode = getRegU32(ctx, 4);
+         uint32_t interlace = getRegU32(ctx, 5);
+         uint32_t omode = getRegU32(ctx, 6);
+@@ -868,6 +872,7 @@ namespace ps2_stubs
+ 
+     void sceGsSetDefDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         const uint32_t envAddr = getRegU32(ctx, 4);
+         uint32_t psm = getRegU32(ctx, 5);
+         uint32_t w = getRegU32(ctx, 6);
+@@ -1130,6 +1135,7 @@ namespace ps2_stubs
+ 
+     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         const uint32_t envAddr = getRegU32(ctx, 4);
+         const uint32_t which = getRegU32(ctx, 5) & 1u;
+ 
+@@ -1188,6 +1194,7 @@ namespace ps2_stubs
+ 
+     void sceGsSwapDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++        runtime->memory().syncGsWorker();
+         const uint32_t envAddr = getRegU32(ctx, 4);
+         const uint32_t which = getRegU32(ctx, 5) & 1u;
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 490a5c8..2c06ca2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1892,6 +1892,7 @@ namespace
+ 
+     static void applyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)
+     {
++        runtime->memory().syncGsWorker();
+         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
+             return;
+         for (size_t i = 0; i < pairCount; ++i)
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 02811d6..706c406 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -3,6 +3,9 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -269,6 +272,7 @@ PS2Memory::PS2Memory()
+ 
+ PS2Memory::~PS2Memory()
+ {
++    stopGsWorker();
+     if (m_rdram)
+     {
+         delete[] m_rdram;
+@@ -563,6 +567,8 @@ bool PS2Memory::isScratchpad(uint32_t address) const
+ 
+ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
+ {
++    if (m_gsWorkerEnabled && physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
++        syncGsWorker(1);
+     return const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
+ }
+ 
+@@ -1113,6 +1119,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+     }
+     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
+     {
++        syncGsWorker(2);
+         alignas(16) uint8_t fifoData[16];
+         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+         processVIF1Data(fifoData, sizeof(fifoData));
+@@ -1158,6 +1165,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+ 
+ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ {
++    if (m_gsWorkerEnabled && ((address >= 0x10003C00u && address < 0x10003E00u) || (address >= 0x10003000u && address < 0x10003100u)))
++        syncGsWorker(address >= 0x10003C00u ? 3 : 4);
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+@@ -1697,6 +1706,8 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
+ 
+ void PS2Memory::processPendingTransfers()
+ {
++    if (!m_gsWorker.joinable() && !onGsWorker())
++        startGsWorker();
+     const bool hadGif = !m_pendingGifTransfers.empty();
+     uint32_t observedGifQwc = 0u;
+     for (const auto &transfer : m_pendingGifTransfers)
+@@ -1717,6 +1728,14 @@ void PS2Memory::processPendingTransfers()
+     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
+     {
+         auto &p = m_pendingGifTransfers[idx];
++        if (m_gsWorkerEnabled)
++        {
++            if (!p.chainData.empty())
++                enqueueGsWork(false, std::move(p.chainData));
++            else
++                enqueueGsWork(false, p.fromScratchpad, p.srcAddr, p.qwc);
++            continue;
++        }
+         if (!p.chainData.empty())
+         {
+             m_seenGifCopy = true;
+@@ -1839,6 +1858,14 @@ void PS2Memory::processPendingTransfers()
+     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+     for (auto &p : m_pendingVif1Transfers)
+     {
++        if (m_gsWorkerEnabled)
++        {
++            if (!p.chainData.empty())
++                enqueueGsWork(true, std::move(p.chainData));
++            else
++                enqueueGsWork(true, p.fromScratchpad, p.srcAddr, p.qwc);
++            continue;
++        }
+         if (!p.chainData.empty())
+         {
+             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+@@ -1894,7 +1921,7 @@ void PS2Memory::processPendingTransfers()
+     }
+     m_pendingVif1Transfers.clear();
+ 
+-    if (m_gifArbiter)
++    if (m_gifArbiter && !m_gsWorkerEnabled)
+         m_gifArbiter->drain();
+ 
+     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
+@@ -1940,6 +1967,173 @@ void PS2Memory::processPendingTransfers()
+     }
+ }
+ 
++namespace
++{
++    thread_local bool t_onGsWorker = false;
++    uint64_t gsWorkerNowUs()
++    {
++        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count());
++    }
++}
++
++bool PS2Memory::onGsWorker()
++{
++    return t_onGsWorker;
++}
++
++void PS2Memory::startGsWorker()
++{
++    const char *env = std::getenv("APE2_MTGS");
++    if ((env && std::atoi(env) == 0) || std::thread::hardware_concurrency() < 3u)
++        return;
++    m_gsWorkerStop = false;
++    m_gsWorker = std::thread([this]
++                             { gsWorkerMain(); });
++    m_gsWorkerEnabled = true;
++    std::fprintf(stderr, "[mtgs] VIF1, VU1, GIF and the GS front end run on a worker thread\n");
++}
++
++void PS2Memory::stopGsWorker()
++{
++    if (!m_gsWorker.joinable())
++        return;
++    {
++        std::lock_guard<std::mutex> lock(m_gsWorkMutex);
++        m_gsWorkerStop = true;
++    }
++    m_gsWorkCv.notify_all();
++    m_gsWorker.join();
++    m_gsWorkerEnabled = false;
++}
++
++void PS2Memory::enqueueGsWork(bool vif1, bool fromScratchpad, uint32_t srcAddr, uint32_t qwc)
++{
++    uint32_t srcPhys = 0;
++    try
++    {
++        srcPhys = translateAddress(srcAddr);
++    }
++    catch (const std::exception &)
++    {
++        return;
++    }
++    const uint8_t *base = fromScratchpad ? m_scratchpad : m_rdram;
++    const uint32_t size = fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
++    std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u);
++    size_t done = 0;
++    while (done < data.size())
++    {
++        if (srcPhys >= size)
++            srcPhys = 0;
++        const size_t chunk = std::min<size_t>(data.size() - done, size - srcPhys);
++        std::memcpy(data.data() + done, base + srcPhys, chunk);
++        done += chunk;
++        srcPhys += static_cast<uint32_t>(chunk);
++    }
++    enqueueGsWork(vif1, std::move(data));
++}
++
++void PS2Memory::enqueueGsWork(bool vif1, std::vector<uint8_t> &&data)
++{
++    if (data.empty())
++        return;
++    std::unique_lock<std::mutex> lock(m_gsWorkMutex);
++    // keep the EE at most this far ahead of the worker
++    constexpr size_t kMaxQueuedBytes = 48u << 20;
++    if (m_gsWorkBytes > kMaxQueuedBytes)
++    {
++        const uint64_t t0 = gsWorkerNowUs();
++        m_gsIdleCv.wait(lock, [this]
++                        { return m_gsWorkBytes <= kMaxQueuedBytes / 2u; });
++        m_gsSyncCount[7].fetch_add(1, std::memory_order_relaxed);
++        m_gsSyncWaitUs[7].fetch_add(gsWorkerNowUs() - t0, std::memory_order_relaxed);
++    }
++    m_gsWorkBytes += data.size();
++    GsWorkItem item;
++    item.vif1 = vif1;
++    item.data = std::move(data);
++    m_gsWork.push_back(std::move(item));
++    lock.unlock();
++    m_gsWorkCv.notify_one();
++}
++
++void PS2Memory::syncGsWorker(int reason)
++{
++    if (!m_gsWorkerEnabled || t_onGsWorker)
++        return;
++    std::unique_lock<std::mutex> lock(m_gsWorkMutex);
++    if (m_gsWork.empty() && !m_gsWorkerBusy)
++        return;
++    const uint64_t t0 = gsWorkerNowUs();
++    m_gsIdleCv.wait(lock, [this]
++                    { return m_gsWork.empty() && !m_gsWorkerBusy; });
++    const int r = (reason >= 0 && reason < 8) ? reason : 0;
++    m_gsSyncCount[r].fetch_add(1, std::memory_order_relaxed);
++    m_gsSyncWaitUs[r].fetch_add(gsWorkerNowUs() - t0, std::memory_order_relaxed);
++}
++
++void PS2Memory::gsWorkerMain()
++{
++    t_onGsWorker = true;
++    static const bool stats = std::getenv("APE2_MTGS_STATS") != nullptr;
++    uint64_t busyUs = 0, lastReport = gsWorkerNowUs();
++    for (;;)
++    {
++        GsWorkItem item;
++        {
++            std::unique_lock<std::mutex> lock(m_gsWorkMutex);
++            m_gsWorkerBusy = false;
++            if (m_gsWork.empty())
++                m_gsIdleCv.notify_all();
++            m_gsWorkCv.wait(lock, [this]
++                            { return m_gsWorkerStop || !m_gsWork.empty(); });
++            if (m_gsWorkerStop)
++                return;
++            item = std::move(m_gsWork.front());
++            m_gsWork.pop_front();
++            m_gsWorkerBusy = true;
++        }
++        const uint64_t t0 = stats ? gsWorkerNowUs() : 0;
++        if (item.vif1)
++            processVIF1Data(item.data.data(), static_cast<uint32_t>(item.data.size()));
++        else
++        {
++            m_seenGifCopy = true;
++            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
++            submitGifPacket(GifPathId::Path3, item.data.data(), static_cast<uint32_t>(item.data.size()), false);
++        }
++        if (m_gifArbiter)
++            m_gifArbiter->drain();
++        {
++            std::lock_guard<std::mutex> lock(m_gsWorkMutex);
++            m_gsWorkBytes -= item.data.size();
++            if (m_gsWorkBytes <= (24u << 20))
++                m_gsIdleCv.notify_all();
++        }
++        if (stats)
++        {
++            const uint64_t now = gsWorkerNowUs();
++            busyUs += now - t0;
++            if (now - lastReport >= 5000000u)
++            {
++                static const char *names[8] = {"other", "vu1mem", "vif1fifo", "vif1w", "gifw", "vif1r", "gifr", "full"};
++                std::fprintf(stderr, "[mtgs] worker busy %.0f%%; EE waits:", 100.0 * static_cast<double>(busyUs) / static_cast<double>(now - lastReport));
++                for (int k = 0; k < 8; ++k)
++                {
++                    const uint64_t c = m_gsSyncCount[k].exchange(0), w = m_gsSyncWaitUs[k].exchange(0);
++                    if (c)
++                        std::fprintf(stderr, " %s %llu (%.1f ms)", names[k], static_cast<unsigned long long>(c), static_cast<double>(w) / 1000.0);
++                }
++                std::fprintf(stderr, "\n");
++                busyUs = 0;
++                lastReport = now;
++            }
++        }
++    }
++}
++
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+ {
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+@@ -2322,6 +2516,8 @@ int PS2Memory::pollDmaRegisters()
+ 
+ uint32_t PS2Memory::readIORegister(uint32_t address)
+ {
++    if (m_gsWorkerEnabled && ((address >= 0x10003C00u && address < 0x10003E00u) || (address >= 0x10003000u && address < 0x10003100u)))
++        syncGsWorker(address >= 0x10003C00u ? 5 : 6);
+     size_t timerIndex = 0u;
+     uint32_t timerOffset = 0u;
+     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d4ed8fc..b703e87 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -673,7 +673,14 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+-                                     if (!cpuContext)
++                                     // on the GS worker (patch 0043) the EE context belongs to another thread:
++                                     // VPU-STAT D/T bits go to a private copy
++                                     static thread_local R5900Context workerContext{};
++                                     if (PS2Memory::onGsWorker())
++                                     {
++                                         cpuContext = &workerContext;
++                                     }
++                                     else if (!cpuContext)
+                                      {
+                                          cpuContext = &m_cpuContext;
+                                      }
+@@ -725,7 +732,14 @@ bool PS2Runtime::syncCoreSubsystems()
+     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
+                                  {
+                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+-                                     if (!cpuContext)
++                                     // on the GS worker (patch 0043) the EE context belongs to another thread:
++                                     // VPU-STAT D/T bits go to a private copy
++                                     static thread_local R5900Context workerContext{};
++                                     if (PS2Memory::onGsWorker())
++                                     {
++                                         cpuContext = &workerContext;
++                                     }
++                                     else if (!cpuContext)
+                                      {
+                                          cpuContext = &m_cpuContext;
+                                      }
