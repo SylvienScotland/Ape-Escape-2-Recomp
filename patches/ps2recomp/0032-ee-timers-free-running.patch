@@ -1,0 +1,20 @@
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index fefe914..02811d6 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -427,6 +427,15 @@ bool PS2Memory::initialize(size_t ramSize)
+ void PS2Memory::resetEeTimers() noexcept
+ {
+     m_eeTimers = {};
++    // The EE kernel leaves timers 2 and 3 free-running (BUSCLK/256) for its own use, and games read T2 as an
++    // entropy source: Ape Escape 2 seeds its VU0 random generator from it, and a zero seed sticks the LFSR at 0
++    // so object placement loops forever. As the PAL port JackyPendrag0n/ae2-recomp (port/src/rt_hw.c hw_init;
++    // Ape Escape 2 recomp patch 0032).
++    for (size_t t = 2; t < 4; ++t)
++    {
++        m_eeTimers[t].mode = 0x82u;
++        m_eeTimers[t].count = static_cast<uint32_t>(0x1234u * t);
++    }
+ }
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept

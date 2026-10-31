@@ -438,3 +438,8 @@
   - VCLIP: +/- flag bits swapped and w not made absolute (now as the hardware / PAL V_CLIP).
   - Runner build: zz_ape2_* overrides excluded from unity batches (editing one no longer rebuilds a batch).
   - APE2_REGCHECK=1 (EE scheduler): reports a thread's s0-s7 upper halves changing while it is not running.
+- Regression after 0031, fixed (0032): the stage hung after the "Go ape" screen in a monkey-placement loop
+  (0x1C5930: random points until one lies in a box, test 0x2020C8). The VU0 random register R was stuck at 0
+  (the game seeds it from EE timer 2, which our runtime left stopped at 0), so every point was the box's corner;
+  the old swapped VCLIP bits had let that corner pass. Timers 2 and 3 now start free-running (mode 0x82) as the
+  PS2 kernel leaves them, like the PAL port's rt_hw.c. Debug aid: APE2_BOXLOG=<n>[, APE2_BOXSKIP=<n>].

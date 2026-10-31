@@ -315,8 +315,40 @@ namespace
             std::fprintf(stderr, "[s0] 1d29b8 changed s0 upper %016llx -> %016llx (lower %016llx -> %016llx)\n", (unsigned long long)before[1], (unsigned long long)after[1], (unsigned long long)before[0], (unsigned long long)after[0]);
     }
 
+    // APE2_BOXLOG=<count>: log the in-box test 0x2020C8 (a0 = box min/max, a1 = point, f12 = radius)
+    uint64_t g_boxLeft = 0;
+    void ape2_box(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t a0 = GPR_U32(ctx, 4), ra = GPR_U32(ctx, 31);
+        static uint64_t calls = 0;
+        ++calls;
+        float p[4], box[8] = {}, m[16];
+        std::memcpy(p, &ctx->r[5], 16);
+        const float r = ctx->f[12];
+        if (a0)
+            std::memcpy(box, rdram + (a0 & 0x1FFFFF0u), 32);
+        std::memcpy(m, rdram + 0x5127A0u, 64);
+        sub_002020C8_0x2020c8(rdram, ctx, runtime);
+        // log calls in [APE2_BOXSKIP, APE2_BOXSKIP + APE2_BOXLOG)
+        static const uint64_t skip = std::getenv("APE2_BOXSKIP") ? std::strtoull(std::getenv("APE2_BOXSKIP"), nullptr, 0) : 0;
+        if (g_boxLeft && calls > skip)
+        {
+            --g_boxLeft;
+            std::fprintf(stderr, "[box] ra=%06x box=%x ", ra, a0);
+            std::fprintf(stderr, "p %g %g %g %g r %g min %g %g %g %g max %g %g %g %g -> %d clip %06x\n", p[0], p[1], p[2], p[3], r, box[0], box[1],
+                         box[2], box[3], box[4], box[5], box[6], box[7], static_cast<int>(GPR_U32(ctx, 2)), ctx->vu0_clip_flags & 0xFFFFFFu);
+            if (0) std::fprintf(stderr, "[box]   m (%g %g %g %g) (%g %g %g %g) (%g %g %g %g) (%g %g %g %g)\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6],
+                         m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+        }
+    }
+
     void ape2_camlog_apply(PS2Runtime &runtime)
     {
+        if (const char *b = std::getenv("APE2_BOXLOG"))
+        {
+            g_boxLeft = std::strtoull(b, nullptr, 0);
+            runtime.registerFunction(0x002020C8u, ape2_box);
+        }
         if (const char *r = std::getenv("APE2_RAYLOG"))
         {
             g_rayLeft = std::strtoull(r, nullptr, 0);
