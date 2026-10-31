@@ -1,0 +1,101 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index c3a3863..7b8e554 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -43,6 +43,7 @@ private:
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
++    void StampPagesUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 849ab88..75d26b1 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -804,6 +804,11 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     }();
+     if (bands <= 1)
+     {
++        const auto &c = batch.state.context;
++        const uint32_t sx = static_cast<uint32_t>(c.scissor.x1), sy = static_cast<uint32_t>(c.scissor.y1);
++        StampPagesUnlocked(c.frame.psm, GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, 0u, 0u, sx, sy);
++        if (!c.zbuf.zmask)
++            StampPagesUnlocked(c.zbuf.psm, GSInternal::framePageBaseToBlock(c.zbuf.zbp), c.frame.fbw, 0u, 0u, sx, sy);
+         DrawPrimitive(batch);
+         return;
+     }
+@@ -944,6 +949,9 @@ void GSCpuBackend::FlushQueueUnlocked()
+     m_inflightGen = m_flushGen;
+     ++m_flushGen;
+     m_inflightBusy = true;
++    for (uint32_t pg = 0; pg < 512u; ++pg)
++        if (m_inflightPages[pg])
++            m_pageEpoch[pg].store(m_vramEpoch, std::memory_order_relaxed);
+     const int n = std::max(1, pool.workers());
+     m_inflightTask = [this, n](int k)
+     {
+@@ -1143,6 +1151,7 @@ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t
+     }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     WriteVramUnlocked(psm, base, bw, x, y, value);
++    StampPagesUnlocked(psm, base, bw, x, y, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -1150,7 +1159,19 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+     if (!m_vram)
+         return;
+     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
+-    m_pageEpoch[VramPageOf(psm, base, bw, x, y)].store(m_vramEpoch, std::memory_order_relaxed);
++    // page epochs are stamped per batch / transfer / clear (StampPagesUnlocked), not per pixel
++}
++
++void GSCpuBackend::StampPagesUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++{
++    const uint64_t epoch = m_vramEpoch;
++    const uint32_t p0 = VramPageOf(psm, base, bw, x0, y0), p1 = VramPageOf(psm, base, bw, x1, y1);
++    for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
++    {
++        m_pageEpoch[pg].store(epoch, std::memory_order_relaxed);
++        if (pg == p1)
++            break;
++    }
+ }
+ 
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+@@ -2400,6 +2421,12 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         if (drawn)
+             { m_flushReason = 4; DrainUnlocked(); }
+     }
++    {
++        const auto &b = m_transfer.bitbltbuf;
++        const uint32_t w = std::max<uint32_t>(m_transfer.trxreg.rrw, 1u), h = std::max<uint32_t>(m_transfer.trxreg.rrh, 1u);
++        StampPagesUnlocked(b.dpsm, b.dbp, b.dbw, m_transfer.trxpos.dsax, m_transfer.trxpos.dsay,
++                           m_transfer.trxpos.dsax + w - 1u, m_transfer.trxpos.dsay + h - 1u);
++    }
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -2508,6 +2535,12 @@ void GSCpuBackend::PerformLocalToLocalTransfer()
+ {
+     if (!m_vram)
+         return;
++    {
++        const auto &b = m_transfer.bitbltbuf;
++        const uint32_t w = std::max<uint32_t>(m_transfer.trxreg.rrw, 1u), h = std::max<uint32_t>(m_transfer.trxreg.rrh, 1u);
++        StampPagesUnlocked(b.dpsm, b.dbp, b.dbw, m_transfer.trxpos.dsax, m_transfer.trxpos.dsay,
++                           m_transfer.trxpos.dsax + w - 1u, m_transfer.trxpos.dsay + h - 1u);
++    }
+ 
+     const uint32_t rrw = m_transfer.trxreg.rrw;
+     const uint32_t rrh = m_transfer.trxreg.rrh;
+@@ -2637,6 +2670,7 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+     const uint32_t x1 = std::max<uint32_t>(x0, context.scissor.x1);
+     const uint32_t y0 = context.scissor.y0;
+     const uint32_t y1 = std::max<uint32_t>(y0, context.scissor.y1);
++    StampPagesUnlocked(context.frame.psm, GSInternal::framePageBaseToBlock(context.frame.fbp), context.frame.fbw, x0, y0, x1, y1);
+     uint8_t r = static_cast<uint8_t>(rgba);
+     uint8_t g = static_cast<uint8_t>(rgba >> 8u);
+     uint8_t b = static_cast<uint8_t>(rgba >> 16u);

@@ -490,3 +490,7 @@
   chain calls them first and falls back to the compiled program when they decline (as PAL's vu1_chain).
   APE2_VU1_NATIVE=0 turns them off. VIF1+VU1 on the EE thread ~36% -> ~20%.
 - Title 39-42 fps, gameplay 20-33 fps; the scripted run clears Liberty Island ("Stage cleared").
+- 0039: VRAM page write epochs are stamped once per batch (its target pages), transfer rectangle, clear or
+  single write, instead of per pixel (VramPageOf with divisions in every pixel write). Gameplay 27-35 fps,
+  Travel Station 40-43. The EE thread is now ~1/3 game, ~2/3 GS front end + VIF1/VU1 + raster submit/waits:
+  next is running VIF1/VU1/GS on their own thread (as the PAL port's MTVU).
