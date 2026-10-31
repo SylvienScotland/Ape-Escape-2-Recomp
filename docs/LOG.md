@@ -483,3 +483,10 @@
   are exact for page-aligned textures (fewer false render-to-texture drains: 15.8k -> 4.2k per run).
   Title 33-40 fps. Gameplay 21-32 fps depending on the area; on the EE thread VIF1+VU1 is now the largest
   share (~36%), the game ~24%.
+
+## Speed: hand-written VU1 programs from the PAL port (0038)
+- Kernel/zz_ape2_vu1_native_pal.cpp: the PAL port's vu1_native.c (skinned models 0x60, stage strip kernel
+  0x40/0x2360, backface pass 0x50) on our compiled-VU state (same layout as its vu_impl.h); the compiled-program
+  chain calls them first and falls back to the compiled program when they decline (as PAL's vu1_chain).
+  APE2_VU1_NATIVE=0 turns them off. VIF1+VU1 on the EE thread ~36% -> ~20%.
+- Title 39-42 fps, gameplay 20-33 fps; the scripted run clears Liberty Island ("Stage cleared").
