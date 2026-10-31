@@ -1,0 +1,605 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 7c04317..400dfd9 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -5,7 +5,9 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <functional>
+ #include <memory>
++#include <unordered_map>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -71,11 +73,13 @@ private:
+         size_t tileCount = 0;
+         std::unique_ptr<std::atomic<uint8_t>[]> tileReady;
+         std::atomic<uint64_t> tilesDecoded{0};
++        mutable uint64_t queuedGen = ~0ull; // flush generation of the queue that last used it
++        GSDrawState decodeState{};          // TEX0/TEXA the texels are decoded with
+         DecodedTexture() = default;
+         DecodedTexture(DecodedTexture &&o) noexcept
+             : decodeEpoch(o.decodeEpoch), clutVersion(o.clutVersion), firstPage(o.firstPage), pageRows(o.pageRows),
+               pageCols(o.pageCols), pagesPerRow(o.pagesPerRow), clutPage(o.clutPage), indexed(o.indexed), w(o.w), h(o.h),
+-              texels(std::move(o.texels)), clut(o.clut), tilesW(o.tilesW), tileCount(o.tileCount), tileReady(std::move(o.tileReady))
++              texels(std::move(o.texels)), clut(o.clut), decodeState(o.decodeState), tilesW(o.tilesW), tileCount(o.tileCount), tileReady(std::move(o.tileReady))
+         {
+             key[0] = o.key[0];
+             key[1] = o.key[1];
+@@ -86,7 +90,7 @@ private:
+     bool TextureStillValid(const DecodedTexture &t) const;
+     static uint32_t VramPageOf(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+     std::array<std::atomic<uint64_t>, 512> m_pageEpoch{};
+-    uint64_t m_vramEpoch = 1;
++    std::atomic<uint64_t> m_vramEpoch{1};
+     uint32_t m_clutVersion = 1;
+     uint64_t m_clutHash = 0;
+     std::vector<DecodedTexture> m_textureCache;
+@@ -102,7 +106,38 @@ private:
+     };
+     std::vector<QueuedPrimitive> m_queue;
+     std::array<bool, 512> m_queuePages{};
+-    void FlushQueueUnlocked();
++    uint64_t m_queueTargetKey = ~0ull;
++    std::array<bool, 512> m_queueTexPages{};
++    uint64_t m_flushGen = 0;
++    uint32_t m_flushReason = 0;
++    void QueueTexture(const DecodedTexture *texture);
++    bool SettleQueuedTextures(uint32_t p0, uint32_t p1);
++    struct QueuedTextureUse
++    {
++        const DecodedTexture *texture;
++        GSDrawState state;
++    };
++    std::vector<QueuedTextureUse> m_queuedTextures;
++    struct TexKey
++    {
++        uint64_t a, b, c;
++        bool operator==(const TexKey &o) const { return a == o.a && b == o.b && c == o.c; }
++    };
++    struct TexKeyHash
++    {
++        size_t operator()(const TexKey &k) const { return static_cast<size_t>((k.a * 0x9E3779B97F4A7C15ull) ^ (k.b + 0x632BE59BD9B4E019ull) ^ (k.c << 7)); }
++    };
++    std::unordered_map<TexKey, size_t, TexKeyHash> m_textureIndex;
++    static constexpr size_t kMaxTextures = 1024u;
++    void FlushQueueUnlocked();   // starts drawing the queued batch (asynchronously, patch 0035)
++    void WaitInflightUnlocked(); // waits for the batch being drawn
++    void DrainUnlocked();        // both: VRAM is up to date afterwards
++    std::vector<QueuedPrimitive> m_inflight;
++    std::array<bool, 512> m_inflightPages{};
++    std::array<bool, 512> m_inflightTexPages{};
++    bool m_inflightBusy = false;
++    uint64_t m_inflightGen = ~0ull;
++    std::function<void(int)> m_inflightTask;
+     void DrawPrimitiveRaster(const GSPrimitiveBatch &batch, const DecodedTexture *texture);
+     uint64_t m_texStats[5] = {}; // hits, stale, decodes, stale by CLUT, texels decoded
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 8cacd28..db134db 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1,3 +1,7 @@
++#define NOMINMAX
++#include <windows.h>
++#include <dbghelp.h>
++#pragma comment(lib, "dbghelp.lib")
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_psmct16.h"
+@@ -576,9 +580,39 @@ namespace
+ 
+         [[nodiscard]] int threads() const noexcept { return static_cast<int>(m_workers.size()) + 1; }
+ 
++        [[nodiscard]] int workers() const noexcept { return static_cast<int>(m_workers.size()); }
++
++        // Starts fn(task) for task in [0, taskCount) on the workers only and returns at once (patch 0035).
++        void runAsync(int taskCount, const std::function<void(int)> &fn)
++        {
++            waitIdle();
++            {
++                std::lock_guard<std::mutex> lock(m_mutex);
++                m_job = &fn;
++                m_taskCount = taskCount;
++                m_nextTask.store(0, std::memory_order_relaxed);
++                m_activeWorkers = static_cast<int>(m_workers.size());
++                ++m_generation;
++                m_asyncBusy = true;
++            }
++            m_wake.notify_all();
++        }
++
++        // Waits until an asynchronous job has finished.
++        void waitIdle()
++        {
++            std::unique_lock<std::mutex> lock(m_mutex);
++            if (!m_asyncBusy)
++                return;
++            m_done.wait(lock, [this] { return m_activeWorkers == 0; });
++            m_job = nullptr;
++            m_asyncBusy = false;
++        }
++
+         // Runs fn(task) for task in [0, taskCount) on the workers plus the calling thread.
+         void run(int taskCount, const std::function<void(int)> &fn)
+         {
++            waitIdle();
+             {
+                 std::lock_guard<std::mutex> lock(m_mutex);
+                 m_job = &fn;
+@@ -661,6 +695,7 @@ namespace
+         int m_activeWorkers = 0;
+         uint64_t m_generation = 0;
+         bool m_stop = false;
++        bool m_asyncBusy = false;
+     };
+ 
+     constexpr int kRowsPerTask = 4;
+@@ -673,6 +708,8 @@ namespace
+         int k = 0, n = 1;
+     };
+     thread_local BandState t_band;
++    void vramPageSize(uint32_t psm, uint32_t &pw, uint32_t &ph);
++    uint32_t vramPagesPerRow(uint32_t psm, uint32_t bw);
+     constexpr int kBandShift = 3;
+     inline bool rowInBand(int y) { return t_band.n <= 1 || ((static_cast<unsigned>(y) >> kBandShift) % static_cast<unsigned>(t_band.n)) == static_cast<unsigned>(t_band.k); }
+ 
+@@ -732,9 +769,10 @@ void GSCpuBackend::ResetUnlocked()
+     m_clut.fill(0u);
+     m_clutCbp.fill(0u);
+     m_texturePageCache.Invalidate();
+-    FlushQueueUnlocked();
++    { m_flushReason = 9; DrainUnlocked(); }
+     m_textureCache.clear();
+-    m_textureCache.reserve(256);
++    m_textureCache.reserve(kMaxTextures); // queued primitives hold pointers into it: never reallocate
++    m_textureIndex.clear();
+     m_textureCacheNext = 0;
+     m_clutHash = 0;
+     m_curTexture = nullptr;
+@@ -770,19 +808,43 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+         return;
+     }
+     const GSDrawState &state = batch.state;
+-    const DecodedTexture *texture = state.prim.tme ? PrepareTexture(state) : nullptr;
+-    // sampling a page that a queued primitive renders to: draw those first
+-    if (texture && m_queue.size() > 0u)
++    if (state.prim.tme && (!m_queue.empty() || m_inflightBusy))
+     {
++        // sampling pages that queued or in-flight primitives render to: draw those first
++        const auto &tex = state.context.tex0;
++        uint32_t pw, ph;
++        vramPageSize(tex.psm, pw, ph);
++        const uint32_t first = (tex.tbp0 >> 5) & 511u, ppr = vramPagesPerRow(tex.psm, tex.tbw);
++        const uint32_t rows = (static_cast<uint32_t>(state.textureHeight) + ph - 1u) / ph + 1u;
++        const uint32_t cols = std::min(ppr, (static_cast<uint32_t>(state.textureWidth) + pw - 1u) / pw + 1u);
+         bool conflict = false;
+-        for (uint32_t r = 0; r < texture->pageRows && !conflict; ++r)
+-            for (uint32_t c = 0; c < texture->pageCols && !conflict; ++c)
+-                conflict = m_queuePages[(texture->firstPage + r * texture->pagesPerRow + c) & 511u];
++        for (uint32_t r = 0; r < rows && !conflict; ++r)
++            for (uint32_t c = 0; c < cols && !conflict; ++c)
++            {
++                const uint32_t pg = (first + r * ppr + c) & 511u;
++                conflict = m_queuePages[pg] || m_inflightPages[pg];
++            }
+         if (conflict)
+-            FlushQueueUnlocked();
++            { m_flushReason = 1; DrainUnlocked(); }
+     }
+-    // pages this primitive may write: its frame and z buffers (whole buffers, conservative)
++    const DecodedTexture *texture = state.prim.tme ? PrepareTexture(state) : nullptr;
++    // pages this primitive may write: its frame and z buffers (whole buffers, conservative); the same buffers
++    // as the previous primitive are already marked
+     const auto &ctx = state.context;
++    const uint64_t targetKey = (static_cast<uint64_t>(ctx.frame.fbp) << 0) ^ (static_cast<uint64_t>(ctx.frame.fbw) << 12) ^
++                               (static_cast<uint64_t>(ctx.frame.psm) << 20) ^ (static_cast<uint64_t>(ctx.zbuf.zbp) << 26) ^
++                               (static_cast<uint64_t>(ctx.zbuf.psm) << 38) ^ (static_cast<uint64_t>(ctx.zbuf.zmask ? 1u : 0u) << 44) ^
++                               (static_cast<uint64_t>(static_cast<uint32_t>(ctx.scissor.x1)) << 45) ^
++                               (static_cast<uint64_t>(static_cast<uint32_t>(ctx.scissor.y1)) << 52);
++    if (!m_queue.empty() && targetKey == m_queueTargetKey)
++    {
++        QueueTexture(texture);
++        m_queue.push_back(QueuedPrimitive{batch, texture});
++        if (m_queue.size() >= 4096u)
++            { m_flushReason = 10; FlushQueueUnlocked(); }
++        return;
++    }
++    m_queueTargetKey = targetKey;
+     const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
+     const uint32_t height = static_cast<uint32_t>(std::max(ctx.scissor.y1 + 1, 1));
+     const uint32_t width = static_cast<uint32_t>(std::max(ctx.scissor.x1 + 1, 1));
+@@ -799,29 +861,122 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+         for (uint32_t pg = zp0; pg != ((zp1 + 1u) & 511u); pg = (pg + 1u) & 511u)
+             m_queuePages[pg] = true;
+     }
++    QueueTexture(texture);
+     m_queue.push_back(QueuedPrimitive{batch, texture});
+     if (m_queue.size() >= 4096u)
+-        FlushQueueUnlocked();
++        { m_flushReason = 2; FlushQueueUnlocked(); }
++}
++
++void GSCpuBackend::QueueTexture(const DecodedTexture *texture)
++{
++    if (!texture || texture->queuedGen == m_flushGen)
++        return;
++    texture->queuedGen = m_flushGen;
++    m_queuedTextures.push_back({texture, texture->decodeState});
++    for (uint32_t r = 0; r < texture->pageRows; ++r)
++        for (uint32_t c = 0; c < texture->pageCols; ++c)
++            m_queueTexPages[(texture->firstPage + r * texture->pagesPerRow + c) & 511u] = true;
+ }
+ 
+ void GSCpuBackend::FlushQueueUnlocked()
+ {
+     if (m_queue.empty())
+         return;
++    {
++        // APE2_GS_FLUSHSTATS=1: why the queue is drawn, and how big batches are
++        static const bool stats = std::getenv("APE2_GS_FLUSHSTATS") != nullptr;
++        if (stats)
++        {
++            static uint64_t reasons[16] = {}, prims = 0, flushes = 0;
++            ++reasons[m_flushReason & 15u];
++            if (m_flushReason == 0u)
++            {
++                static int shown = 0;
++                if (shown < 3)
++                {
++                    ++shown;
++                    void *frames[12] = {};
++                    const USHORT got = RtlCaptureStackBackTrace(0, 12, frames, nullptr);
++                    static bool symInit = false;
++                    if (!symInit)
++                    {
++                        symInit = true;
++                        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
++                        SymInitialize(GetCurrentProcess(), nullptr, TRUE);
++                    }
++                    for (USHORT f = 0; f < got; ++f)
++                    {
++                        alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256] = {};
++                        auto *sym = reinterpret_cast<SYMBOL_INFO *>(buf);
++                        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
++                        sym->MaxNameLen = 255;
++                        DWORD64 disp = 0;
++                        if (SymFromAddr(GetCurrentProcess(), reinterpret_cast<DWORD64>(frames[f]), &disp, sym))
++                            std::fprintf(stderr, "[gs:flush] reason0 #%d frame %d: %s+0x%llx\n", shown, f, sym->Name, static_cast<unsigned long long>(disp));
++                    }
++                }
++            }
++            prims += m_queue.size();
++            if ((++flushes & 0x3FFFu) == 0u)
++            {
++                std::fprintf(stderr, "[gs:flush] %llu flushes, %.1f prims each; reasons:", static_cast<unsigned long long>(flushes),
++                             static_cast<double>(prims) / static_cast<double>(flushes));
++                for (int i = 0; i < 16; ++i)
++                    if (reasons[i])
++                        std::fprintf(stderr, " %d=%llu", i, static_cast<unsigned long long>(reasons[i]));
++                std::fprintf(stderr, "\n");
++            }
++        }
++        m_flushReason = 0;
++    }
++    // the previous batch must be done before this one starts (same rows, in order)
++    WaitInflightUnlocked();
+     RasterPool &pool = RasterPool::instance();
+-    const int n = pool.threads();
+-    const std::function<void(int)> task = [&](int k)
++    m_inflight.swap(m_queue);
++    m_queue.clear();
++    m_inflightPages = m_queuePages;
++    m_inflightTexPages = m_queueTexPages;
++    m_queuePages.fill(false);
++    m_queueTexPages.fill(false);
++    m_queuedTextures.clear();
++    m_inflightGen = m_flushGen;
++    ++m_flushGen;
++    m_inflightBusy = true;
++    const int n = std::max(1, pool.workers());
++    m_inflightTask = [this, n](int k)
+     {
+         t_band.k = k;
+         t_band.n = n;
+-        for (const QueuedPrimitive &q : m_queue)
++        for (const QueuedPrimitive &q : m_inflight)
+             DrawPrimitiveRaster(q.batch, q.texture);
+         t_band = BandState{};
+         t_curTexture = nullptr;
+     };
+-    pool.run(n, task);
+-    m_queue.clear();
+-    m_queuePages.fill(false);
++    if (pool.workers() == 0)
++    {
++        m_inflightTask(0);
++        m_inflightBusy = false;
++        m_inflight.clear();
++        return;
++    }
++    pool.runAsync(n, m_inflightTask);
++}
++
++void GSCpuBackend::WaitInflightUnlocked()
++{
++    if (!m_inflightBusy)
++        return;
++    RasterPool::instance().waitIdle();
++    m_inflightBusy = false;
++    m_inflight.clear();
++    m_inflightPages.fill(false);
++    m_inflightTexPages.fill(false);
++}
++
++void GSCpuBackend::DrainUnlocked()
++{
++    FlushQueueUnlocked();
++    WaitInflightUnlocked();
+ }
+ 
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+@@ -829,12 +984,12 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+-    if (tex0.cld != 0u && m_queue.size() > 0u)
++    if (tex0.cld != 0u && (!m_queue.empty() || m_inflightBusy))
+     {
+-        // the CLUT is read from VRAM: queued draws to its page come first
+-        const uint32_t cp = VramPageOf(tex0.cpsm, tex0.cbp, 1u, 0u, 0u);
+-        if (m_queuePages[cp] || m_queuePages[(cp + 1u) & 511u])
+-            FlushQueueUnlocked();
++        // the CLUT is read from VRAM: queued or in-flight draws to its page come first
++        const uint32_t cp = VramPageOf(tex0.cpsm, tex0.cbp, 1u, 0u, 0u), cq = (cp + 1u) & 511u;
++        if (m_queuePages[cp] || m_queuePages[cq] || m_inflightPages[cp] || m_inflightPages[cq])
++            { m_flushReason = 6; DrainUnlocked(); }
+     }
+ 
+     switch (tex0.cld)
+@@ -945,7 +1100,6 @@ void GSCpuBackend::Flush()
+ void GSCpuBackend::TextureFlush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushQueueUnlocked();
+     m_texturePageCache.Invalidate();
+ }
+ 
+@@ -958,7 +1112,7 @@ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
+ {
+     {
+         std::lock_guard<std::mutex> lock(m_mutex);
+-        const_cast<GSCpuBackend *>(this)->FlushQueueUnlocked();
++        { const_cast<GSCpuBackend *>(this)->m_flushReason = 11; const_cast<GSCpuBackend *>(this)->DrainUnlocked(); }
+     }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     return ReadVramUnlocked(psm, base, bw, x, y);
+@@ -983,7 +1137,7 @@ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t
+ {
+     {
+         std::lock_guard<std::mutex> lock(m_mutex);
+-        FlushQueueUnlocked();
++        { m_flushReason = 12; DrainUnlocked(); }
+     }
+     std::lock_guard<std::mutex> lock(m_mutex);
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+@@ -1000,7 +1154,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    const_cast<GSCpuBackend *>(this)->FlushQueueUnlocked();
++    { const_cast<GSCpuBackend *>(this)->m_flushReason = 13; const_cast<GSCpuBackend *>(this)->DrainUnlocked(); }
+     if (!m_vram || m_vramSize == 0u)
+     {
+         out.clear();
+@@ -1473,6 +1627,46 @@ uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int u, int v, const
+     return 0xFFFF00FFu;
+ }
+ 
++// Decodes every tile of the queued textures that cover VRAM pages [p0, p1], so a write to those pages can go
++// ahead without drawing the queue first. False when it cannot (a queued primitive draws into the pages).
++bool GSCpuBackend::SettleQueuedTextures(uint32_t p0, uint32_t p1)
++{
++    for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
++    {
++        if (m_queuePages[pg] || m_inflightPages[pg] || m_inflightTexPages[pg])
++            return false;
++        if (pg == ((p1 + 1u) & 511u))
++            break;
++    }
++    for (const QueuedTextureUse &use : m_queuedTextures)
++    {
++        DecodedTexture &t = const_cast<DecodedTexture &>(*use.texture);
++        bool overlaps = false;
++        for (uint32_t r = 0; r < t.pageRows && !overlaps; ++r)
++            for (uint32_t c = 0; c < t.pageCols && !overlaps; ++c)
++            {
++                const uint32_t pg = (t.firstPage + r * t.pagesPerRow + c) & 511u;
++                overlaps = ((pg - p0) & 511u) <= ((p1 + 1u - p0) & 511u);
++            }
++        if (!overlaps)
++            continue;
++        const size_t tiles = t.tileCount;
++        for (size_t i = 0; i < tiles; ++i)
++        {
++            if (t.tileReady[i].load(std::memory_order_relaxed))
++                continue;
++            const int u0 = static_cast<int>(i % static_cast<size_t>(t.tilesW)) * 8, v0 = static_cast<int>(i / static_cast<size_t>(t.tilesW)) * 8;
++            const int u1 = std::min(u0 + 8, t.w), v1 = std::min(v0 + 8, t.h);
++            for (int vv = v0; vv < v1; ++vv)
++                for (int uu = u0; uu < u1; ++uu)
++                    t.texels[static_cast<size_t>(vv) * static_cast<size_t>(t.w) + static_cast<size_t>(uu)] =
++                        DecodeTexel(use.state, uu, vv, t.clut.data());
++            t.tileReady[i].store(1u, std::memory_order_relaxed);
++        }
++    }
++    return true;
++}
++
+ bool GSCpuBackend::TextureStillValid(const DecodedTexture &t) const
+ {
+     for (uint32_t r = 0; r < t.pageRows; ++r)
+@@ -1520,26 +1714,28 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTexture(const GSDrawSta
+     key[2] = static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
+              (static_cast<uint64_t>(state.texa.aem ? 1u : 0u) << 16);
+ 
+-    constexpr size_t kMaxTextures = 256u;
+     size_t slot = SIZE_MAX;
+-    for (size_t i = 0; i < m_textureCache.size(); ++i)
+     {
+-        DecodedTexture &t = m_textureCache[i];
+-        if (t.key[0] == key[0] && t.key[1] == key[1] && t.key[2] == key[2])
++        const auto found = m_textureIndex.find(TexKey{key[0], key[1], key[2]});
++        if (found != m_textureIndex.end())
+         {
++            DecodedTexture &t = m_textureCache[found->second];
+             if (TextureStillValid(t))
+             {
+                 ++m_texStats[0];
+                 return &t;
+             }
+             ++m_texStats[1];
+-            if (t.indexed && t.clutVersion != m_clutVersion)
+-                ++m_texStats[3];
+-            slot = i; // stale: decode again in place
+-            break;
++            if (t.queuedGen != m_flushGen && !(m_inflightBusy && t.queuedGen == m_inflightGen))
++                slot = found->second; // stale and not used by the queued or in-flight batch: decode again in place
++            else
++            {
++                // stale but still sampled by queued primitives: they keep this copy; decode into another slot
++                m_textureIndex.erase(found);
++                t.key[0] = ~0ull;
++            }
+         }
+     }
+-    FlushQueueUnlocked(); // queued primitives may still sample the slot that is about to change
+     if (slot == SIZE_MAX)
+     {
+         if (m_textureCache.size() < kMaxTextures)
+@@ -1549,10 +1745,30 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTexture(const GSDrawSta
+         }
+         else
+         {
+-            slot = m_textureCacheNext;
+-            m_textureCacheNext = (m_textureCacheNext + 1u) % kMaxTextures;
++            // evict round-robin, skipping textures the queued batch samples
++            for (size_t tries = 0; tries < kMaxTextures; ++tries)
++            {
++                const size_t candidate = m_textureCacheNext;
++                m_textureCacheNext = (m_textureCacheNext + 1u) % kMaxTextures;
++                const uint64_t g = m_textureCache[candidate].queuedGen;
++                if (g != m_flushGen && !(m_inflightBusy && g == m_inflightGen))
++                {
++                    slot = candidate;
++                    break;
++                }
++            }
++            if (slot == SIZE_MAX)
++            {
++                { m_flushReason = 5; DrainUnlocked(); }
++                slot = m_textureCacheNext;
++                m_textureCacheNext = (m_textureCacheNext + 1u) % kMaxTextures;
++            }
+         }
++        DecodedTexture &old = m_textureCache[slot];
++        if (old.w != 0 && old.key[0] != ~0ull)
++            m_textureIndex.erase(TexKey{old.key[0], old.key[1], old.key[2]});
+     }
++    m_textureIndex[TexKey{key[0], key[1], key[2]}] = slot;
+     ++m_texStats[2];
+     m_texStats[4] += static_cast<uint64_t>(w) * static_cast<uint64_t>(h);
+     {
+@@ -1573,6 +1789,7 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTexture(const GSDrawSta
+     t.h = h;
+     t.texels.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+     t.clut = m_clut;
++    t.decodeState = state;
+     t.tilesW = (w + 7) / 8;
+     const size_t tiles = static_cast<size_t>(t.tilesW) * static_cast<size_t>((h + 7) / 8);
+     if (t.tileCount != tiles)
+@@ -2069,7 +2286,38 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushQueueUnlocked();
++    if (!m_queue.empty() || m_inflightBusy)
++    {
++        const auto &b = command.bitbltbuf;
++        const uint32_t w = std::max<uint32_t>(command.trxreg.rrw, 1u), h = std::max<uint32_t>(command.trxreg.rrh, 1u);
++        bool conflict = false;
++        auto check = [&](uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y, bool written)
++        {
++            const uint32_t p0 = VramPageOf(psm, bp, bw, x, y);
++            const uint32_t p1 = VramPageOf(psm, bp, bw, x + w - 1u, y + h - 1u);
++            bool sampled = false;
++            for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
++            {
++                if (m_queuePages[pg] || m_inflightPages[pg] || (written && m_inflightTexPages[pg]))
++                    conflict = true; // a page being drawn (or sampled by the batch in flight)
++                if (written && m_queueTexPages[pg])
++                    sampled = true;
++                if (pg == ((p1 + 1u) & 511u) || conflict)
++                    break;
++            }
++            // a write to pages queued primitives only sample: decode those textures now
++            if (!conflict && sampled && !SettleQueuedTextures(p0, p1))
++                conflict = true;
++        };
++        if (command.direction == 0u || command.direction == 2u)
++            check(b.dpsm, b.dbp, b.dbw, command.trxpos.dsax, command.trxpos.dsay, true);
++        if (command.direction == 1u || command.direction == 2u)
++            check(b.spsm, b.sbp, b.sbw, command.trxpos.ssax, command.trxpos.ssay, false);
++        if (command.direction > 2u)
++            conflict = true;
++        if (conflict)
++            { m_flushReason = 3; DrainUnlocked(); }
++    }
+     if (gsTraceEnabled())
+     {
+         const auto &b = command.bitbltbuf;
+@@ -2097,7 +2345,23 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushQueueUnlocked();
++    if (!m_queue.empty() || m_inflightBusy)
++    {
++        const auto &b = m_transfer.bitbltbuf;
++        const uint32_t w = std::max<uint32_t>(m_transfer.trxreg.rrw, 1u), h = std::max<uint32_t>(m_transfer.trxreg.rrh, 1u);
++        const uint32_t p0 = VramPageOf(b.dpsm, b.dbp, b.dbw, m_transfer.trxpos.dsax, m_transfer.trxpos.dsay);
++        const uint32_t p1 = VramPageOf(b.dpsm, b.dbp, b.dbw, m_transfer.trxpos.dsax + w - 1u, m_transfer.trxpos.dsay + h - 1u);
++        bool sampled = false, drawn = false;
++        for (uint32_t pg = p0;; pg = (pg + 1u) & 511u)
++        {
++            drawn = drawn || m_queuePages[pg] || m_inflightPages[pg] || m_inflightTexPages[pg];
++            sampled = sampled || m_queueTexPages[pg];
++            if (pg == ((p1 + 1u) & 511u))
++                break;
++        }
++        if (drawn || (sampled && !SettleQueuedTextures(p0, p1)))
++            { m_flushReason = 4; DrainUnlocked(); }
++    }
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -2314,8 +2578,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+ 
+ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+-    std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushQueueUnlocked();
++    std::lock_guard<std::mutex> lock(m_mutex); // reads the buffer filled at BeginTransfer (no VRAM access)
+     if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
+         return 0u;
+     const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
+@@ -2328,7 +2591,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushQueueUnlocked();
++    { m_flushReason = 7; DrainUnlocked(); }
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+ 

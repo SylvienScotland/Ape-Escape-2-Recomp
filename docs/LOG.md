@@ -462,3 +462,16 @@
   readback, clears, presentation) and when a primitive samples a page a queued primitive renders to.
   Decoded textures carry their own palette copy. Pool default up to 16 threads; APE2_GS_BANDS=0 = old path.
 - Title 13 -> 25-34 fps, gameplay 8 -> 15 fps; the GS thread is no longer the limit in gameplay (19%).
+
+## Speed: fewer, asynchronous raster batches (0035)
+- Batches were drawn after almost every primitive (APE2_GS_FLUSHSTATS=1: why and how big): TEXFLUSH writes,
+  texture-cache slot reuse, and texture uploads into pages the queue samples (the game streams textures through
+  the same VRAM). Now: TEXFLUSH does not draw the queue (page epochs keep textures coherent); a stale or evicted
+  texture still used by the queue keeps its data and the new decode takes another slot (1024 slots, hash index);
+  an upload into pages queued primitives only sample decodes those textures first instead of drawing the queue.
+  ~2500 primitives per batch instead of 1.
+- Batches are drawn asynchronously: the raster workers draw batch N while the EE thread queues batch N+1; it
+  waits only on a real conflict (render-to-texture, uploads/transfers/CLUT loads touching pages in use, readback,
+  presentation). The scripted run now gets much further into Liberty Island in the same time (catches George
+  and Cruiser); gameplay 15-25 fps.
+- Next: the EE thread still runs VIF1 + VU1 (~25%), the GS front end (~40%) and the game (~20%) in series.
