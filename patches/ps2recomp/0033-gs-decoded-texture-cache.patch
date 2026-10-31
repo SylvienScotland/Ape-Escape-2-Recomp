@@ -1,0 +1,339 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..68e4198 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,6 +4,8 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <atomic>
++#include <memory>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -47,6 +49,48 @@ private:
+     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
++    uint32_t DecodeTexel(const GSDrawState &state, int u, int v);
++
++    // Decoded-texture cache (Ape Escape 2 recomp patch 0033): each texture is converted once (format, TEXA,
++    // CLUT) to linear RGBA and sampled with one array read, until a VRAM page it covers (or its CLUT) is
++    // written again. VRAM writes stamp their 8 KB page with the current write epoch.
++    struct DecodedTexture
++    {
++        uint64_t key[3] = {};
++        uint64_t decodeEpoch = 0;
++        uint32_t clutVersion = 0;
++        uint32_t firstPage = 0, pageRows = 0, pageCols = 0, pagesPerRow = 0;
++        uint32_t clutPage = 0;
++        bool indexed = false;
++        int w = 0, h = 0;
++        std::vector<uint32_t> texels;
++        // lazily decoded 8x8 tiles
++        int tilesW = 0;
++        size_t tileCount = 0;
++        std::unique_ptr<std::atomic<uint8_t>[]> tileReady;
++        std::atomic<uint64_t> tilesDecoded{0};
++        DecodedTexture() = default;
++        DecodedTexture(DecodedTexture &&o) noexcept
++            : decodeEpoch(o.decodeEpoch), clutVersion(o.clutVersion), firstPage(o.firstPage), pageRows(o.pageRows),
++              pageCols(o.pageCols), pagesPerRow(o.pagesPerRow), clutPage(o.clutPage), indexed(o.indexed), w(o.w), h(o.h),
++              texels(std::move(o.texels)), tilesW(o.tilesW), tileCount(o.tileCount), tileReady(std::move(o.tileReady))
++        {
++            key[0] = o.key[0];
++            key[1] = o.key[1];
++            key[2] = o.key[2];
++        }
++    };
++    const DecodedTexture *PrepareTexture(const GSDrawState &state);
++    bool TextureStillValid(const DecodedTexture &t) const;
++    static uint32_t VramPageOf(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
++    std::array<std::atomic<uint64_t>, 512> m_pageEpoch{};
++    uint64_t m_vramEpoch = 1;
++    uint32_t m_clutVersion = 1;
++    uint64_t m_clutHash = 0;
++    std::vector<DecodedTexture> m_textureCache;
++    size_t m_textureCacheNext = 0;
++    const DecodedTexture *m_curTexture = nullptr;
++    uint64_t m_texStats[5] = {}; // hits, stale, decodes, stale by CLUT, texels decoded
+ 
+     void PerformLocalToLocalTransfer();
+     void PerformLocalToHostTransfer();
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 1b73272..ced6517 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -715,6 +715,16 @@ void GSCpuBackend::ResetUnlocked()
+     m_clut.fill(0u);
+     m_clutCbp.fill(0u);
+     m_texturePageCache.Invalidate();
++    m_textureCache.clear();
++    m_textureCache.reserve(256);
++    m_textureCacheNext = 0;
++    m_clutHash = 0;
++    m_curTexture = nullptr;
++    ++m_vramEpoch;
++    for (auto &e : m_pageEpoch)
++        e.store(m_vramEpoch, std::memory_order_relaxed);
++    ++m_vramEpoch;
++    ++m_clutVersion;
+     m_transfer = {};
+     m_transfer.direction = 3u;
+     m_transferState = {};
+@@ -776,6 +786,21 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ 
+ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
++    // the decoded-texture cache only needs a new version when the CLUT contents change
++    struct ClutVersionBump
++    {
++        GSCpuBackend &b;
++        std::array<uint16_t, 512> before;
++        explicit ClutVersionBump(GSCpuBackend &backend) : b(backend), before(backend.m_clut) {}
++        ~ClutVersionBump()
++        {
++            if (before != b.m_clut)
++            {
++                ++b.m_clutVersion;
++                b.m_clutHash = 0u; // recomputed on first use
++            }
++        }
++    } clutVersionBump(*this);
+     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
+     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+@@ -870,6 +895,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+     if (!m_vram)
+         return;
+     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
++    m_pageEpoch[VramPageOf(psm, base, bw, x, y)].store(m_vramEpoch, std::memory_order_relaxed);
+ }
+ 
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+@@ -1029,6 +1055,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+         }
+     });
+ 
++    m_curTexture = state.prim.tme ? PrepareTexture(state) : nullptr;
+     switch (state.prim.type)
+     {
+     case GS_PRIM_SPRITE:
+@@ -1272,6 +1299,187 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+     return 0xFFFF00FFu;
+ }
+ 
++namespace
++{
++    // PS2 VRAM page (8 KB) size in pixels for a storage format
++    void vramPageSize(uint32_t psm, uint32_t &pw, uint32_t &ph)
++    {
++        pw = 64u;
++        ph = 32u; // 32-bit layouts (CT32/24, Z32/24, and T8H/T4HL/T4HH stored in them)
++        if (psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S)
++            ph = 64u;
++        else if (psm == GS_PSM_T8)
++        {
++            pw = 128u;
++            ph = 64u;
++        }
++        else if (psm == GS_PSM_T4)
++        {
++            pw = 128u;
++            ph = 128u;
++        }
++    }
++    uint32_t vramPagesPerRow(uint32_t psm, uint32_t bw)
++    {
++        uint32_t pw, ph;
++        vramPageSize(psm, pw, ph);
++        return std::max(1u, ((bw ? bw : 1u) * 64u + pw - 1u) / pw);
++    }
++}
++
++uint32_t GSCpuBackend::VramPageOf(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
++{
++    uint32_t pw, ph;
++    vramPageSize(psm, pw, ph);
++    return ((base >> 5) + (y / ph) * vramPagesPerRow(psm, bw) + (x / pw)) & 511u;
++}
++
++uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int u, int v)
++{
++    const auto &tex = state.context.tex0;
++    const u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++    switch (tex.psm)
++    {
++    case GS_PSM_CT32:
++    case GS_PSM_Z32:
++    case GS_PSM_CT24:
++    case GS_PSM_Z24:
++        return applyTexa(state.texa, tex.psm, out);
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S:
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S:
++        return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
++    case GS_PSM_T8:
++    case GS_PSM_T8H:
++    case GS_PSM_T4:
++    case GS_PSM_T4HL:
++    case GS_PSM_T4HH:
++        return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
++    }
++    return 0xFFFF00FFu;
++}
++
++bool GSCpuBackend::TextureStillValid(const DecodedTexture &t) const
++{
++    for (uint32_t r = 0; r < t.pageRows; ++r)
++        for (uint32_t c = 0; c < t.pageCols; ++c)
++            if (m_pageEpoch[(t.firstPage + r * t.pagesPerRow + c) & 511u].load(std::memory_order_relaxed) >= t.decodeEpoch)
++                return false;
++    return true;
++}
++
++const GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTexture(const GSDrawState &state)
++{
++    // APE2_GS_TEXCACHE=0 samples VRAM directly (as before)
++    static const bool disabled = [] { const char *e = std::getenv("APE2_GS_TEXCACHE"); return e && e[0] == '0'; }();
++    if (disabled || !m_vram)
++        return nullptr;
++    const auto &tex = state.context.tex0;
++    const int w = state.textureWidth, h = state.textureHeight;
++    if (w <= 0 || h <= 0 || w > 1024 || h > 1024)
++        return nullptr;
++    const bool indexed = tex.psm == GS_PSM_T8 || tex.psm == GS_PSM_T8H || tex.psm == GS_PSM_T4 || tex.psm == GS_PSM_T4HL ||
++                         tex.psm == GS_PSM_T4HH;
++    uint64_t key[3];
++    key[0] = static_cast<uint64_t>(tex.tbp0) | (static_cast<uint64_t>(tex.tbw) << 16) | (static_cast<uint64_t>(tex.psm) << 24) |
++             (static_cast<uint64_t>(w) << 32) | (static_cast<uint64_t>(h) << 48);
++    key[1] = 0u;
++    if (indexed)
++    {
++        // the palette contents are part of the key: the game switches palettes on the same texture
++        if (m_clutHash == 0u)
++        {
++            uint64_t h = 1469598103934665603ull;
++            const uint8_t *bytes = reinterpret_cast<const uint8_t *>(m_clut.data());
++            for (size_t i = 0; i < sizeof(m_clut); i += 8)
++            {
++                uint64_t w;
++                std::memcpy(&w, bytes + i, 8);
++                h = (h ^ w) * 1099511628211ull;
++                h ^= h >> 29;
++            }
++            m_clutHash = h | 1u;
++        }
++        key[1] = (m_clutHash ^ (static_cast<uint64_t>(tex.cpsm) | (static_cast<uint64_t>(tex.csm) << 8) |
++                                (static_cast<uint64_t>(tex.csa) << 16))) * 1099511628211ull;
++    }
++    key[2] = static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
++             (static_cast<uint64_t>(state.texa.aem ? 1u : 0u) << 16);
++
++    constexpr size_t kMaxTextures = 256u;
++    size_t slot = SIZE_MAX;
++    for (size_t i = 0; i < m_textureCache.size(); ++i)
++    {
++        DecodedTexture &t = m_textureCache[i];
++        if (t.key[0] == key[0] && t.key[1] == key[1] && t.key[2] == key[2])
++        {
++            if (TextureStillValid(t))
++            {
++                ++m_texStats[0];
++                return &t;
++            }
++            ++m_texStats[1];
++            if (t.indexed && t.clutVersion != m_clutVersion)
++                ++m_texStats[3];
++            slot = i; // stale: decode again in place
++            break;
++        }
++    }
++    if (slot == SIZE_MAX)
++    {
++        if (m_textureCache.size() < kMaxTextures)
++        {
++            m_textureCache.emplace_back();
++            slot = m_textureCache.size() - 1u;
++        }
++        else
++        {
++            slot = m_textureCacheNext;
++            m_textureCacheNext = (m_textureCacheNext + 1u) % kMaxTextures;
++        }
++    }
++    ++m_texStats[2];
++    m_texStats[4] += static_cast<uint64_t>(w) * static_cast<uint64_t>(h);
++    {
++        static const bool stats = std::getenv("APE2_GS_TEXSTATS") != nullptr;
++        if (stats && (m_texStats[2] & 0x3FFu) == 0u)
++            std::fprintf(stderr, "[gs:texcache] hits %llu stale %llu (clut %llu) decodes %llu texels decoded %llu\n",
++                         static_cast<unsigned long long>(m_texStats[0]), static_cast<unsigned long long>(m_texStats[1]),
++                         static_cast<unsigned long long>(m_texStats[3]), static_cast<unsigned long long>(m_texStats[2]),
++                         static_cast<unsigned long long>(m_texStats[4]));
++    }
++    DecodedTexture &t = m_textureCache[slot];
++    t.key[0] = key[0];
++    t.key[1] = key[1];
++    t.key[2] = key[2];
++    t.indexed = indexed;
++    t.clutVersion = m_clutVersion;
++    t.w = w;
++    t.h = h;
++    t.texels.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
++    t.tilesW = (w + 7) / 8;
++    const size_t tiles = static_cast<size_t>(t.tilesW) * static_cast<size_t>((h + 7) / 8);
++    if (t.tileCount != tiles)
++    {
++        t.tileReady.reset(new std::atomic<uint8_t>[tiles]);
++        t.tileCount = tiles;
++    }
++    for (size_t i = 0; i < tiles; ++i)
++        t.tileReady[i].store(0u, std::memory_order_relaxed);
++
++    // VRAM pages the texture covers; one extra row and column for a base that is not page-aligned
++    uint32_t pw, ph;
++    vramPageSize(tex.psm, pw, ph);
++    t.firstPage = (tex.tbp0 >> 5) & 511u;
++    t.pagesPerRow = vramPagesPerRow(tex.psm, tex.tbw);
++    t.pageRows = (static_cast<uint32_t>(h) + ph - 1u) / ph + 1u;
++    t.pageCols = std::min(t.pagesPerRow, (static_cast<uint32_t>(w) + pw - 1u) / pw + 1u);
++    t.decodeEpoch = m_vramEpoch;
++    ++m_vramEpoch; // writes from here on (this draw included) are newer than the decode
++    return &t;
++}
++
+ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
+ {
+     const auto &ctx = state.context;
+@@ -1300,10 +1508,29 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+         texVf = t * invQ * static_cast<float>(texH);
+     }
+ 
++    const DecodedTexture *decoded = m_curTexture;
+     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+     {
+         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
+         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
++        if (decoded && static_cast<unsigned>(sampleU) < static_cast<unsigned>(decoded->w) &&
++            static_cast<unsigned>(sampleV) < static_cast<unsigned>(decoded->h))
++        {
++            const size_t tile = static_cast<size_t>(sampleV >> 3) * static_cast<size_t>(decoded->tilesW) + static_cast<size_t>(sampleU >> 3);
++            if (!decoded->tileReady[tile].load(std::memory_order_acquire))
++            {
++                // decode this 8x8 tile (raster threads may race here; they write the same values)
++                DecodedTexture &d = const_cast<DecodedTexture &>(*decoded);
++                const int u0 = sampleU & ~7, v0 = sampleV & ~7;
++                const int u1 = std::min(u0 + 8, d.w), v1 = std::min(v0 + 8, d.h);
++                for (int vv = v0; vv < v1; ++vv)
++                    for (int uu = u0; uu < u1; ++uu)
++                        d.texels[static_cast<size_t>(vv) * static_cast<size_t>(d.w) + static_cast<size_t>(uu)] = DecodeTexel(state, uu, vv);
++                d.tileReady[tile].store(1u, std::memory_order_release);
++                d.tilesDecoded.fetch_add(1u, std::memory_order_relaxed);
++            }
++            return decoded->texels[static_cast<size_t>(sampleV) * static_cast<size_t>(decoded->w) + static_cast<size_t>(sampleU)];
++        }
+ 
+         u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+ 

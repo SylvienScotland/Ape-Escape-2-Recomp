@@ -443,3 +443,13 @@
   (the game seeds it from EE timer 2, which our runtime left stopped at 0), so every point was the box's corner;
   the old swapped VCLIP bits had let that corner pass. Timers 2 and 3 now start free-running (mode 0x82) as the
   PS2 kernel leaves them, like the PAL port's rt_hw.c. Debug aid: APE2_BOXLOG=<n>[, APE2_BOXSKIP=<n>].
+
+## Speed: decoded-texture cache in the CPU rasterizer (0033)
+- Texture sampling (swizzled VRAM read, CLUT lookup, format conversion per texel) was ~45% of the frame.
+  Textures are now decoded once into linear RGBA, lazily in 8x8 tiles, keyed by TEX0/TEXA and a hash of
+  the palette contents (the game switches palettes on the same texture), and kept until a VRAM page they
+  cover is written (per-page write epochs stamped in WriteVramUnlocked). APE2_GS_TEXCACHE=0 turns it off;
+  APE2_GS_TEXSTATS=1 prints hits/stale/decodes.
+- Title 10 -> 13-19 fps; gameplay in Liberty Island ~8 fps (now reached in the scripted run: Spike, HUD,
+  pause menu). A/B frames with the cache on/off show the same pictures.
+- Remaining cost: per-pixel combine/blend/raster loop (combineTexture, DrawTriangle row lambda, WritePixel).
