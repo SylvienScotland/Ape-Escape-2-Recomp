@@ -494,3 +494,10 @@
   single write, instead of per pixel (VramPageOf with divisions in every pixel write). Gameplay 27-35 fps,
   Travel Station 40-43. The EE thread is now ~1/3 game, ~2/3 GS front end + VIF1/VU1 + raster submit/waits:
   next is running VIF1/VU1/GS on their own thread (as the PAL port's MTVU).
+
+## Saving (0040)
+- Saving left a 0-byte BASLUS-20685/BASLUS-20685 and the save menu hung. Log (every memory card command is now
+  printed): mkdir ok, open -> fd 5, then the game wrote to fd 0 (-4). The game's card worker takes the fd from
+  sceMcSync, and our libmc kept one "last command" result: the game's GetInfo poller ran a command between the
+  save's open and its sync and replaced the result with its own 0. libmc runs one command at a time; a command
+  issued while another awaits sceMcSync is now refused (-1), so the poller retries later.
