@@ -421,3 +421,20 @@
 - Title: the kid and monkeys are drawn ~72 units below the camera target (bone matrices in view space,
   back-projected with the logged camera), i.e. under the hill; the grass hides them (not a compiled-VU or
   depth-test bug: identical in the interpreter). Next: why the title actors' height is wrong.
+
+## Title screen: Jimmy and the monkeys back on the hill (0031 + overrides/zz_ape2_archive_name.cpp)
+- Chain found with debug hooks (overrides/zz_ape2_camlog.cpp: APE2_CAMLOG, APE2_CAMFIND, APE2_CAMPEEK, APE2_RAYLOG):
+  title actors ray-cast the ground from y=+40 to y=-40 (0x1C2E70 -> 0x1D3CE0) and stood at the miss value -40,
+  under the hill; the static collision query (0x1D2D68) found no cells because the collision tree (gp+0x18F4)
+  was empty; it is built from 'STAT_BSP' in the title stage archive TIT_A (0x1BE0B8), and that lookup missed:
+  the name 'TIT_A' reached the slot lookup 0x1927B0 (full 128-bit compare) with a stray word (0x3F13CD35) in
+  its upper 64 bits.
+- Workaround (overrides/zz_ape2_archive_name.cpp): clear the bytes after the name's NUL before the lookup.
+  Root cause of the stray upper half still open: not the scheduler between runs (APE2_REGCHECK=1), not the
+  loader body or its callees, not the syscalls.
+- patches/ps2recomp/0031 (recompiler; found on the way, checked against PAL vu0.h):
+  - VU0 macro VSQI/VSQD had the address and data registers swapped; VLQI/VLQD/VSQI/VSQD/VILWR/VISWR addressed
+    EE RAM instead of VU0 data memory (now runtime->memory().getVU0Data(), qword index & 0xFF).
+  - VCLIP: +/- flag bits swapped and w not made absolute (now as the hardware / PAL V_CLIP).
+  - Runner build: zz_ape2_* overrides excluded from unity batches (editing one no longer rebuilds a batch).
+  - APE2_REGCHECK=1 (EE scheduler): reports a thread's s0-s7 upper halves changing while it is not running.

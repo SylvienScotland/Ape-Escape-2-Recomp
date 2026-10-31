@@ -1,0 +1,262 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index e8ddcf7..043e802 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -116,12 +116,27 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
++        // VILWR.<f> vit, (vis): the first selected field of the VU0 data memory qword at vis (patch 0031)
++        const uint8_t is = inst.rd, it = inst.rt, d = inst.vectorInfo.vectorField;
++        if (!it)
++            return "{ }";
++        const int lane = (d & 8) ? 0 : (d & 4) ? 1 : (d & 2) ? 2 : 3;
++        const std::string vi = is ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", is) : std::string("0u");
++        return fmt::format("{{ uint32_t w_; std::memcpy(&w_, runtime->memory().getVU0Data() + (({} & 0xFFu) << 4) + {}, 4); ctx->vi[{}] = w_ & 0xFFFFu; }}",
++                           vi, lane * 4, it);
+     }
+ 
+     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
++        // VISWR.<f> vit, (vis): vit into each selected field of the VU0 data memory qword at vis (patch 0031)
++        const uint8_t is = inst.rd, it = inst.rt, d = inst.vectorInfo.vectorField;
++        const std::string vi = is ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", is) : std::string("0u");
++        const std::string v = it ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", it) : std::string("0u");
++        std::string out = fmt::format("{{ uint8_t *m_ = runtime->memory().getVU0Data() + (({} & 0xFFu) << 4); const uint32_t w_ = {}; ", vi, v);
++        for (int lane = 0; lane < 4; ++lane)
++            if (d & (8 >> lane))
++                out += fmt::format("std::memcpy(m_ + {}, &w_, 4); ", lane * 4);
++        return out + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
+@@ -766,68 +781,55 @@ namespace ps2recomp
+                            inst.rt, inst.rt);
+     }
+ 
++    // VU0 macro-mode memory ops address VU0 data memory (4 KB, qword index & 0xFF), not EE RAM; the field
++    // order is LQI/LQD: vft, (vis); SQI/SQD: vfs, (vit). As the PAL port JackyPendrag0n/ae2-recomp
++    // (port/include/vu0.h V_LQI..V_ISWR; Ape Escape 2 recomp patch 0031).
+     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt,
+-                           vis, vis);
++        const uint8_t is = inst.rd, ft = inst.rt, d = inst.vectorInfo.vectorField;
++        const std::string vi = is ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", is) : std::string("0u");
++        const std::string step = is ? fmt::format("ctx->vi[{}] = (ctx->vi[{}] + 1u) & 0xFFFFu; ", is, is) : std::string();
++        const std::string load = ft ? fmt::format("{{ const __m128 v_ = _mm_loadu_ps(reinterpret_cast<const float *>(runtime->memory().getVU0Data() + (({} & 0xFFu) << 4))); "
++                                                  "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], v_, _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); }} ",
++                                                  vi, ft, ft, (d & 1) ? -1 : 0, (d & 2) ? -1 : 0, (d & 4) ? -1 : 0, (d & 8) ? -1 : 0)
++                                      : std::string();
++        return std::string("{ ") + load + step + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++        const uint8_t fs = inst.rd, it = inst.rt, d = inst.vectorInfo.vectorField;
++        const std::string vi = it ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", it) : std::string("0u");
++        const std::string step = it ? fmt::format("ctx->vi[{}] = (ctx->vi[{}] + 1u) & 0xFFFFu; ", it, it) : std::string();
++        const std::string store = fmt::format("{{ uint8_t *m_ = runtime->memory().getVU0Data() + (({} & 0xFFu) << 4); "
++                                              "const __m128 old_ = _mm_loadu_ps(reinterpret_cast<const float *>(m_)); "
++                                              "_mm_storeu_ps(reinterpret_cast<float *>(m_), _mm_blendv_ps(old_, ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {})))); }} ",
++                                              vi, fs, (d & 1) ? -1 : 0, (d & 2) ? -1 : 0, (d & 4) ? -1 : 0, (d & 8) ? -1 : 0);
++        return std::string("{ ") + store + step + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+-                           vis, vis,
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt);
++        const uint8_t is = inst.rd, ft = inst.rt, d = inst.vectorInfo.vectorField;
++        const std::string vi = is ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", is) : std::string("0u");
++        const std::string step = is ? fmt::format("ctx->vi[{}] = (ctx->vi[{}] - 1u) & 0xFFFFu; ", is, is) : std::string();
++        const std::string load = ft ? fmt::format("{{ const __m128 v_ = _mm_loadu_ps(reinterpret_cast<const float *>(runtime->memory().getVU0Data() + (({} & 0xFFu) << 4))); "
++                                                  "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], v_, _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); }} ",
++                                                  vi, ft, ft, (d & 1) ? -1 : 0, (d & 2) ? -1 : 0, (d & 4) ? -1 : 0, (d & 8) ? -1 : 0)
++                                      : std::string();
++        return std::string("{ ") + step + load + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
+-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
++        const uint8_t fs = inst.rd, it = inst.rt, d = inst.vectorInfo.vectorField;
++        const std::string vi = it ? fmt::format("(ctx->vi[{}] & 0xFFFFu)", it) : std::string("0u");
++        const std::string step = it ? fmt::format("ctx->vi[{}] = (ctx->vi[{}] - 1u) & 0xFFFFu; ", it, it) : std::string();
++        const std::string store = fmt::format("{{ uint8_t *m_ = runtime->memory().getVU0Data() + (({} & 0xFFu) << 4); "
++                                              "const __m128 old_ = _mm_loadu_ps(reinterpret_cast<const float *>(m_)); "
++                                              "_mm_storeu_ps(reinterpret_cast<float *>(m_), _mm_blendv_ps(old_, ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {})))); }} ",
++                                              vi, fs, (d & 1) ? -1 : 0, (d & 2) ? -1 : 0, (d & 4) ? -1 : 0, (d & 8) ? -1 : 0);
++        return std::string("{ ") + step + store + "}";
+     }
+ 
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+diff --git a/ps2xRecomp/src/lib/vu_translator.cpp b/ps2xRecomp/src/lib/vu_translator.cpp
+index d0fc95d..520a7dc 100644
+--- a/ps2xRecomp/src/lib/vu_translator.cpp
++++ b/ps2xRecomp/src/lib/vu_translator.cpp
+@@ -268,15 +268,17 @@ namespace ps2recomp
+ 
+                     return fmt::format(
+                         "{{ __m128 fs = ctx->vu0_vf[{}]; "
+-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
++                        "__m128 ft = _mm_andnot_ps(_mm_castsi128_ps(_mm_set1_epi32(0x80000000)), _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+                         "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
+                         "__m128 gt = _mm_cmpgt_ps(fs, ft); "
+                         "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
+                         "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
+                         "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
+-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
+-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
+-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
++                        /* +x +|w| is bit 0, -x bit 1, then y, z: the hardware order (Ape Escape 2 recomp patch 0031;
++                           the bits were swapped and w was not made absolute) */
++                        "uint32_t flags = ((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1) | "
++                        "((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2) | "
++                        "((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3); "
+                         "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+                         inst.rd, inst.rt, inst.rt, shuffle_pattern);
+                 }
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 28e0dc6..a4ca018 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -467,6 +467,14 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+         UNITY_BUILD ON
+         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+     )
++    # Game overrides (zz_ape2_*.cpp, copied from the Ape Escape 2 recomp repo) build on their own, so editing
++    # one recompiles that file only instead of a whole batch of generated code (Ape Escape 2 recomp patch 0031).
++    foreach(PS2X_RUNNER_SRC IN LISTS RUNNER_SRC_FILES)
++        get_filename_component(PS2X_RUNNER_SRC_NAME "${PS2X_RUNNER_SRC}" NAME)
++        if(PS2X_RUNNER_SRC_NAME MATCHES "^zz_ape2_")
++            set_source_files_properties("${PS2X_RUNNER_SRC}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
++        endif()
++    endforeach()
+ endif()
+ 
+ if(PS2X_ENABLE_RUNNER_PCH)
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 8c0796b..1af6940 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,8 @@
++#include <string>
++#include <cstdio>
++#include <unordered_map>
++#include <deque>
++#include <array>
+ #include "runtime/ee_scheduler.h"
+ 
+ #include "ps2_log.h"
+@@ -293,6 +298,43 @@ void EeScheduler::run()
+             continue;
+         }
+ 
++        // APE2_REGCHECK=1: report when a thread's s0-s7 upper halves change while it is not running
++        // (debugging aid, Ape Escape 2 recomp)
++        static const bool regCheck = std::getenv("APE2_REGCHECK") != nullptr;
++        static std::unordered_map<int, std::array<uint64_t, 8>> regUpper;
++        static std::deque<std::string> regEvents;
++        if (regCheck)
++        {
++            char ev[160];
++            std::snprintf(ev, sizeof(ev), "run thread %d pc %x invocations %zu kind %d", running->id, context.pc, running->invocations.size(),
++                          running->invocations.empty() ? -1 : static_cast<int>(running->invocations.back().kind));
++            regEvents.emplace_back(ev);
++            if (regEvents.size() > 24u)
++                regEvents.pop_front();
++            {
++                auto it = regUpper.find(running->id);
++                if (it != regUpper.end())
++                {
++                    for (int k = 0; k < 8; ++k)
++                    {
++                        uint64_t up[2];
++                        std::memcpy(up, &running->context.r[16 + k], 16);
++                        if (up[1] != it->second[k])
++                        {
++                            static int reports = 0;
++                            if (reports++ < 10)
++                            {
++                                std::fprintf(stderr, "[regcheck] thread %d s%d upper %016llx -> %016llx before pc %x; recent:\n", running->id, k,
++                                             static_cast<unsigned long long>(it->second[k]), static_cast<unsigned long long>(up[1]), context.pc);
++                                for (const std::string &e : regEvents)
++                                    std::fprintf(stderr, "[regcheck]   %s\n", e.c_str());
++                            }
++                            break;
++                        }
++                    }
++                }
++            }
++        }
+         try
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+@@ -314,6 +356,21 @@ void EeScheduler::run()
+             throw;
+         }
+ 
++        if (regCheck)
++        {
++            GuestThread *ran = currentThread();
++            if (ran)
++            {
++                std::array<uint64_t, 8> up{};
++                for (int k = 0; k < 8; ++k)
++                {
++                    uint64_t w[2];
++                    std::memcpy(w, &ran->context.r[16 + k], 16);
++                    up[k] = w[1];
++                }
++                regUpper[ran->id] = up;
++            }
++        }
+         processPendingEvents();
+         if (m_rescheduleRequested && m_currentThreadId != 0)
+         {
