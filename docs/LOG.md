@@ -453,3 +453,12 @@
 - Title 10 -> 13-19 fps; gameplay in Liberty Island ~8 fps (now reached in the scripted run: Spike, HUD,
   pause menu). A/B frames with the cache on/off show the same pictures.
 - Remaining cost: per-pixel combine/blend/raster loop (combineTexture, DrawTriangle row lambda, WritePixel).
+
+## Speed: band-parallel rasterizer (0034)
+- Only large primitives were split across threads; characters and stages are thousands of small triangles,
+  so drawing ran on one core. Primitives are now queued and each raster worker draws all of them, but only
+  rows with ((y >> 3) % n) == k (as the PAL port's gs.c bands), so per-pixel order is kept without locks.
+  The queue is drawn before anything else touches VRAM (transfers, CLUT loads from a page being drawn,
+  readback, clears, presentation) and when a primitive samples a page a queued primitive renders to.
+  Decoded textures carry their own palette copy. Pool default up to 16 threads; APE2_GS_BANDS=0 = old path.
+- Title 13 -> 25-34 fps, gameplay 8 -> 15 fps; the GS thread is no longer the limit in gameplay (19%).
