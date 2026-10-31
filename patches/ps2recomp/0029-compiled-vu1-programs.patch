@@ -209,10 +209,10 @@ index 0000000..dfd532c
 +}
 diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
 new file mode 100644
-index 0000000..84caf5a
+index 0000000..7fa03ef
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_vu_compiled.cpp
-@@ -0,0 +1,442 @@
+@@ -0,0 +1,633 @@
 +// Compiled VU1 microprograms: lookup, state hand-over and XGKICK (Ape Escape 2 recomp patch); see
 +// ps2_vu_compiled.h. Lookup by entry + program hash and the chaining of programs follow the PAL port
 +// JackyPendrag0n/ae2-recomp (port/src/vu.c), used with the author's permission.
@@ -250,7 +250,7 @@ index 0000000..84caf5a
 +            uint64_t generation = ~0ull;
 +            ProgFn fn = nullptr;
 +        };
-+        CacheEntry g_cache[2048];
++        CacheEntry g_cache[2][2048];
 +
 +        VU g_vu1{};
 +        bool g_vu1Init = false;
@@ -259,6 +259,8 @@ index 0000000..84caf5a
 +        std::vector<uint8_t> g_packet;
 +
 +        std::atomic<uint64_t> g_runs{0}, g_fallbacks{0}, g_unknown{0};
++        // verify mode: PATH1 packets of the interpreter run and of the compiled run
++        std::vector<std::vector<uint8_t>> *g_captureInterp = nullptr, *g_captureCompiled = nullptr;
 +
 +        Mode readMode()
 +        {
@@ -277,7 +279,7 @@ index 0000000..84caf5a
 +        }
 +
 +        // PAL port vu.c: vu_reach + vu_prog_hash
-+        uint64_t programHash(const uint8_t *code, uint32_t entry)
++        uint64_t programHash(const uint8_t *code, uint32_t entry, uint32_t kCodeMask)
 +        {
 +            static uint8_t mark[2048];
 +            static uint32_t stack[8192];
@@ -320,7 +322,7 @@ index 0000000..84caf5a
 +                }
 +            }
 +            uint64_t h = 1469598103934665603ull ^ (entry & kCodeMask);
-+            for (uint32_t i = 0; i < 2048u; ++i)
++            for (uint32_t i = 0; i < (kCodeMask + 1u) / 8u; ++i)
 +            {
 +                if (!(mark[i] & 1u))
 +                    continue;
@@ -336,16 +338,17 @@ index 0000000..84caf5a
 +            return h;
 +        }
 +
-+        ProgFn find(const uint8_t *code, uint64_t generation, uint32_t entry)
++        ProgFn find(int unit, const uint8_t *code, uint64_t generation, uint32_t entry)
 +        {
-+            CacheEntry &c = g_cache[(entry & kCodeMask) >> 3];
++            const uint32_t mask = unit ? kCodeMask : 0xFFFu;
++            CacheEntry &c = g_cache[unit][(entry & mask) >> 3];
 +            if (c.generation == generation)
 +                return c.fn;
-+            const uint64_t h = programHash(code, entry);
++            const uint64_t h = programHash(code, entry, mask);
 +            ProgFn fn = nullptr;
-+            for (const Prog &p : programs()[1])
++            for (const Prog &p : programs()[unit])
 +            {
-+                if (p.entry == (entry & kCodeMask) && p.hash == h)
++                if (p.entry == (entry & mask) && p.hash == h)
 +                {
 +                    fn = p.fn;
 +                    break;
@@ -354,14 +357,15 @@ index 0000000..84caf5a
 +            if (!fn && g_unknown++ < 20u)
 +            {
 +                char line[128];
-+                std::snprintf(line, sizeof(line), "[vu1:compiled] no compiled program for entry %04x hash %016llx (interpreted)",
-+                              entry & kCodeMask, static_cast<unsigned long long>(h));
++                std::snprintf(line, sizeof(line), "[vu%d:compiled] no compiled program for entry %04x hash %016llx (interpreted)",
++                              unit, entry & mask, static_cast<unsigned long long>(h));
 +                std::cerr << line << std::endl;
 +            }
 +            c.generation = generation;
 +            c.fn = fn;
 +            return fn;
 +        }
++        ProgFn find(const uint8_t *code, uint64_t generation, uint32_t entry) { return find(1, code, generation, entry); }
 +
 +        uint32_t gifPacketBytes(const uint8_t *vuData, uint32_t addr)
 +        {
@@ -445,7 +449,7 @@ index 0000000..84caf5a
 +                    u.p = u.p_new;
 +                    return 0;
 +                }
-+                fn = find(code, generation, u.pc);
++                fn = find(u.unit, code, generation, u.pc);
 +                if (!fn)
 +                {
 +                    u.tpc = u.pc;
@@ -473,7 +477,7 @@ index 0000000..84caf5a
 +    void kick(VU *u, uint32_t qwordAddress)
 +    {
 +        PS2Memory *memory = static_cast<PS2Memory *>(u->kickContext);
-+        if (!memory)
++        if (!memory && !g_captureCompiled)
 +            return;
 +        const uint32_t bytes = gifPacketBytes(u->mem, qwordAddress);
 +        if (!bytes)
@@ -482,7 +486,18 @@ index 0000000..84caf5a
 +        const uint32_t base = qwordAddress * 16u;
 +        for (uint32_t i = 0; i < bytes; i += 16u)
 +            std::memcpy(g_packet.data() + i, u->mem + ((base + i) & (kDataSize - 1u)), 16);
++        if (!memory)
++        {
++            g_captureCompiled->push_back(g_packet);
++            return;
++        }
 +        memory->submitGifPacket(GifPathId::Path1, g_packet.data(), bytes);
++    }
++
++    void notePath1Packet(const uint8_t *data, uint32_t size)
++    {
++        if (g_captureInterp)
++            g_captureInterp->emplace_back(data, data + size);
 +    }
 +
 +    Mode mode()
@@ -511,6 +526,25 @@ index 0000000..84caf5a
 +        u.mem = vuData;
 +        u.kickContext = memory;
 +        stateIn(u, state);
++        static const bool fresh = [] { const char *e = std::getenv("APE2_VU_FRESH"); return e && e[0] == '1'; }();
++        if (fresh)
++        {
++            u.q = u.q_new = state.q;
++            u.q_done = 0;
++            u.p = u.p_new = state.p;
++            u.p_done = 0;
++            u.cycle = 0;
++            std::memset(u.vf_ready, 0, sizeof(u.vf_ready));
++            for (auto &f : u.fh)
++            {
++                f.at = 0;
++                f.mac = state.mac;
++                f.status = state.status & 0x3fu;
++                f.clip = state.clip;
++            }
++            u.status_sticky = state.status & 0xfc0u;
++            u.clip_latest = state.clip & 0xffffffu;
++        }
 +        u.top = top & 0xffffu;
 +        u.itop = itop & 0xffffu;
 +        u.pc = startPc & kCodeMask;
@@ -549,6 +583,7 @@ index 0000000..84caf5a
 +        uint32_t startPc, top, itop;
 +        ProgFn fn;
 +        uint64_t generation;
++        std::vector<std::vector<uint8_t>> interpPackets;
 +    };
 +
 +    void *verifyBefore(const uint8_t *vuCode, const uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc,
@@ -559,15 +594,18 @@ index 0000000..84caf5a
 +        ProgFn fn = find(vuCode, codeGeneration, startPc);
 +        if (!fn)
 +            return nullptr;
-+        auto *in = new VerifyInput{state, std::vector<uint8_t>(vuData, vuData + kDataSize), startPc, top, itop, fn, codeGeneration};
++        auto *in = new VerifyInput{state, std::vector<uint8_t>(vuData, vuData + kDataSize), startPc, top, itop, fn, codeGeneration, {}};
++        g_captureInterp = &in->interpPackets;
 +        return in;
 +    }
 +
 +    void verifyAfter(void *input, const uint8_t *vuCode, const uint8_t *vuData, const VU1State &after)
 +    {
 +        auto *in = static_cast<VerifyInput *>(input);
++        g_captureInterp = nullptr;
 +        if (!in)
 +            return;
++        std::vector<std::vector<uint8_t>> compiledPackets;
 +        static uint64_t runs = 0, bad = 0, badMem = 0, badRegs = 0, badScratch = 0;
 +        static std::mutex mutex;
 +        std::lock_guard<std::mutex> lock(mutex);
@@ -593,7 +631,9 @@ index 0000000..84caf5a
 +        int left;
 +        {
 +            GuestFpu fpu;
++            g_captureCompiled = &compiledPackets;
 +            left = chain(u, in->fn, vuCode, in->generation);
++            g_captureCompiled = nullptr;
 +        }
 +        VU1State got = in->state;
 +        stateOut(u, got);
@@ -629,6 +669,35 @@ index 0000000..84caf5a
 +        }
 +        if (left)
 +            category = 1;
++        if (!why[0])
++        {
++            if (compiledPackets.size() != in->interpPackets.size())
++            {
++                std::snprintf(why, sizeof(why), "kicks %zu vs interp %zu", compiledPackets.size(), in->interpPackets.size());
++                category = 1;
++            }
++            for (size_t k = 0; k < compiledPackets.size() && !why[0]; ++k)
++            {
++                const auto &a = compiledPackets[k], &b = in->interpPackets[k];
++                if (a.size() != b.size())
++                {
++                    std::snprintf(why, sizeof(why), "kick %zu: %zu bytes vs interp %zu", k, a.size(), b.size());
++                    category = 1;
++                    break;
++                }
++                for (size_t q = 0; q < a.size(); q += 16)
++                    if (std::memcmp(a.data() + q, b.data() + q, 16))
++                    {
++                        uint32_t wa[4], wb[4];
++                        std::memcpy(wa, a.data() + q, 16);
++                        std::memcpy(wb, b.data() + q, 16);
++                        std::snprintf(why, sizeof(why), "kick %zu qw %zu/%zu: %08x %08x %08x %08x vs interp %08x %08x %08x %08x", k, q / 16,
++                                      a.size() / 16, wa[0], wa[1], wa[2], wa[3], wb[0], wb[1], wb[2], wb[3]);
++                        category = 1;
++                        break;
++                    }
++            }
++        }
 +        if (why[0])
 +        {
 +            ++bad;
@@ -654,9 +723,274 @@ index 0000000..84caf5a
 +        }
 +        delete in;
 +    }
++
++    // ---- VU0 micro subroutines (VCALLMS): registers shared with the EE's COP2 state, passed in and out
++    // through a VU1State like the interpreter path (PAL port vu.c rt_vu0_exec).
++    namespace
++    {
++        void freshFromState(VU &u, const VU1State &s, uint8_t *data, uint32_t memmask, int unit)
++        {
++            u = VU{};
++            u.mem = data;
++            u.memmask = memmask;
++            u.unit = unit;
++            std::memcpy(u.vf, s.vf, sizeof(u.vf));
++            for (int k = 0; k < 16; ++k)
++                u.vi[k] = static_cast<uint32_t>(s.vi[k]) & 0xffffu;
++            std::memcpy(u.acc, s.acc, sizeof(u.acc));
++            u.q = u.q_new = s.q;
++            u.p = u.p_new = s.p;
++            u.i = s.i;
++            u.r = s.r & 0x7fffffu;
++            for (auto &f : u.fh)
++            {
++                f.mac = s.mac;
++                f.status = s.status & 0x3fu;
++                f.clip = s.clip;
++            }
++            u.status_sticky = s.status & 0xfc0u;
++            u.clip_latest = s.clip & 0xffffffu;
++            u.itop = s.itop & 0xffffu;
++        }
++        void vu0Out(VU &u, VU1State &s)
++        {
++            std::memcpy(s.vf, u.vf, sizeof(u.vf));
++            for (int k = 0; k < 16; ++k)
++                s.vi[k] = static_cast<int16_t>(u.vi[k] & 0xffffu);
++            s.vi[0] = 0;
++            std::memcpy(s.acc, u.acc, sizeof(s.acc));
++            s.q = u.q;
++            s.p = u.p;
++            s.i = u.i;
++            s.r = 0x3F800000u | (u.r & 0x7fffffu);
++            uint32_t mac = 0, status = 0, clip = 0;
++            flags_visible(&u, &mac, &status, &clip);
++            s.mac = mac;
++            s.status = status;
++            s.clip = clip;
++            s.pc = u.tpc;
++            s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
++            s.vf[0][3] = 1.0f;
++        }
++        Result vu0Run(const uint8_t *vuCode, uint8_t *vuData, uint64_t generation, uint32_t startPc, VU1State &state, ProgFn fn)
++        {
++            VU u;
++            freshFromState(u, state, vuData, 0xFFFu, 0);
++            u.pc = startPc & 0xFFFu;
++            int left;
++            {
++                GuestFpu fpu;
++                left = chain(u, fn, vuCode, generation);
++            }
++            vu0Out(u, state);
++            state.stoppedByD = false;
++            state.stoppedByT = false;
++            return left ? Result::ContinueInInterpreter : Result::Done;
++        }
++    }
++
++    Result runVu0(const uint8_t *vuCode, uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc, VU1State &state)
++    {
++        static const bool vu0Off = [] { const char *e = std::getenv("APE2_VU0_COMPILED"); return e && e[0] == '0'; }();
++        if (mode() != Mode::On || programs()[0].empty() || vu0Off)
++            return Result::NotHandled;
++        ProgFn fn = find(0, vuCode, codeGeneration, startPc);
++        if (!fn)
++            return Result::NotHandled;
++        return vu0Run(vuCode, vuData, codeGeneration, startPc, state, fn);
++    }
++
++    void verifyVu0(const uint8_t *vuCode, uint64_t codeGeneration, uint32_t startPc, const VU1State &before,
++                   const uint8_t *dataBefore, const VU1State &after, const uint8_t *dataAfter)
++    {
++        ProgFn fn = find(0, vuCode, codeGeneration, startPc);
++        if (!fn)
++            return;
++        static uint64_t runs = 0, bad = 0;
++        std::vector<uint8_t> data(dataBefore, dataBefore + 0x1000);
++        VU1State got = before;
++        const Result r = vu0Run(vuCode, data.data(), codeGeneration, startPc, got, fn);
++        ++runs;
++        char why[256] = "";
++        if (r != Result::Done)
++            std::snprintf(why, sizeof(why), "left the compiled code");
++        for (uint32_t i = 0; i < 0x1000u && !why[0]; i += 16u)
++            if (std::memcmp(data.data() + i, dataAfter + i, 16))
++            {
++                const float *a = reinterpret_cast<const float *>(data.data() + i);
++                const float *b = reinterpret_cast<const float *>(dataAfter + i);
++                std::snprintf(why, sizeof(why), "mem qw %03x: %g %g %g %g vs interp %g %g %g %g", i / 16u, a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
++            }
++        for (int k = 1; k < 32 && !why[0]; ++k)
++            if (std::memcmp(got.vf[k], after.vf[k], 16))
++                std::snprintf(why, sizeof(why), "vf%d %g %g %g %g vs interp %g %g %g %g", k, got.vf[k][0], got.vf[k][1], got.vf[k][2],
++                              got.vf[k][3], after.vf[k][0], after.vf[k][1], after.vf[k][2], after.vf[k][3]);
++        for (int k = 1; k < 16 && !why[0]; ++k)
++            if ((got.vi[k] & 0xffff) != (after.vi[k] & 0xffff))
++                std::snprintf(why, sizeof(why), "vi%d %x vs interp %x", k, got.vi[k] & 0xffff, after.vi[k] & 0xffff);
++        if (!why[0] && (std::memcmp(got.acc, after.acc, 16) || got.q != after.q))
++            std::snprintf(why, sizeof(why), "acc %g %g %g %g / q %g vs interp %g %g %g %g / q %g", got.acc[0], got.acc[1], got.acc[2],
++                          got.acc[3], got.q, after.acc[0], after.acc[1], after.acc[2], after.acc[3], after.q);
++        if (why[0] && ++bad <= 40u)
++        {
++            char line[400];
++            std::snprintf(line, sizeof(line), "[vu0:compiled] VERIFY entry %04x: %s", startPc & 0xFFFu, why);
++            std::cerr << line << std::endl;
++        }
++        if ((runs & 0x3FFFu) == 0u)
++        {
++            char line[128];
++            std::snprintf(line, sizeof(line), "[vu0:compiled] verify: %llu runs, %llu differ",
++                          static_cast<unsigned long long>(runs), static_cast<unsigned long long>(bad));
++            std::cerr << line << std::endl;
++        }
++    }
 +}
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 87a9f18..e904c6c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1140,6 +1140,12 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         break;
+     }
+ 
++    {
++        // APE2_GS_ZTEST_OFF=1: every depth test passes (debugging aid, Ape Escape 2 recomp)
++        static const bool ztestOff = [] { const char *e = std::getenv("APE2_GS_ZTEST_OFF"); return e && e[0] == '1'; }();
++        if (ztestOff)
++            zpass = true;
++    }
+     if (!zpass)
+     {
+         return;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 7a73030..17b8f16 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1029,7 +1029,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1066,7 +1066,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(x) / 16.0f;
+         vtx.y = static_cast<float>(y) / 16.0f;
+-        vtx.z = static_cast<float>(z);
++        vtx.z = static_cast<double>(z);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1100,7 +1100,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
++        vtx.z = static_cast<double>((hi >> 4) & 0xFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1131,7 +1131,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
+         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
+         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
+-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
++        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
+         vtx.r = m_curR;
+         vtx.g = m_curG;
+         vtx.b = m_curB;
+@@ -1634,6 +1634,7 @@ namespace
+         uint32_t count = 0;
+         int x0 = 1 << 30, y0 = 1 << 30, x1 = -(1 << 30), y1 = -(1 << 30);
+         uint32_t order = 0;
++        uint64_t z0 = ~0ull, z1 = 0;
+     };
+     void ape2DrawLog(uint64_t vsync, const GSPrimitiveBatch &batch)
+     {
+@@ -1657,8 +1658,9 @@ namespace
+             std::vector<std::pair<uint32_t, std::string>> lines;
+             for (const auto &[key, e] : entries)
+             {
+-                char t[96];
+-                std::snprintf(t, sizeof(t), " n=%u rect=(%d,%d)-(%d,%d)", e.count, e.x0, e.y0, e.x1, e.y1);
++                char t[160];
++                std::snprintf(t, sizeof(t), " n=%u rect=(%d,%d)-(%d,%d) z=%llx-%llx", e.count, e.x0, e.y0, e.x1, e.y1,
++                              static_cast<unsigned long long>(e.z0), static_cast<unsigned long long>(e.z1));
+                 lines.emplace_back(e.order, key + t);
+             }
+             std::sort(lines.begin(), lines.end());
+@@ -1679,12 +1681,32 @@ namespace
+         const GSDrawState &st = batch.state;
+         const GSContext &c = st.context;
+         const GSVertex &v = batch.vertices[0];
++        {
++            // APE2_DRAW_SEQ=1: also every batch in submission order
++            static const bool seq = std::getenv("APE2_DRAW_SEQ") != nullptr;
++            if (seq)
++            {
++                int bx0 = 1 << 30, by0 = 1 << 30, bx1 = -(1 << 30), by1 = -(1 << 30);
++                double bz0 = 1e30, bz1 = -1e30;
++                for (uint32_t i = 0; i < batch.vertexCount; ++i)
++                {
++                    const int x = static_cast<int>(batch.vertices[i].x) - (c.xyoffset.ofx >> 4);
++                    const int y = static_cast<int>(batch.vertices[i].y) - (c.xyoffset.ofy >> 4);
++                    bx0 = std::min(bx0, x); by0 = std::min(by0, y); bx1 = std::max(bx1, x); by1 = std::max(by1, y);
++                    bz0 = std::min(bz0, batch.vertices[i].z); bz1 = std::max(bz1, batch.vertices[i].z);
++                }
++                std::fprintf(stderr, "[seq] fbp=%x prim=%u tex=%x test=%llx zmsk=%u fbmsk=%08x abe=%u alpha=%llx nv=%u rect=(%d,%d)-(%d,%d) z=%.0f-%.0f\n",
++                             c.frame.fbp, static_cast<unsigned>(st.prim.type), c.tex0.tbp0, static_cast<unsigned long long>(c.test),
++                             c.zbuf.zmask, c.frame.fbmsk, st.prim.abe, static_cast<unsigned long long>(c.alpha), batch.vertexCount,
++                             bx0, by0, bx1, by1, bz0, bz1);
++            }
++        }
+         char key[512];
+         std::snprintf(key, sizeof(key),
+-                      "fbp=%x fbmsk=%08x prim=%u tme=%u abe=%u fge=%u ctx=%u tex=%x/%x/w%u tfx=%u tcc=%u alpha=%llx test=%llx zbp=%x zmsk=%u fba=%llu pabe=%u fog=%02x%02x%02x col0=%02x%02x%02x%02x f0=%02x",
++                      "fbp=%x fbmsk=%08x prim=%u tme=%u abe=%u fge=%u ctx=%u tex=%x/%x/w%u tfx=%u tcc=%u alpha=%llx test=%llx zbp=%x zpsm=%x zmsk=%u fba=%llu pabe=%u fog=%02x%02x%02x col0=%02x%02x%02x%02x f0=%02x",
+                       c.frame.fbp, c.frame.fbmsk, static_cast<unsigned>(st.prim.type), st.prim.tme, st.prim.abe, st.prim.fge,
+                       st.prim.ctxt, c.tex0.tbp0, c.tex0.psm, c.tex0.tbw, c.tex0.tfx, c.tex0.tcc,
+-                      static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test), c.zbuf.zbp, c.zbuf.zmask,
++                      static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test), c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask,
+                       static_cast<unsigned long long>(c.fba & 1ull), st.pabe, st.fogR, st.fogG, st.fogB, v.r, v.g, v.b, v.a, v.fog);
+         Ape2DrawLogEntry &e = entries[key];
+         if (e.count++ == 0u)
+@@ -1697,6 +1719,8 @@ namespace
+             e.y0 = std::min(e.y0, y);
+             e.x1 = std::max(e.x1, x);
+             e.y1 = std::max(e.y1, y);
++            e.z0 = std::min<uint64_t>(e.z0, static_cast<uint64_t>(batch.vertices[i].z));
++            e.z1 = std::max<uint64_t>(e.z1, static_cast<uint64_t>(batch.vertices[i].z));
+         }
+     }
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index bbe9f81..fefe914 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1969,10 +1969,17 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+         m_gifArbiter->drain();
+ }
+ 
++namespace ape2vu
++{
++    void notePath1Packet(const uint8_t *data, uint32_t size); // zz_ape2_vu_compiled.cpp (verify mode)
++}
++
+ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
+ {
+     if (!data || sizeBytes < 16)
+         return;
++    if (pathId == GifPathId::Path1)
++        ape2vu::notePath1Packet(data, sizeBytes);
+ 
+     if (pathId == GifPathId::Path3)
+     {
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 5def05e..268ad7d 100644
+index 5def05e..9970dd4 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,5 +1,6 @@
@@ -724,12 +1058,43 @@ index 5def05e..268ad7d 100644
                                       m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, top, itop, 65536);
+@@ -1451,6 +1482,21 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+ 
+     m_vu0.reset();
+     copyVu0ContextToState(ctx, m_vu0.state());
++    // Compiled microprogram (tools/vu_recomp.py; Ape Escape 2 recomp patch 0029)
++    const uint64_t vu0Generation = m_memory.getVU0CodeGeneration();
++    if (ape2vu::runVu0(vu0Code, vu0Data, vu0Generation, startPC, m_vu0.state()) == ape2vu::Result::Done)
++    {
++        copyVu0StateToContext(m_vu0.state(), ctx);
++        return;
++    }
++    const bool verifyCompiled = ape2vu::mode() == ape2vu::Mode::Verify;
++    VU1State vu0Before{};
++    static std::vector<uint8_t> vu0DataBefore;
++    if (verifyCompiled)
++    {
++        vu0Before = m_vu0.state();
++        vu0DataBefore.assign(vu0Data, vu0Data + PS2_VU0_DATA_SIZE);
++    }
+     // Run the microprogram to its E bit. The old 4096-cycle budget cut long programs (the game's VU0
+     // animation program loops over every bone) part-way (Ape Escape 2 recomp patch 0027).
+     constexpr uint32_t kVu0Budget = 1u << 22;
+@@ -1475,6 +1521,8 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+             }
+         }
+     }
++    if (verifyCompiled)
++        ape2vu::verifyVu0(vu0Code, vu0Generation, startPC, vu0Before, vu0DataBefore.data(), m_vu0.state(), vu0Data);
+     copyVu0StateToContext(m_vu0.state(), ctx);
+ }
+ 
 diff --git a/ps2xRuntime/src/lib/ps2_vu_compiled_run.h b/ps2xRuntime/src/lib/ps2_vu_compiled_run.h
 new file mode 100644
-index 0000000..411fc98
+index 0000000..6af096f
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/ps2_vu_compiled_run.h
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,37 @@
 +// Running the compiled VU1 microprograms in place of the interpreter (Ape Escape 2 recomp patch);
 +// see ps2_vu_compiled.h.
 +#pragma once
@@ -761,4 +1126,9 @@ index 0000000..411fc98
 +    void *verifyBefore(const uint8_t *vuCode, const uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc,
 +                       uint32_t top, uint32_t itop, const VU1State &state);
 +    void verifyAfter(void *input, const uint8_t *vuCode, const uint8_t *vuData, const VU1State &after);
++
++    // VU0 micro subroutine (VCALLMS): state in and out through a VU1State (the EE's COP2 registers).
++    Result runVu0(const uint8_t *vuCode, uint8_t *vuData, uint64_t codeGeneration, uint32_t startPc, VU1State &state);
++    void verifyVu0(const uint8_t *vuCode, uint64_t codeGeneration, uint32_t startPc, const VU1State &before,
++                   const uint8_t *dataBefore, const VU1State &after, const uint8_t *dataAfter);
 +}

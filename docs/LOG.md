@@ -401,3 +401,10 @@
 - Verify run (title -> stage, 200k program runs): VU memory, vi and vf15-31 identical to the interpreter;
   only scratch vf1-14 differ (past-end pipeline iterations, not read later).
 - Now: ~35 fps in the stage; GS rasterizer ~50% of the busy thread, VU1 ~20%.
+- 0029 extended: VU0 micro subroutines (VCALLMS) also run compiled (APE2_VU0_COMPILED=0 turns that off);
+  verify now also compares every PATH1 packet (identical over 120k runs). GS: packed XYZ vertex Z went through
+  float (24-bit mantissa), now double. Debug aids: APE2_GS_ZTEST_OFF=1 (all depth tests pass),
+  APE2_DRAW_SEQ=1 (with APE2_DRAW_LOG: every batch in order with its depth range).
+- Title screen: Jimmy and the monkeys are drawn (walking around, visible with APE2_GS_ZTEST_OFF=1) but the
+  grass in front of them has larger depth (14.7M-19.8M vs ~5.7M) when the game runs fast; with the slow
+  interpreter they show. Under investigation.
