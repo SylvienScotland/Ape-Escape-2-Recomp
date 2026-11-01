@@ -1,0 +1,324 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 27643bb..18f3fa2 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -1633,6 +1633,35 @@ private:
+                                  v[2].s, v[2].t, v[2].q, v[2].u, v[2].v);
+                 }
+             }
++            // during a burst: where in guest RAM the keyboard's TEX0 (8-bit 256x256 atlas) comes from (debugging aid)
++            extern std::atomic<int> g_ape2FrameDumpBurst;
++            extern uint8_t *g_ape2Rdram;
++            if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && g_ape2Rdram && c.tex0.psm == GS_PSM_T8 &&
++                c.tex0.tw == 8 && c.tex0.th == 8 && bx1 - bx0 >= 45 && bx1 - bx0 <= 65 && by1 - by0 >= 12 && by1 - by0 <= 25)
++            {
++                static int scans = 0;
++                if (scans < 12)
++                {
++                    ++scans;
++                    const uint64_t want = static_cast<uint64_t>(c.tex0.tbp0) | (static_cast<uint64_t>(c.tex0.tbw) << 14) |
++                                          (static_cast<uint64_t>(c.tex0.psm) << 20) | (8ull << 26) | (8ull << 30) |
++                                          (static_cast<uint64_t>(c.tex0.cbp) << 37);
++                    const uint64_t mask = 0x3FFFFFFFFull | (0x3FFFull << 37);
++                    std::fprintf(stderr, "[gpu:tex0scan] tbp0=0x%x cbp=0x%x:", c.tex0.tbp0, c.tex0.cbp);
++                    int found = 0;
++                    for (uint32_t a = 0; a + 8 <= 32u * 1024u * 1024u && found < 24; a += 8)
++                    {
++                        uint64_t w = 0;
++                        std::memcpy(&w, g_ape2Rdram + a, 8);
++                        if ((w & mask) == want)
++                        {
++                            std::fprintf(stderr, " %06x", a);
++                            ++found;
++                        }
++                    }
++                    std::fprintf(stderr, "\n");
++                }
++            }
+         }
+         DrawState s;
+         stateFrom(st, s, rt, zb, tex, texRt);
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index ee2b9ba..0e6de71 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -574,6 +574,11 @@ static void dumpPresentationFrame(const PresentationFrame &frame, const GSPresen
+     if (!dir || !*dir || frame.width == 0u || frame.height == 0u)
+         return;
+     static uint32_t burstDumped = 0u;
++    // APE2_FRAME_DUMP_BURST_AT=<presented frame>: start a 60-frame burst there by itself (unattended runs)
++    static const uint32_t burstAt = [] { const char *e = std::getenv("APE2_FRAME_DUMP_BURST_AT"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u; }();
++    static uint32_t presentedForBurst = 0u;
++    if (burstAt != 0u && ++presentedForBurst == burstAt)
++        g_ape2FrameDumpBurst.store(60);
+     if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && burstDumped < 1200u)
+     {
+         g_ape2FrameDumpBurst.fetch_sub(1, std::memory_order_relaxed);
+@@ -1548,6 +1553,10 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             command.trxpos = m_trxpos;
+             command.trxreg = m_trxreg;
+             command.direction = m_trxdir;
++            extern thread_local int g_ape2GifPath;
++            if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && m_trxdir == 0u)
++                std::fprintf(stderr, "[gs:up] path %d dbp=0x%x dbw=%u dpsm=0x%x %ux%u\n", g_ape2GifPath, m_bitbltbuf.dbp,
++                             m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh);
+             m_backend->BeginTransfer(command);
+         }
+         recordTransferDebugEventUnlocked();
+@@ -1833,6 +1842,25 @@ void GS::vertexKick(bool drawing)
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
++        if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && batch.state.prim.tme &&
++            batch.state.context.tex0.psm == GS_PSM_T8 && batch.state.context.tex0.tw == 8)
++        {
++            // keyboard-sized 8-bit atlas draws near the hub keyboard (debugging aid)
++            extern thread_local int g_ape2GifPath;
++            const float ofx = static_cast<float>(batch.state.context.xyoffset.ofx >> 4);
++            const float ofy = static_cast<float>(batch.state.context.xyoffset.ofy >> 4);
++            float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
++            for (uint32_t i = 0; i < batch.vertexCount; ++i)
++            {
++                x0 = std::min(x0, batch.vertices[i].x - ofx);
++                x1 = std::max(x1, batch.vertices[i].x - ofx);
++                y0 = std::min(y0, batch.vertices[i].y - ofy);
++                y1 = std::max(y1, batch.vertices[i].y - ofy);
++            }
++            if (x0 > 160 && x1 < 245 && y0 > 95 && y1 < 145)
++                std::fprintf(stderr, "[gs:kbd] path %d tbp0=0x%x bbox %.0f,%.0f-%.0f,%.0f\n", g_ape2GifPath,
++                             batch.state.context.tex0.tbp0, x0, y0, x1, y1);
++        }
+         if (m_privRegs)
+             ape2DrawLog(m_privRegs->vsyncTick.load(std::memory_order_relaxed), batch);
+         updatePreferredDisplaySourceForDraw(batch);
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c0507c7..1bb916d 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -2,6 +2,9 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++// GIF path of the packet being processed (debugging aid: frame-dump burst logs)
++thread_local int g_ape2GifPath = 0;
++
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+ {
+@@ -57,6 +60,7 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            g_ape2GifPath = static_cast<int>(pkt.pathId);
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index f84133d..30e7729 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -264,6 +264,7 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
+ }
+ 
+ void ape2InstallRamWatch(uint8_t *rdram, size_t ramSize);
++uint8_t *g_ape2Rdram = nullptr;
+ 
+ PS2Memory::PS2Memory()
+     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
+@@ -368,6 +369,7 @@ bool PS2Memory::initialize(size_t ramSize)
+         m_rdram = new uint8_t[ramSize];
+         std::memset(m_rdram, 0, ramSize);
+         ape2InstallRamWatch(m_rdram, ramSize); // APE2_RAM_WATCH debugging aid (zz_ape2_ram_watch.cpp)
++        g_ape2Rdram = m_rdram; // debugging aids that search guest RAM
+ 
+         // Allocate scratchpad
+         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
+@@ -1391,7 +1393,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // A DMA chain ends at an END/REFE tag (or a TIE interrupt); this cap only guards against a
++                    // runaway chain. It was 4096: Ape Escape 2's frame lists in busy areas (the hub, ~2.5 MB of
++                    // VIF1 data with every texture inline) have more tags, and their tails - texture uploads among
++                    // them - were dropped while the transfer still reported done (recomp patch 0052).
++                    const int kMaxChainTags = 1 << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1568,6 +1574,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             break;
+                     }
+ 
++                    if (tagsProcessed > 4096)
++                    {
++                        static int bigReports = 0;
++                        if (bigReports++ < 10)
++                            std::fprintf(stderr, "[dma] chain on channel 0x%x has %d tags (over the old 4096 cap)\n", channelBase, tagsProcessed);
++                    }
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        static int reports = 0;
++                        if (reports++ < 20)
++                            std::fprintf(stderr, "[dma] chain on channel 0x%x stopped after %d tags\n", channelBase, tagsProcessed);
++                    }
+                     m_ioRegisters[channelBase + 0x30] = dmaRegisterAddress(tagAddr);
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+@@ -2222,6 +2240,12 @@ void PS2Memory::enqueueGsWork(bool vif1, std::vector<uint8_t> &&data)
+ {
+     if (data.empty())
+         return;
++    {
++        extern std::atomic<int> g_ape2FrameDumpBurst; // gs_frontend.cpp (debugging aid)
++        if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0)
++            std::fprintf(stderr, "[kick] %s %zu bytes vsync %llu\n", vif1 ? "VIF1" : "GIF", data.size(),
++                         static_cast<unsigned long long>(gs_regs.vsyncTick.load(std::memory_order_relaxed)));
++    }
+     const uint64_t tick = gs_regs.vsyncTick.load(std::memory_order_acquire);
+     if (tick != g_lastMarkTick)
+     {
+@@ -2309,6 +2333,11 @@ void PS2Memory::gsWorkerMain()
+             m_gsWorkerBusy = true;
+         }
+         const uint64_t t0 = stats ? gsWorkerNowUs() : 0;
++        {
++            extern std::atomic<int> g_ape2FrameDumpBurst; // gs_frontend.cpp (debugging aid)
++            if (!item.special && g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0)
++                std::fprintf(stderr, "[item] %s %zu bytes\n", item.vif1 ? "VIF1" : "GIF", item.data.size());
++        }
+         if (item.special)
+         {
+             uint32_t offset = 0;
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index f01d3c2..c931dab 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -1,4 +1,5 @@
+ // Based on Blackline Interactive implementation
++#include <atomic>
+ #include <algorithm>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -103,6 +104,21 @@ namespace
+     uint32_t s_vif1PendingDirectQwc = 0u;
+     bool s_vif1PendingDirectHl = false;
+ 
++    // A VU1 program started by MSCAL/MSCNT and not run yet (Ape Escape 2 recomp patch 0052). On the PS2, MSCAL
++    // only starts VU1: VIF1 goes on with the next VIFcodes (DIRECT texture uploads among them) while VU1 computes,
++    // and the program's XGKICK reaches the GS later. The game uploads an object's texture with a DIRECT right
++    // after starting its program, into a slot another texture used before: running VU1 at once drew the object
++    // before its texture arrived (garbage textures in the hub, level 1 and elsewhere). The program now runs where
++    // VIF1 would have to wait for VU1: the next MSCAL/MSCNT, FLUSH/FLUSHE/FLUSHA, MPG, an UNPACK to an absolute
++    // VU1 address, or the end of the transfer. APE2_VU1_DEFER=0 runs it at MSCAL as before.
++    struct PendingVu1
++    {
++        bool pending = false;
++        bool cont = false; // MSCNT
++        uint32_t pc = 0, top = 0, itop = 0;
++    };
++    PendingVu1 s_vu1Pending;
++
+     // UNPACK whose payload continues in the next VIF1 chunk (DMA chain data often splits an UNPACK across
+     // tags): the command word, the bytes collected so far and the total it needs (Ape Escape 2 recomp
+     // patch 0027). Without this the unpack was dropped and VU1 ran on stale vertex data.
+@@ -354,6 +370,20 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         return;
+ 
+     uint32_t pos = 0;
++    static const bool deferVu1 = [] { const char *e = std::getenv("APE2_VU1_DEFER"); return !e || std::atoi(e) != 0; }();
++    auto runPendingVu1 = [&]()
++    {
++        if (!s_vu1Pending.pending)
++            return;
++        s_vu1Pending.pending = false;
++        if (s_vu1Pending.cont)
++        {
++            if (m_vu1MscntCallback)
++                m_vu1MscntCallback(s_vu1Pending.top, s_vu1Pending.itop);
++        }
++        else if (m_vu1MscalCallback)
++            m_vu1MscalCallback(s_vu1Pending.pc, s_vu1Pending.top, s_vu1Pending.itop);
++    };
+ 
+     // Sends one DIRECT/DIRECTHL payload to PATH2. A GIF IMAGE packet can span several DIRECT commands
+     // (GIFtag in one, pixels in later ones), so leading qwords continue a pending IMAGE before the rest is
+@@ -628,6 +658,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;
+ 
++        {
++            // during a frame-dump burst: VIFcodes other than double-buffered UNPACKs (debugging aid)
++            extern std::atomic<int> g_ape2FrameDumpBurst;
++            static const bool vifLog = std::getenv("APE2_VIF1_LOG") != nullptr;
++            if (vifLog && g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 &&
++                !((opcode & 0x60) == 0x60 && (imm & 0x8000u) != 0u) && opcode != 0x00)
++                std::fprintf(stderr, "[vif] %02x imm %04x num %u%s\n", opcode, imm, num, s_vu1Pending.pending ? " (vu1 pending)" : "");
++        }
+         // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+         vif1_regs.num = num;
+@@ -720,10 +758,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
+         {
++            runPendingVu1();
+             continue;
+         }
+         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
+         {
++            runPendingVu1();
+             uint32_t startPC = (uint32_t)imm * 8u;
+ 
+             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
+@@ -738,12 +778,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            if (m_vu1MscalCallback)
++            if (deferVu1)
++                s_vu1Pending = PendingVu1{true, false, startPC, runTop, runItop};
++            else if (m_vu1MscalCallback)
+                 m_vu1MscalCallback(startPC, runTop, runItop);
+             continue;
+         }
+         else if (opcode == VIF_MSCNT)
+         {
++            runPendingVu1();
+             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
+             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
+             vif1_regs.top = runTop;
+@@ -756,7 +799,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
+             vif1_regs.stat ^= (1u << 7); // toggle DBF
+ 
+-            if (m_vu1MscntCallback)
++            if (deferVu1)
++                s_vu1Pending = PendingVu1{true, true, 0u, runTop, runItop};
++            else if (m_vu1MscntCallback)
+                 m_vu1MscntCallback(runTop, runItop);
+             continue;
+         }
+@@ -788,6 +833,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if (opcode == VIF_MPG)
+         {
++            runPendingVu1();
+             uint32_t destAddr = (uint32_t)imm * 8u;
+             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
+             const uint32_t mpgBytes = instructionCount * 8u;
+@@ -835,6 +881,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         }
+         else if ((opcode & 0x60) == 0x60)
+         {
++            if ((imm & 0x8000u) == 0u)
++                runPendingVu1(); // an absolute address: may be what the started program reads
+             const uint32_t need = unpackSourceBytes(cmd);
+             if (pos + need > sizeBytes)
+             {
+@@ -854,4 +902,5 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+     }
++    runPendingVu1();
+ }

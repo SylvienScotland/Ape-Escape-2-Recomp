@@ -613,3 +613,13 @@
   as CT32 (4/8-bit textures uploaded as 32-bit data); the Z32 buffer ends exactly at 0x2A00. In garbage frames
   the keyboard samples an atlas slot where its image was not uploaded: the game's texture streaming and our
   VRAM disagree. Next: trace the game's texture manager (which upload it expects before the keyboard draw).
+
+## Garbage textures: VU1 deferral, DMA tag cap, probes (0052) - paused
+- VIF1 MSCAL/MSCNT now run the VU1 program at the next sync point (FLUSH*, MPG, non-FLG UNPACK, end of data)
+  instead of immediately (APE2_VU1_DEFER=0 restores immediate); helped the keyboard only partly.
+- The DMA chain tag cap was raised from 4096 to 1<<20 ([dma] logs a chain over 4096; none were seen).
+- Debugging: APE2_FRAME_DUMP_BURST_AT=<frame> starts a burst unattended, APE2_VIF1_LOG=1 logs VIFcodes during
+  a burst, [gs:up]/[gs:kbd] logs, [gpu:tex0scan] searches guest RAM for the keyboard's TEX0.
+- Measured with an unattended hub run (keyboard frames sampling a wrong slot, of ~58): baseline 31,
+  APE2_TIMESLICE=1 46, APE2_VU1_DEFER=0 49, APE2_FPU_NEAREST=1 9 (slot changes 57 -> 9). The FPU rounding mode
+  (0048) is the strongest lead: next, compare with how the PAL port sets rounding.
