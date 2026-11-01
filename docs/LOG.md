@@ -540,3 +540,13 @@
 - The next VBlankStart's host deadline was always previous + 16.7 ms, so after a slow stretch the missed
   vsyncs fired back to back and the game ran visibly too fast for a moment (reported while playing). When more
   than a frame late, the next deadline is now "now" (the backlog is dropped).
+
+## Profiling the GS and raster threads (0046)
+- APE2_PERF_THREAD=gs|vu|raster points the host stack sampler at that thread instead of the EE;
+  APE2_GS_BATCH sets primitives per raster batch (default 4096).
+- Stage run: the GS thread spends ~50% waiting for the raster pool (26% at the barrier before each new batch,
+  24% in drains for texture/CLUT/snapshot conflicts); a raster worker is idle ~53% and spends the rest in
+  DrawTriangle/SampleTexture/WritePixel (generic per-pixel path). Batch size 4096 vs 16384: no clear change.
+- The PAL port reaches full speed with its GPU renderer (gs_hw.h, OpenGL 3.3, 1x-8x resolution); its software
+  rasteriser is also the slow path (hot spot: SSE span functions). Next: a GPU backend.
+- Reported while playing: the camera shakes left/right a little in some areas (to investigate).

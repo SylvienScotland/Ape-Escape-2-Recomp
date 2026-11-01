@@ -1,0 +1,150 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp b/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp
+index cbe721a..b6e95b6 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ps2_perf_host.cpp
+@@ -13,6 +13,8 @@
+ #include <windows.h>
+ #include <dbghelp.h>
+ #include <string>
++#include <cstdlib>
++#include <cstring>
+ 
+ #pragma comment(lib, "dbghelp.lib")
+ 
+@@ -122,6 +124,9 @@ namespace ps2perf
+ 
+     void hostRegisterCurrentThread()
+     {
++        static const char *selected = std::getenv("APE2_PERF_THREAD");
++        if (selected && std::strcmp(selected, "ee") != 0)
++            return; // another thread is sampled (hostRegisterIfSelected)
+         HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                               GetCurrentThreadId());
+         if (!h)
+@@ -132,6 +137,25 @@ namespace ps2perf
+             CloseHandle(old);
+     }
+ 
++    void hostRegisterIfSelected(const char *name)
++    {
++        const char *selected = std::getenv("APE2_PERF_THREAD");
++        if (!selected || std::strcmp(selected, name) != 0)
++            return;
++        static std::atomic<bool> taken{false};
++        if (taken.exchange(true))
++            return;
++        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
++                              GetCurrentThreadId());
++        if (!h)
++            return;
++        g_targetId.store(GetCurrentThreadId());
++        HANDLE old = g_target.exchange(h);
++        if (old)
++            CloseHandle(old);
++        std::fprintf(stderr, "[perf] sampling the %s thread\n", name);
++    }
++
+     void hostSampleTick()
+     {
+         HANDLE h = g_target.load();
+@@ -179,6 +203,7 @@ namespace ps2perf
+ namespace ps2perf
+ {
+     void hostRegisterCurrentThread() {}
++    void hostRegisterIfSelected(const char *) {}
+     void hostSampleTick() {}
+     void hostReport() {}
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 75d26b1..057c476 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -10,6 +10,7 @@
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "ps2_log.h"
++#include "../ps2_perf.h"
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
+@@ -661,6 +662,7 @@ namespace
+ 
+         void workerLoop()
+         {
++            ps2perf::hostRegisterIfSelected("raster");
+             uint64_t seen = 0;
+             for (;;)
+             {
+@@ -789,6 +791,13 @@ void GSCpuBackend::ResetUnlocked()
+     m_localToHostReadPos = 0u;
+ }
+ 
++// primitives per raster batch (APE2_GS_BATCH, default 4096): each batch ends in a barrier for all workers
++static const size_t kMaxQueuedPrims = []
++{
++    const char *e = std::getenv("APE2_GS_BATCH");
++    return e ? static_cast<size_t>(std::max(256, std::atoi(e))) : static_cast<size_t>(4096);
++}();
++
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -847,7 +856,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     {
+         QueueTexture(texture);
+         m_queue.push_back(QueuedPrimitive{batch, texture});
+-        if (m_queue.size() >= 4096u)
++        if (m_queue.size() >= kMaxQueuedPrims)
+             { m_flushReason = 10; FlushQueueUnlocked(); }
+         return;
+     }
+@@ -870,7 +879,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     }
+     QueueTexture(texture);
+     m_queue.push_back(QueuedPrimitive{batch, texture});
+-    if (m_queue.size() >= 4096u)
++    if (m_queue.size() >= kMaxQueuedPrims)
+         { m_flushReason = 2; FlushQueueUnlocked(); }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 0fb4d04..aa43ede 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_address.h"
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
++#include "ps2_perf.h"
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -2121,6 +2122,7 @@ void PS2Memory::flushGsBatch()
+ void PS2Memory::gsThreadMain()
+ {
+     static const bool stats = std::getenv("APE2_MTGS_STATS") != nullptr;
++    ps2perf::hostRegisterIfSelected("gs");
+     for (;;)
+     {
+         std::vector<uint8_t> batch;
+@@ -2285,6 +2287,7 @@ void PS2Memory::syncGsWorker(int reason)
+ void PS2Memory::gsWorkerMain()
+ {
+     t_onGsWorker = true;
++    ps2perf::hostRegisterIfSelected("vu");
+     static const bool stats = std::getenv("APE2_MTGS_STATS") != nullptr;
+     uint64_t busyUs = 0, lastReport = gsWorkerNowUs();
+     for (;;)
+diff --git a/ps2xRuntime/src/lib/ps2_perf.h b/ps2xRuntime/src/lib/ps2_perf.h
+index 9cce367..b9ddd03 100644
+--- a/ps2xRuntime/src/lib/ps2_perf.h
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -163,6 +163,8 @@ namespace ps2perf
+     //   [perf:host-self] samples=N | 31% name | ...   (leaf function)
+     //   [perf:host-incl] samples=N | 88% name | ...   (anywhere on the stack)
+     void hostRegisterCurrentThread();
++    // APE2_PERF_THREAD=gs|vu|raster: sample that thread instead of the EE (called by those threads at start)
++    void hostRegisterIfSelected(const char *name);
+     void hostSampleTick();
+     void hostReport();
+ 
