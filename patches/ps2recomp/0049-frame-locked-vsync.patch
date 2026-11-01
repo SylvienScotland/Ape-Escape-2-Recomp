@@ -1,0 +1,156 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index e25f39a..bf1ae70 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -39,6 +39,46 @@ namespace
+     constexpr uint32_t WEF_CLEAR_ALL = 0x20u;
+     constexpr auto kVBlankPeriod = std::chrono::microseconds(16667);
+     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
++
++    // Frame-locked vsync (Ape Escape 2 recomp patch 0049): the game moves its camera by the number of vsyncs a
++    // frame took, and overshoots when that is 2 (a frame slower than 16.7 ms): the camera shook. A vsync is held
++    // until the game has finished the frame it started at the previous one (a stage frame, overrides/
++    // zz_ape2_frame_mark.cpp), so every
++    // frame sees one vsync and a slow frame plays a little slower instead, as in the PAL port. A vsync is never
++    // held longer than four periods; screens without the frame mark run free. APE2_VSYNC_FRAMELOCK=0 disables it.
++    std::atomic<uint64_t> g_gameFramesDone{0};
++    uint64_t g_gameFramesAtVsync = 0;
++    std::chrono::steady_clock::time_point g_vsyncHeldSince{};
++
++    bool holdVBlankForGameFrame()
++    {
++        static const bool enabled = []
++        {
++            const char *e = std::getenv("APE2_VSYNC_FRAMELOCK");
++            return !e || std::atoi(e) != 0;
++        }();
++        const uint64_t frames = g_gameFramesDone.load(std::memory_order_acquire);
++        const auto now = std::chrono::steady_clock::now();
++        // only while the game is running frames that mark their end (stages); other screens run free
++        static uint64_t lastFrames = 0;
++        static std::chrono::steady_clock::time_point lastFrameSeen{};
++        if (frames != lastFrames)
++        {
++            lastFrames = frames;
++            lastFrameSeen = now;
++        }
++        const bool active = frames != 0u && now - lastFrameSeen < std::chrono::milliseconds(250);
++        if (enabled && active && frames == g_gameFramesAtVsync)
++        {
++            if (g_vsyncHeldSince == std::chrono::steady_clock::time_point{})
++                g_vsyncHeldSince = now;
++            if (now - g_vsyncHeldSince < 4 * kVBlankPeriod)
++                return true;
++        }
++        g_gameFramesAtVsync = frames;
++        g_vsyncHeldSince = {};
++        return false;
++    }
+     constexpr uint64_t kAlarmTickMicroseconds = 64u;
+     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+ 
+@@ -1904,6 +1944,13 @@ void EeScheduler::processDueDeadlines()
+ 
+         for (ScheduledEvent &scheduled : due)
+         {
++            if (scheduled.event.type == EeEventType::VBlankStart && holdVBlankForGameFrame())
++            {
++                // the game has not finished the frame it started at the last vsync: look again after it has run a
++                // little further (a cycle deadline, so the EE keeps running rather than waiting here)
++                scheduleEvent(m_eeCycle + kVBlankPeriodCycles / 64u, std::chrono::steady_clock::now(), scheduled.event);
++                continue;
++            }
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+@@ -2216,3 +2263,9 @@ void EeScheduler::publishIdleDebugContext()
+         publishDebugContext(selected->activeContext());
+     }
+ }
++
++// the game finished a stage frame (frame-locked vsync, patch 0049; called by the game's override)
++void ape2NoteGameFrame()
++{
++    g_gameFramesDone.fetch_add(1, std::memory_order_release);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_ram_watch.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_ram_watch.cpp
+index e9a9f50..aaa3aee 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_ram_watch.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_ram_watch.cpp
+@@ -37,6 +37,8 @@ namespace
+     thread_local uint8_t *t_target = nullptr;
+     thread_local uintptr_t t_rip = 0;
+     uint32_t g_valueLines = 0;
++    uint32_t g_maxValueLines = 400; // APE2_RAM_WATCH_LINES
++    size_t g_stride = 0, g_strideOff = 0, g_strideLen = 16;
+     std::mutex g_logMutex;
+     std::map<std::pair<uintptr_t, bool>, uint32_t> g_seen;
+     uint32_t g_lines = 0;
+@@ -74,8 +76,38 @@ namespace
+                 auto *target = reinterpret_cast<uint8_t *>(rec->ExceptionInformation[1]);
+                 if (target >= g_pageStart && target < g_pageStart + g_pageBytes)
+                 {
+-                    const bool hit = target + 16 > g_watchStart && target < g_watchStart + g_watchBytes;
+-                    const uintptr_t rip = static_cast<uintptr_t>(info->ContextRecord->Rip);
++                    bool hit = target + 16 > g_watchStart && target < g_watchStart + g_watchBytes;
++                    // APE2_RAM_WATCH_STRIDE=<stride>,<offset>,<len>: only that field of each record in the range
++                    if (hit && g_stride)
++                    {
++                        const size_t rel = static_cast<size_t>(target - g_watchStart) % g_stride;
++                        hit = rel + 16 > g_strideOff && rel < g_strideOff + g_strideLen;
++                    }
++                    uintptr_t rip = static_cast<uintptr_t>(info->ContextRecord->Rip);
++                    if (hit)
++                    {
++                        // a store helper (Ps2FastWrite32, memcpy...): name the recompiled function that called it
++                        CONTEXT c = *info->ContextRecord;
++                        for (int depth = 0; depth < 4; ++depth)
++                        {
++                            DWORD64 imageBase = 0;
++                            PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
++                            if (symbolFor(static_cast<uintptr_t>(c.Rip)).rfind("sub_", 0) == 0)
++                            {
++                                rip = static_cast<uintptr_t>(c.Rip);
++                                break;
++                            }
++                            if (!fe)
++                            {
++                                c.Rip = *reinterpret_cast<const DWORD64 *>(c.Rsp);
++                                c.Rsp += 8;
++                                continue;
++                            }
++                            PVOID handlerData = nullptr;
++                            DWORD64 establisher = 0;
++                            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, fe, &c, &handlerData, &establisher, nullptr);
++                        }
++                    }
+                     {
+                         std::lock_guard<std::mutex> lock(g_logMutex);
+                         uint32_t &count = g_seen[std::make_pair(rip, hit)];
+@@ -102,7 +134,7 @@ namespace
+             if (t_target)
+             {
+                 std::lock_guard<std::mutex> lock(g_logMutex);
+-                if (g_valueLines < 400u)
++                if (g_valueLines < g_maxValueLines)
+                 {
+                     ++g_valueLines;
+                     uint8_t *line = reinterpret_cast<uint8_t *>(reinterpret_cast<uintptr_t>(t_target) & ~uintptr_t(15));
+@@ -147,6 +179,17 @@ void ape2InstallRamWatch(uint8_t *rdram, size_t ramSize)
+     const uintptr_t last = (reinterpret_cast<uintptr_t>(g_watchStart) + bytes + page - 1u) & ~(page - 1u);
+     g_pageStart = reinterpret_cast<uint8_t *>(first);
+     g_pageBytes = last - first;
++    if (const char *st = std::getenv("APE2_RAM_WATCH_STRIDE"))
++    {
++        char *e2 = nullptr;
++        g_stride = static_cast<size_t>(std::strtoul(st, &e2, 0));
++        if (e2 && *e2 == ',')
++            g_strideOff = static_cast<size_t>(std::strtoul(e2 + 1, &e2, 0));
++        if (e2 && *e2 == ',')
++            g_strideLen = static_cast<size_t>(std::strtoul(e2 + 1, &e2, 0));
++    }
++    if (const char *ln = std::getenv("APE2_RAM_WATCH_LINES"))
++        g_maxValueLines = static_cast<uint32_t>(std::strtoul(ln, nullptr, 0));
+     AddVectoredExceptionHandler(1, watchHandler);
+     DWORD old = 0;
+     VirtualProtect(g_pageStart, g_pageBytes, PAGE_READONLY, &old);

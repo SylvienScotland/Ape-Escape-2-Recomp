@@ -570,3 +570,14 @@
 - The game thread now runs with round toward zero + flush-to-zero/denormals-are-zero, as the PAL port's guest
   threads (PCSX2's default "chop" mode); it ran in the host's round-to-nearest before. A first try at the
   camera shaking left/right in some areas. APE2_FPU_NEAREST=1 for the old rounding.
+
+## Camera shake: frame-locked vsync (0049)
+- Recorded with APE2_CAMLOG + APE2_RAM_WATCH (now with APE2_RAM_WATCH_STRIDE=<stride>,<off>,<len>,
+  APE2_RAM_WATCH_LINES and the caller of store helpers named): the gameplay camera is slot 0 (0x4CBAF0, eye at
+  +0x150), moved each frame by 0x272E40 (and corrected by 0x275BB8). With Jimmy standing still the eye ran a
+  sawtooth whose period matched how often a frame took 2 vsyncs (every ~10th frame at ~54 fps, every 3rd at
+  ~40 fps): the camera is moved by the vsyncs a frame took and overshoots at 2.
+- EeScheduler holds a vsync until the game has finished the frame it started at the previous one (end of the
+  stage frame 0x19BCE0, PAL 0x19CF28, marked by overrides/zz_ape2_frame_mark.cpp), at most four periods, and
+  only while stage frames are running; a slow frame now plays slightly slower (as in the PAL port) instead of
+  jumping. APE2_VSYNC_FRAMELOCK=0 disables it. (Marking at sceGsSyncPath did not work: 12 fps.)

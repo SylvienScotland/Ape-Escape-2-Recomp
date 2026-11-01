@@ -27,9 +27,9 @@ namespace
             std::memcpy(eye, &ctx->r[4], 16);
             std::memcpy(target, &ctx->r[5], 16);
             _mm_storeu_ps(vf0, ctx->vu0_vf[0]);
-            std::fprintf(stderr, "[cam] #%llu ra=%06x eye %.1f %.1f %.1f target %.1f %.1f %.1f vf0 %g %g %g %g\n",
+            std::fprintf(stderr, "[cam] #%llu ra=%06x eye %.1f %.1f %.1f target %.1f %.1f %.1f vf0 %g %g %g %g s1=%06x\n",
                          static_cast<unsigned long long>(n), GPR_U32(ctx, 31), eye[0], eye[1], eye[2], target[0], target[1],
-                         target[2], vf0[0], vf0[1], vf0[2], vf0[3]);
+                         target[2], vf0[0], vf0[1], vf0[2], vf0[3], GPR_U32(ctx, 17));
         }
         static const bool flip = std::getenv("APE2_CAMFLIP") != nullptr; // experiment: mirror eye height
         if (flip)
