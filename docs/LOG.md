@@ -535,3 +535,8 @@
   (~99% busy, mostly Submit waiting on raster batches: flush reasons 10 = 4096-primitive batch, 1 = texture
   page still being drawn).
 - Note: APE2_GS_THREADS above 16 crashes when the title's 3D starts (reproducible; default 16 is fine).
+
+## Vsync: no catch-up bursts (0045)
+- The next VBlankStart's host deadline was always previous + 16.7 ms, so after a slow stretch the missed
+  vsyncs fired back to back and the game ran visibly too fast for a moment (reported while playing). When more
+  than a frame late, the next deadline is now "now" (the backlog is dropped).

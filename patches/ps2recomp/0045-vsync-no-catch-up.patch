@@ -1,0 +1,21 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 1af6940..e25f39a 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1909,8 +1909,15 @@ void EeScheduler::processDueDeadlines()
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+                               scheduled.hostDeadline + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
++                // a late vsync does not make the next ones come faster: when the EE fell more than a frame
++                // behind (heavy frames, waits for the GS thread), the missed vsyncs are dropped instead of
++                // delivered back to back, which ran the game too fast for a moment (patch 0045)
++                auto nextHostDeadline = scheduled.hostDeadline + kVBlankPeriod;
++                const auto lateNow = std::chrono::steady_clock::now();
++                if (nextHostDeadline + kVBlankPeriod < lateNow)
++                    nextHostDeadline = lateNow;
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              nextHostDeadline,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
