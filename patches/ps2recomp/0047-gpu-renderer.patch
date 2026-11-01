@@ -1,0 +1,1850 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 7b8e554..a3b7e42 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -13,6 +13,8 @@
+ 
+ class GSCpuBackend final : public GSRasterBackend
+ {
++    friend class GSGlBackend; // the GPU renderer keeps VRAM, CLUTs and texture decoding here (patch 0047)
++
+ public:
+     GSCpuBackend();
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+new file mode 100644
+index 0000000..8bf9d66
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -0,0 +1,1741 @@
++// GPU renderer (Ape Escape 2 recomp patch 0047): the GS drawn with OpenGL 3.3 core.
++//
++// A port of the PAL port's GPU renderer (JackyPendrag0n/ae2-recomp, port/src/gs_hw.h and gl.h, used with the
++// author's permission) to this runtime's raster backend interface. It is the default; APE2_GS_RENDERER=cpu selects the software
++// renderer. It needs the GS thread (APE2_MTGS=2, the default) and falls back to software without a GL context.
++//
++//   - The software backend (GSCpuBackend) stays the owner of VRAM: transfers, CLUT loads and texture decoding
++//     run there as before. Only primitives are drawn on the GPU.
++//   - Render targets live in GPU textures keyed by frame-buffer address/width/format; depth buffers likewise
++//     (32-bit float depth = Z / 2^32). Primitives with the same state are drawn in one call.
++//   - VRAM stays the authority for everything the CPU reads: before a texture decode, CLUT load or transfer
++//     reads VRAM that a target has drawn over, that target is read back; a texture whose address is a render
++//     target samples the target directly (render-to-texture effects); uploads into a target are pushed to it.
++//   - The displayed frame buffer is read back into VRAM when the game swaps buffers and at each vsync mark,
++//     and the existing presentation path shows VRAM.
++//
++// GS colour maths is done in the fragment shader in 0..255 units with the GS's integer truncation; blending uses
++// dual-source fixed-function blending where the GS equation allows, the rest reads the destination in the shader.
++#if defined(_WIN32)
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++
++#include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/ps2_gs_common.h"
++#include "runtime/gs/ps2_gs_memory.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++// ------------------------------------------------------------------ minimal GL 3.3 loader (after PAL's gl.h)
++namespace ape2gl
++{
++    typedef unsigned int GLenum, GLuint, GLbitfield;
++    typedef int GLint, GLsizei;
++    typedef unsigned char GLboolean, GLubyte;
++    typedef float GLfloat;
++    typedef char GLchar;
++    typedef ptrdiff_t GLsizeiptr, GLintptr;
++
++    constexpr GLenum GL_TRIANGLES = 0x0004, GL_TRIANGLE_STRIP = 0x0005;
++    constexpr GLenum GL_ZERO = 0, GL_ONE = 1, GL_DST_COLOR = 0x0306;
++    constexpr GLenum GL_SRC1_ALPHA = 0x8589, GL_ONE_MINUS_SRC1_ALPHA = 0x88FB;
++    constexpr GLenum GL_FUNC_ADD = 0x8006, GL_FUNC_SUBTRACT = 0x800A, GL_FUNC_REVERSE_SUBTRACT = 0x800B;
++    constexpr GLenum GL_GREATER = 0x0204, GL_GEQUAL = 0x0206, GL_ALWAYS = 0x0207;
++    constexpr GLenum GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_SCISSOR_TEST = 0x0C11, GL_CULL_FACE = 0x0B44;
++    constexpr GLenum GL_UNPACK_ALIGNMENT = 0x0CF5, GL_PACK_ALIGNMENT = 0x0D05;
++    constexpr GLenum GL_TEXTURE_2D = 0x0DE1, GL_UNSIGNED_BYTE = 0x1401, GL_FLOAT = 0x1406;
++    constexpr GLenum GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_DEPTH_COMPONENT = 0x1902, GL_DEPTH_COMPONENT32F = 0x8CAC;
++    constexpr GLenum GL_NEAREST = 0x2600, GL_LINEAR = 0x2601;
++    constexpr GLenum GL_TEXTURE_MAG_FILTER = 0x2800, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803;
++    constexpr GLenum GL_CLAMP_TO_EDGE = 0x812F, GL_REPEAT = 0x2901;
++    constexpr GLenum GL_TEXTURE0 = 0x84C0, GL_TEXTURE1 = 0x84C1;
++    constexpr GLenum GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0;
++    constexpr GLenum GL_FRAGMENT_SHADER = 0x8B30, GL_VERTEX_SHADER = 0x8B31, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82;
++    constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9;
++    constexpr GLenum GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_FRAMEBUFFER_COMPLETE = 0x8CD5;
++    constexpr GLbitfield GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x0100;
++    constexpr GLenum GL_RENDERER = 0x1F01, GL_EXTENSIONS = 0x1F03, GL_NUM_EXTENSIONS = 0x821D, GL_MAX_TEXTURE_SIZE = 0x0D33;
++
++#define APE2_GL_FUNCS(X)                                                                                                     \
++    X(void, glClear, (GLbitfield))                                                                                         \
++    X(void, glClearColor, (GLfloat, GLfloat, GLfloat, GLfloat))                                                            \
++    X(void, glClearDepth, (double))                                                                                        \
++    X(void, glViewport, (GLint, GLint, GLsizei, GLsizei))                                                                  \
++    X(void, glScissor, (GLint, GLint, GLsizei, GLsizei))                                                                   \
++    X(void, glEnable, (GLenum))                                                                                            \
++    X(void, glDisable, (GLenum))                                                                                           \
++    X(GLenum, glGetError, (void))                                                                                          \
++    X(const GLubyte *, glGetString, (GLenum))                                                                              \
++    X(const GLubyte *, glGetStringi, (GLenum, GLuint))                                                                     \
++    X(void, glGetIntegerv, (GLenum, GLint *))                                                                              \
++    X(void, glBlendFuncSeparate, (GLenum, GLenum, GLenum, GLenum))                                                         \
++    X(void, glBlendEquationSeparate, (GLenum, GLenum))                                                                     \
++    X(void, glColorMask, (GLboolean, GLboolean, GLboolean, GLboolean))                                                     \
++    X(void, glDepthFunc, (GLenum))                                                                                         \
++    X(void, glDepthMask, (GLboolean))                                                                                      \
++    X(void, glPixelStorei, (GLenum, GLint))                                                                                \
++    X(void, glGenTextures, (GLsizei, GLuint *))                                                                            \
++    X(void, glDeleteTextures, (GLsizei, const GLuint *))                                                                   \
++    X(void, glBindTexture, (GLenum, GLuint))                                                                               \
++    X(void, glActiveTexture, (GLenum))                                                                                     \
++    X(void, glTexParameteri, (GLenum, GLenum, GLint))                                                                      \
++    X(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *))                   \
++    X(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *))                \
++    X(void, glReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))                                        \
++    X(void, glGenBuffers, (GLsizei, GLuint *))                                                                             \
++    X(void, glBindBuffer, (GLenum, GLuint))                                                                                \
++    X(void, glBufferData, (GLenum, GLsizeiptr, const void *, GLenum))                                                      \
++    X(void, glGenVertexArrays, (GLsizei, GLuint *))                                                                        \
++    X(void, glBindVertexArray, (GLuint))                                                                                   \
++    X(void, glEnableVertexAttribArray, (GLuint))                                                                           \
++    X(void, glDisableVertexAttribArray, (GLuint))                                                                          \
++    X(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *))                              \
++    X(void, glDrawArrays, (GLenum, GLint, GLsizei))                                                                        \
++    X(GLuint, glCreateShader, (GLenum))                                                                                    \
++    X(void, glShaderSource, (GLuint, GLsizei, const GLchar *const *, const GLint *))                                       \
++    X(void, glCompileShader, (GLuint))                                                                                     \
++    X(void, glGetShaderiv, (GLuint, GLenum, GLint *))                                                                      \
++    X(void, glGetShaderInfoLog, (GLuint, GLsizei, GLsizei *, GLchar *))                                                    \
++    X(GLuint, glCreateProgram, (void))                                                                                     \
++    X(void, glAttachShader, (GLuint, GLuint))                                                                              \
++    X(void, glLinkProgram, (GLuint))                                                                                       \
++    X(void, glGetProgramiv, (GLuint, GLenum, GLint *))                                                                     \
++    X(void, glGetProgramInfoLog, (GLuint, GLsizei, GLsizei *, GLchar *))                                                   \
++    X(void, glUseProgram, (GLuint))                                                                                        \
++    X(void, glDeleteShader, (GLuint))                                                                                      \
++    X(void, glBindAttribLocation, (GLuint, GLuint, const GLchar *))                                                        \
++    X(GLint, glGetUniformLocation, (GLuint, const GLchar *))                                                               \
++    X(void, glUniform1i, (GLint, GLint))                                                                                   \
++    X(void, glUniform1f, (GLint, GLfloat))                                                                                 \
++    X(void, glUniform2f, (GLint, GLfloat, GLfloat))                                                                        \
++    X(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))                                                      \
++    X(void, glUniform4i, (GLint, GLint, GLint, GLint, GLint))                                                              \
++    X(void, glGenFramebuffers, (GLsizei, GLuint *))                                                                        \
++    X(void, glDeleteFramebuffers, (GLsizei, const GLuint *))                                                               \
++    X(void, glBindFramebuffer, (GLenum, GLuint))                                                                           \
++    X(void, glFramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))                                               \
++    X(GLenum, glCheckFramebufferStatus, (GLenum))                                                                          \
++    X(void, glBlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum))               \
++    X(void, glFlush, (void))                                                                                               \
++    X(void, glTextureBarrier, (void))
++
++#define APE2_GL_DEF(ret, name, args) ret(WINAPI *name) args = nullptr;
++    APE2_GL_FUNCS(APE2_GL_DEF)
++#undef APE2_GL_DEF
++
++    bool load()
++    {
++        HMODULE gl32 = GetModuleHandleA("opengl32.dll");
++        if (!gl32)
++            gl32 = LoadLibraryA("opengl32.dll");
++        auto get = [gl32](const char *name) -> void *
++        {
++            void *p = reinterpret_cast<void *>(wglGetProcAddress(name));
++            const intptr_t v = reinterpret_cast<intptr_t>(p);
++            if (v == 0 || v == 1 || v == 2 || v == 3 || v == -1)
++                p = gl32 ? reinterpret_cast<void *>(GetProcAddress(gl32, name)) : nullptr;
++            return p;
++        };
++        bool ok = true;
++#define APE2_GL_LOAD(ret, name, args)                                    \
++    name = reinterpret_cast<ret(WINAPI *) args>(get(#name));             \
++    if (!name && std::strcmp(#name, "glTextureBarrier") != 0)            \
++    {                                                                    \
++        std::fprintf(stderr, "[gpu] missing GL function %s\n", #name);  \
++        ok = false;                                                      \
++    }
++        APE2_GL_FUNCS(APE2_GL_LOAD)
++#undef APE2_GL_LOAD
++        return ok;
++    }
++
++    bool hasExtension(const char *name)
++    {
++        GLint n = 0;
++        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
++        for (GLint i = 0; i < n; ++i)
++        {
++            const char *e = reinterpret_cast<const char *>(glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(i)));
++            if (e && std::strcmp(e, name) == 0)
++                return true;
++        }
++        return false;
++    }
++
++    GLuint compile(const char *vs, const char *fs, const char *what)
++    {
++        GLuint p = glCreateProgram();
++        const char *src[2] = {vs, fs};
++        const GLenum ty[2] = {GL_VERTEX_SHADER, GL_FRAGMENT_SHADER};
++        for (int i = 0; i < 2; ++i)
++        {
++            GLuint s = glCreateShader(ty[i]);
++            glShaderSource(s, 1, &src[i], nullptr);
++            glCompileShader(s);
++            GLint ok = 0;
++            glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++            if (!ok)
++            {
++                char log[4096];
++                glGetShaderInfoLog(s, sizeof log, nullptr, log);
++                std::fprintf(stderr, "[gpu] %s %s shader: %s\n", what, i ? "fragment" : "vertex", log);
++            }
++            glAttachShader(p, s);
++            glDeleteShader(s);
++        }
++        glBindAttribLocation(p, 0, "a0");
++        glBindAttribLocation(p, 1, "a1");
++        glBindAttribLocation(p, 2, "a2");
++        glLinkProgram(p);
++        GLint ok = 0;
++        glGetProgramiv(p, GL_LINK_STATUS, &ok);
++        if (!ok)
++        {
++            char log[4096];
++            glGetProgramInfoLog(p, sizeof log, nullptr, log);
++            std::fprintf(stderr, "[gpu] %s link: %s\n", what, log);
++            return 0;
++        }
++        return p;
++    }
++}
++
++// ------------------------------------------------------------------ the GS thread's GL context (GLFW, from raylib)
++extern "C"
++{
++    typedef struct GLFWwindow GLFWwindow;
++    void glfwDefaultWindowHints(void);
++    void glfwWindowHint(int hint, int value);
++    GLFWwindow *glfwCreateWindow(int width, int height, const char *title, void *monitor, GLFWwindow *share);
++    GLFWwindow *glfwGetCurrentContext(void);
++    void glfwMakeContextCurrent(GLFWwindow *window);
++}
++
++namespace
++{
++    GLFWwindow *g_gsGlWindow = nullptr;
++
++    bool gpuRequested()
++    {
++        const char *e = std::getenv("APE2_GS_RENDERER");
++        return !e || std::strcmp(e, "cpu") != 0; // the GPU renderer is the default
++    }
++}
++
++// Main thread, after the window exists: a hidden window whose context (shared with the main one) the GS thread uses.
++void ape2CreateGsGlContext()
++{
++    if (!gpuRequested() || g_gsGlWindow)
++        return;
++    GLFWwindow *main = glfwGetCurrentContext();
++    glfwDefaultWindowHints();
++    glfwWindowHint(0x00020004, 0);          // GLFW_VISIBLE
++    glfwWindowHint(0x00022002, 3);          // GLFW_CONTEXT_VERSION_MAJOR
++    glfwWindowHint(0x00022003, 3);          // GLFW_CONTEXT_VERSION_MINOR
++    glfwWindowHint(0x00022008, 0x00032001); // GLFW_OPENGL_PROFILE: core
++    g_gsGlWindow = glfwCreateWindow(16, 16, "gs", nullptr, main);
++    glfwDefaultWindowHints();
++    if (main)
++        glfwMakeContextCurrent(main);
++    std::fprintf(stderr, g_gsGlWindow ? "[gpu] GL context for the GS thread created\n" : "[gpu] could not create a GL context for the GS thread\n");
++}
++
++// ------------------------------------------------------------------ the backend
++using namespace ape2gl;
++
++class GSGlBackend final : public GSRasterBackend
++{
++public:
++    GSGlBackend() : m_cpu(std::make_unique<GSCpuBackend>()) {}
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override { m_cpu->Initialize(vram, vramSize); }
++    void Reset() override
++    {
++        if (onGl())
++            dropTargets();
++        m_cpu->Reset();
++    }
++
++    void Submit(const GSPrimitiveBatch &batch) override
++    {
++        if (!ensureInit())
++        {
++            m_cpu->Submit(batch);
++            return;
++        }
++        prim(batch);
++    }
++
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
++    {
++        if (onGl())
++            syncRange(tex0.cbp, 8u, "clut");
++        m_cpu->LoadClut(tex0, texclut);
++    }
++
++    void BeginTransfer(const GSTransferCommand &command) override
++    {
++        if (onGl())
++        {
++            const auto &b = command.bitbltbuf;
++            const auto &p = command.trxpos;
++            const auto &r = command.trxreg;
++            if (command.direction == 0u || command.direction == 2u)
++            {
++                // the destination's drawing goes back to VRAM before it is (partly) overwritten
++                syncRange(b.dbp, transferBlocks(b.dbw, b.dpsm, p.dsay, r.rrw, r.rrh), "transfer destination");
++            }
++            if (command.direction == 1u || command.direction == 2u)
++                syncRange(b.sbp, transferBlocks(b.sbw, b.spsm, p.ssay, r.rrw, r.rrh), "transfer source");
++        }
++        m_cpu->BeginTransfer(command);
++        if (onGl())
++        {
++            if (command.direction == 0u)
++            {
++                m_upload = command;
++                m_uploadActive = true;
++            }
++            else if (command.direction == 2u)
++                vramWritten(command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsax,
++                            command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
++        }
++    }
++
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
++    {
++        m_cpu->UploadImage(data, sizeBytes);
++        if (onGl() && m_uploadActive)
++        {
++            const GSTransferSnapshot snap = m_cpu->GetTransferSnapshot();
++            if (snap.copiedPixels >= snap.totalPixels)
++            {
++                m_uploadActive = false;
++                vramWritten(m_upload.bitbltbuf.dbp, m_upload.bitbltbuf.dbw, m_upload.bitbltbuf.dpsm, m_upload.trxpos.dsax,
++                            m_upload.trxpos.dsay, m_upload.trxreg.rrw, m_upload.trxreg.rrh);
++            }
++        }
++    }
++
++    void Flush() override
++    {
++        if (onGl())
++            flush();
++        m_cpu->Flush();
++    }
++    void TextureFlush() override { m_cpu->TextureFlush(); }
++    void Sync(GSSyncReason reason) override
++    {
++        if (onGl())
++            flush();
++        m_cpu->Sync(reason);
++    }
++    PresentationFrame Present(const GSPresentationRequest &request) override { return m_cpu->Present(request); }
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
++    {
++        if (onGl())
++            syncRange(GSInternal::framePageBaseToBlock(context.frame.fbp), 2048u, "clear");
++        const bool done = m_cpu->ClearFramebuffer(context, rgba);
++        if (onGl())
++            vramWritten(GSInternal::framePageBaseToBlock(context.frame.fbp), context.frame.fbw, context.frame.psm, 0,
++                        0, static_cast<int>(context.frame.fbw) * 64, context.scissor.y1 + 1);
++        return done;
++    }
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { return m_cpu->ConsumeLocalToHostBytes(dst, maxBytes); }
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { return m_cpu->ReadVram(psm, base, bw, x, y); }
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override { m_cpu->WriteVram(psm, base, bw, x, y, value); }
++    void SnapshotVram(std::vector<uint8_t> &out) const override { m_cpu->SnapshotVram(out); }
++    GSTransferSnapshot GetTransferSnapshot() const override { return m_cpu->GetTransferSnapshot(); }
++
++    // GS thread: the game swapped buffers / a vsync passed: the displayed buffers' drawing goes to VRAM
++    void Display(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2)
++    {
++        if (!onGl())
++            return;
++        for (int n = 0; n < 2; ++n)
++        {
++            if (!(pmode & (1ull << n)))
++                continue;
++            const uint64_t fb = n ? dispfb2 : dispfb1;
++            const uint32_t fbp = static_cast<uint32_t>(fb & 0x1FFu) * 32u, fbw = static_cast<uint32_t>((fb >> 9) & 0x3Fu);
++            const uint32_t psm = static_cast<uint32_t>((fb >> 15) & 0x1Fu);
++            if (Target *rt = findTarget(fbp, fbw, is16(psm)))
++                if (rt->gpuDirty)
++                {
++                    flush();
++                    download(*rt);
++                }
++        }
++        if (++m_frames % 600u == 0u)
++        {
++            std::fprintf(stderr, "[gpu] last 600 displays: %llu prims in %llu draws, %llu destination reads, %llu read-backs (%llu for display), %llu target uploads, %llu texture uploads\n",
++                         static_cast<unsigned long long>(m_stDraws), static_cast<unsigned long long>(m_stBatches),
++                         static_cast<unsigned long long>(m_stDstReads), static_cast<unsigned long long>(m_stDownloads),
++                         static_cast<unsigned long long>(m_stDisplayDownloads), static_cast<unsigned long long>(m_stUploads),
++                         static_cast<unsigned long long>(m_stTexUploads));
++            m_stDraws = m_stBatches = m_stDstReads = m_stDownloads = m_stDisplayDownloads = m_stUploads = m_stTexUploads = 0;
++        }
++    }
++
++private:
++    // ---------------------------------------------------------------- state
++    struct Target
++    {
++        bool used = false;
++        uint32_t fbp = 0, fbw = 0; // fbp in 256-byte blocks
++        bool is16 = false;
++        int w = 0, h = 0; // native size of the GL texture
++        int vh = 0;       // rows in use (whole VRAM pages)
++        GLuint tex = 0, fbo = 0;
++        GLuint ztex = 0;
++        bool gpuDirty = false;
++        int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
++        uint64_t lru = 0;
++    };
++    struct Depth
++    {
++        bool used = false;
++        uint32_t zbp = 0;
++        int w = 0, h = 0;
++        GLuint tex = 0;
++        uint64_t lru = 0;
++    };
++    struct DrawState
++    {
++        Target *rt = nullptr;
++        Depth *zb = nullptr;
++        GLuint tex = 0;
++        int texRt = 0, bilinear = 0, wms = 0, wmt = 0;
++        int mode[4] = {}, atst[4] = {}, blend[4] = {}, misc[4] = {}, fog[4] = {};
++        float fix = 0.0f;
++        int depthFunc = 0, depthWrite = 0, depthTest = 0;
++        int cmask[4] = {};
++        int blOn = 0, blEq = 0, blSf = 0, blDf = 0;
++        int needDst = 0;
++        int scx0 = 0, scy0 = 0, scx1 = 0, scy1 = 0;
++        int pass2 = 0;
++        bool operator==(const DrawState &o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
++    };
++    struct Vert
++    {
++        float x, y, z, f;
++        float r, g, b, a;
++        float s, t, q, pad;
++    };
++    static constexpr int kTargets = 16;
++    static constexpr size_t kMaxVerts = 65536;
++    static constexpr int kMaxDstBoxes = 256;
++
++    std::unique_ptr<GSCpuBackend> m_cpu;
++    bool m_inited = false, m_failed = false;
++    std::thread::id m_glThread{};
++    int m_scale = 1;
++    bool m_barrier = false;
++    GLuint m_prog = 0, m_progCopy = 0, m_vao = 0, m_vbo = 0;
++    GLint u_tex = -1, u_dst = -1, u_vp = -1, u_mode = -1, u_atst = -1, u_blend = -1, u_misc = -1, u_dstoff = -1, u_fix = -1, u_fog = -1;
++    GLint uc_tex = -1;
++    GLuint m_dstCopyTex = 0, m_dstCopyFbo = 0;
++    int m_dstCopyW = 0, m_dstCopyH = 0;
++    GLuint m_upTex = 0;
++    int m_upW = 0, m_upH = 0;
++    GLuint m_dnTex = 0, m_dnFbo = 0;
++    int m_dnW = 0, m_dnH = 0;
++    GLuint m_snapTex = 0, m_snapFbo = 0;
++    int m_snapW = 0, m_snapH = 0;
++    Target m_rt[kTargets];
++    Depth m_z[kTargets];
++    uint64_t m_tick = 0;
++    DrawState m_cur{};
++    bool m_haveCur = false;
++    std::vector<Vert> m_v;
++    int m_bx0 = 1 << 20, m_by0 = 1 << 20, m_bx1 = -(1 << 20), m_by1 = -(1 << 20);
++    int m_db[kMaxDstBoxes][4] = {};
++    int m_ndb = 0;
++    float m_fu = 1, m_fv = 1, m_su = 1, m_sv = 1;
++    GSTransferCommand m_upload{};
++    bool m_uploadActive = false;
++    struct GlTexture
++    {
++        GLuint tex = 0;
++        uint64_t epoch = 0, key0 = 0, key1 = 0, key2 = 0;
++        uint32_t clutVersion = 0;
++        int w = 0, h = 0;
++    };
++    std::unordered_map<const void *, GlTexture> m_textures;
++    uint64_t m_frames = 0;
++    uint64_t m_stDraws = 0, m_stBatches = 0, m_stDstReads = 0, m_stDownloads = 0, m_stDisplayDownloads = 0, m_stUploads = 0, m_stTexUploads = 0;
++    bool m_inDisplayDownload = false;
++
++    static bool is16(uint32_t psm) { return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S; }
++    bool onGl() const { return m_inited && !m_failed && std::this_thread::get_id() == m_glThread; }
++
++    // ---------------------------------------------------------------- shaders (PAL's, unchanged)
++    static constexpr const char *kVs =
++        "#version 330 core\n"
++        "in vec4 a0; in vec4 a1; in vec4 a2;\n"
++        "uniform vec4 u_vp;\n"
++        "out vec4 v_col; flat out vec4 v_colf; noperspective out vec3 v_stq; noperspective out float v_z; noperspective out float v_f;\n"
++        "void main() {\n"
++        "  vec2 p = (a0.xy + 0.5) * u_vp.xy - 1.0;\n"
++        "  v_z = a0.z * u_vp.z;\n"
++        "  gl_Position = vec4(p, 0.0, 1.0);\n"
++        "  v_col = a1; v_colf = a1; v_stq = a2.xyz; v_f = a0.w;\n"
++        "}\n";
++    static constexpr const char *kFs =
++        "#version 330 core\n"
++        "in vec4 v_col; flat in vec4 v_colf; noperspective in vec3 v_stq; noperspective in float v_z; noperspective in float v_f;\n"
++        "uniform sampler2D u_tex; uniform sampler2D u_dst;\n"
++        "uniform ivec4 u_mode; uniform ivec4 u_atst; uniform ivec4 u_blend; uniform ivec4 u_misc; uniform ivec4 u_fog;\n"
++        "uniform vec2 u_dstoff; uniform float u_fix;\n"
++        "layout(location = 0, index = 0) out vec4 o_col;\n"
++        "layout(location = 0, index = 1) out vec4 o_fac;\n"
++        "void main() {\n"
++        "  vec4 c = u_mode.w != 0 ? v_col : v_colf;\n"
++        "  c = floor(c + 0.0001);\n"
++        "  vec3 rgb = c.rgb; float a = c.a;\n"
++        "  if (u_mode.x != 0) {\n"
++        "    vec4 t = floor(texture(u_tex, v_stq.xy / v_stq.z) * 255.0 + 0.5);\n"
++        "    int tfx = u_mode.y;\n"
++        "    if (tfx == 0) { rgb = floor(t.rgb * c.rgb / 128.0); a = u_mode.z != 0 ? floor(t.a * c.a / 128.0) : c.a; }\n"
++        "    else if (tfx == 1) { rgb = t.rgb; a = u_mode.z != 0 ? t.a : c.a; }\n"
++        "    else if (tfx == 2) { rgb = floor(t.rgb * c.rgb / 128.0) + c.a; a = u_mode.z != 0 ? t.a + c.a : c.a; }\n"
++        "    else { rgb = floor(t.rgb * c.rgb / 128.0) + c.a; a = u_mode.z != 0 ? t.a : c.a; }\n"
++        "    rgb = min(rgb, 255.0); a = min(a, 255.0);\n"
++        "  }\n"
++        "  if (u_fog.x != 0) {\n"
++        "    float f = clamp(floor(v_f + 0.0001), 0.0, 255.0);\n"
++        "    rgb = floor((f * rgb + (255.0 - f) * vec3(u_fog.yzw)) / 256.0);\n"
++        "  }\n"
++        "  bool pass = true; float ar = float(u_atst.y);\n"
++        "  switch (u_atst.x) {\n"
++        "    case 0: pass = false; break; case 2: pass = a < ar; break; case 3: pass = a <= ar; break;\n"
++        "    case 4: pass = a == ar; break; case 5: pass = a >= ar; break; case 6: pass = a > ar; break;\n"
++        "    case 7: pass = a != ar; break; default: pass = true; break;\n"
++        "  }\n"
++        "  if (u_atst.z == 0 && !pass) discard;\n"
++        "  if (u_atst.z == 1 && pass) discard;\n"
++        "  vec4 d = vec4(0.0);\n"
++        "  if (u_blend.x != 0 || u_atst.w != 0) d = floor(texelFetch(u_dst, ivec2(gl_FragCoord.xy - u_dstoff), 0) * 255.0 + 0.5);\n"
++        "  if (u_atst.w == 1 && d.a >= 128.0) discard;\n"
++        "  if (u_atst.w == 2 && d.a < 128.0) discard;\n"
++        "  float asrc = a;\n"
++        "  if (u_blend.x != 0 && !(u_misc.y != 0 && asrc < 128.0)) {\n"
++        "    int ab = u_blend.y; int A = ab / 16, B = (ab / 4) & 3, D = ab & 3;\n"
++        "    vec3 cA = A == 0 ? rgb : A == 1 ? d.rgb : vec3(0.0);\n"
++        "    vec3 cB = B == 0 ? rgb : B == 1 ? d.rgb : vec3(0.0);\n"
++        "    vec3 cD = D == 0 ? rgb : D == 1 ? d.rgb : vec3(0.0);\n"
++        "    float C = u_blend.z == 0 ? asrc : u_blend.z == 1 ? d.a : u_fix;\n"
++        "    rgb = floor((cA - cB) * C / 128.0) + cD;\n"
++        "    rgb = u_misc.w != 0 ? clamp(rgb, 0.0, 255.0) : mod(rgb, 256.0);\n"
++        "  }\n"
++        "  float aout = (u_misc.x != 0 && a < 128.0) ? a + 128.0 : a;\n"
++        "  o_col = vec4(rgb / 255.0, aout / 255.0);\n"
++        "  float fac = u_misc.z == 1 ? u_fix / 128.0 : asrc / 128.0;\n"
++        "  o_fac = vec4(fac);\n"
++        "  if (u_misc.z == 2) o_col.rgb = vec3(min(asrc / 128.0, 1.0));\n"
++        "  if (u_misc.z == 3) o_col.rgb = min(floor(rgb * asrc / 128.0), 255.0) / 255.0;\n"
++        "  gl_FragDepth = v_z;\n"
++        "}\n";
++    static constexpr const char *kVsCopy =
++        "#version 330 core\nin vec4 a0; out vec2 uv;\n"
++        "void main() { uv = a0.zw; gl_Position = vec4(a0.xy, 0.0, 1.0); }\n";
++    static constexpr const char *kFsCopy =
++        "#version 330 core\nin vec2 uv; uniform sampler2D u_tex; out vec4 o;\n"
++        "void main() { o = texture(u_tex, uv); }\n";
++
++    // ---------------------------------------------------------------- init
++    bool ensureInit()
++    {
++        if (m_inited)
++            return !m_failed && std::this_thread::get_id() == m_glThread;
++        m_inited = true;
++        m_glThread = std::this_thread::get_id();
++        if (!g_gsGlWindow)
++        {
++            std::fprintf(stderr, "[gpu] no GL context for the GS thread; using the software renderer\n");
++            m_failed = true;
++            return false;
++        }
++        glfwMakeContextCurrent(g_gsGlWindow);
++        if (!ape2gl::load())
++        {
++            std::fprintf(stderr, "[gpu] OpenGL functions missing; using the software renderer\n");
++            m_failed = true;
++            return false;
++        }
++        m_prog = compile(kVs, kFs, "gs");
++        m_progCopy = compile(kVsCopy, kFsCopy, "gs-copy");
++        if (!m_prog || !m_progCopy)
++        {
++            std::fprintf(stderr, "[gpu] shader setup failed; using the software renderer\n");
++            m_failed = true;
++            return false;
++        }
++        u_tex = glGetUniformLocation(m_prog, "u_tex");
++        u_dst = glGetUniformLocation(m_prog, "u_dst");
++        u_vp = glGetUniformLocation(m_prog, "u_vp");
++        u_mode = glGetUniformLocation(m_prog, "u_mode");
++        u_atst = glGetUniformLocation(m_prog, "u_atst");
++        u_blend = glGetUniformLocation(m_prog, "u_blend");
++        u_misc = glGetUniformLocation(m_prog, "u_misc");
++        u_dstoff = glGetUniformLocation(m_prog, "u_dstoff");
++        u_fix = glGetUniformLocation(m_prog, "u_fix");
++        u_fog = glGetUniformLocation(m_prog, "u_fog");
++        uc_tex = glGetUniformLocation(m_progCopy, "u_tex");
++        glGenVertexArrays(1, &m_vao);
++        glBindVertexArray(m_vao);
++        glGenBuffers(1, &m_vbo);
++        glDisable(GL_CULL_FACE);
++        m_barrier = glTextureBarrier != nullptr && (hasExtension("GL_ARB_texture_barrier") || hasExtension("GL_NV_texture_barrier"));
++        if (const char *e = std::getenv("APE2_GS_SCALE"))
++            m_scale = std::clamp(std::atoi(e), 1, 8);
++        GLint maxTex = 0;
++        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
++        while (m_scale > 1 && 1024 * m_scale > maxTex)
++            --m_scale;
++        m_v.reserve(kMaxVerts);
++        std::fprintf(stderr, "[gpu] GPU renderer on %s, %dx internal resolution%s\n",
++                     reinterpret_cast<const char *>(glGetString(GL_RENDERER)), m_scale, m_barrier ? ", texture barriers" : "");
++        return true;
++    }
++
++    // ---------------------------------------------------------------- helpers
++    static void texParams(GLuint t, GLint filter, GLint wrapS, GLint wrapT)
++    {
++        glBindTexture(GL_TEXTURE_2D, t);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
++    }
++    static GLuint newTex(int w, int h, GLenum ifmt, GLenum fmt, GLenum type)
++    {
++        GLuint t = 0;
++        glGenTextures(1, &t);
++        glBindTexture(GL_TEXTURE_2D, t);
++        glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(ifmt), w, h, 0, fmt, type, nullptr);
++        texParams(t, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
++        return t;
++    }
++    void quad(GLuint src, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, bool linear)
++    {
++        const float q[16] = {x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1, x1, y1, u1, v1};
++        glUseProgram(m_progCopy);
++        glUniform1i(uc_tex, 0);
++        glActiveTexture(GL_TEXTURE0);
++        texParams(src, linear ? GL_LINEAR : GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
++        glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
++        glBufferData(GL_ARRAY_BUFFER, sizeof q, q, GL_STREAM_DRAW);
++        glEnableVertexAttribArray(0);
++        glVertexAttribPointer(0, 4, GL_FLOAT, 0, 16, nullptr);
++        glDisableVertexAttribArray(1);
++        glDisableVertexAttribArray(2);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        m_haveCur = false;
++    }
++    static void plainState()
++    {
++        glDisable(GL_BLEND);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_SCISSOR_TEST);
++        glDepthMask(0);
++        glColorMask(1, 1, 1, 1);
++    }
++
++    // ---------------------------------------------------------------- VRAM <-> GPU
++    void vramReadRgba(uint32_t bp, uint32_t bw, uint32_t psm, int x0, int y0, int w, int h, std::vector<uint32_t> &out)
++    {
++        out.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
++        std::lock_guard<std::mutex> lock(m_cpu->m_mutex);
++        for (int y = 0; y < h; ++y)
++            for (int x = 0; x < w; ++x)
++            {
++                uint32_t c = m_cpu->ReadVramUnlocked(psm, bp, bw, static_cast<uint32_t>(x0 + x) & 2047u, static_cast<uint32_t>(y0 + y) & 2047u);
++                if (is16(psm))
++                    c = ((c & 0x1fu) << 3) | (((c >> 5) & 0x1fu) << 11) | (((c >> 10) & 0x1fu) << 19) | ((c & 0x8000u) ? 0x80000000u : 0u);
++                else if (psm == GS_PSM_CT24)
++                    c |= 0x80000000u;
++                out[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] = c;
++            }
++    }
++    void uploadRect(Target &rt, int x0, int y0, int w, int h, const uint32_t *px)
++    {
++        if (!m_upTex || m_upW < w || m_upH < h)
++        {
++            if (m_upTex)
++                glDeleteTextures(1, &m_upTex);
++            m_upW = std::max(w, m_upW);
++            m_upH = std::max(h, m_upH);
++            m_upTex = newTex(m_upW, m_upH, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++        }
++        glBindTexture(GL_TEXTURE_2D, m_upTex);
++        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
++        glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
++        glViewport(0, 0, rt.w * m_scale, rt.h * m_scale);
++        plainState();
++        const float X0 = 2.0f * x0 / rt.w - 1, X1 = 2.0f * (x0 + w) / rt.w - 1, Y0 = 2.0f * y0 / rt.h - 1, Y1 = 2.0f * (y0 + h) / rt.h - 1;
++        quad(m_upTex, X0, Y0, X1, Y1, 0, 0, static_cast<float>(w) / m_upW, static_cast<float>(h) / m_upH, false);
++        ++m_stUploads;
++    }
++    // the drawn part of a target back into VRAM (downscaled, point sampled)
++    void download(Target &rt)
++    {
++        if (!rt.gpuDirty)
++            return;
++        const int w = rt.w, h = rt.h;
++        if (!m_dnTex || m_dnW != w || m_dnH != h)
++        {
++            if (m_dnTex)
++            {
++                glDeleteTextures(1, &m_dnTex);
++                glDeleteFramebuffers(1, &m_dnFbo);
++            }
++            m_dnTex = newTex(w, h, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++            m_dnW = w;
++            m_dnH = h;
++            glGenFramebuffers(1, &m_dnFbo);
++            glBindFramebuffer(GL_FRAMEBUFFER, m_dnFbo);
++            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_dnTex, 0);
++        }
++        const int x0 = rt.dx0, y0 = rt.dy0, rw = rt.dx1 - rt.dx0 + 1, rh = rt.dy1 - rt.dy0 + 1;
++        glBindFramebuffer(GL_FRAMEBUFFER, m_dnFbo);
++        glViewport(0, 0, w, h);
++        plainState();
++        quad(rt.tex, -1, -1, 1, 1, 0, 0, 1, 1, false);
++        std::vector<uint32_t> px(static_cast<size_t>(rw) * static_cast<size_t>(rh));
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
++        const uint32_t psm = rt.is16 ? GS_PSM_CT16 : GS_PSM_CT32;
++        {
++            std::lock_guard<std::mutex> lock(m_cpu->m_mutex);
++            for (int y = 0; y < rh; ++y)
++                for (int x = 0; x < rw; ++x)
++                {
++                    uint32_t c = px[static_cast<size_t>(y) * static_cast<size_t>(rw) + static_cast<size_t>(x)];
++                    if (rt.is16)
++                        c = ((c >> 3) & 0x1fu) | (((c >> 11) & 0x1fu) << 5) | (((c >> 19) & 0x1fu) << 10) | ((c >> 31) << 15);
++                    m_cpu->WriteVramUnlocked(psm, rt.fbp, rt.fbw, static_cast<uint32_t>(x0 + x), static_cast<uint32_t>(y0 + y), c);
++                }
++            // decoded textures of these pages are stale now
++            m_cpu->StampPagesUnlocked(psm, rt.fbp, rt.fbw, static_cast<uint32_t>(x0), static_cast<uint32_t>(y0),
++                                      static_cast<uint32_t>(x0 + rw - 1), static_cast<uint32_t>(y0 + rh - 1));
++            m_cpu->m_vramEpoch.fetch_add(1);
++        }
++        rt.gpuDirty = false;
++        ++m_stDownloads;
++        if (m_inDisplayDownload)
++            ++m_stDisplayDownloads;
++    }
++
++    // ---------------------------------------------------------------- targets
++    static void rowsBlocks(const Target &o, int y0, int y1, uint32_t &b0, uint32_t &b1)
++    {
++        const int ph = o.is16 ? 64 : 32;
++        b0 = o.fbp + static_cast<uint32_t>(y0 / ph) * o.fbw * 32u;
++        b1 = o.fbp + static_cast<uint32_t>(y1 / ph + 1) * o.fbw * 32u;
++    }
++    static bool overlaps(const Target &o, uint32_t bp, uint32_t nblocks)
++    {
++        uint32_t a0, a1;
++        rowsBlocks(o, 0, o.vh - 1, a0, a1);
++        return a0 < bp + nblocks && bp < a1;
++    }
++    static bool dirtyOverlaps(const Target &o, uint32_t bp, uint32_t nblocks)
++    {
++        if (!o.gpuDirty)
++            return false;
++        uint32_t a0, a1;
++        rowsBlocks(o, o.dy0, o.dy1, a0, a1);
++        return a0 < bp + nblocks && bp < a1;
++    }
++    static void mark(Target &o, int x0, int y0, int x1, int y1)
++    {
++        x0 = std::max(x0, 0);
++        y0 = std::max(y0, 0);
++        x1 = std::min(x1, o.w - 1);
++        y1 = std::min(y1, o.h - 1);
++        if (x0 > x1 || y0 > y1)
++            return;
++        if (!o.gpuDirty)
++        {
++            o.dx0 = x0;
++            o.dy0 = y0;
++            o.dx1 = x1;
++            o.dy1 = y1;
++            o.gpuDirty = true;
++            return;
++        }
++        o.dx0 = std::min(o.dx0, x0);
++        o.dy0 = std::min(o.dy0, y0);
++        o.dx1 = std::max(o.dx1, x1);
++        o.dy1 = std::max(o.dy1, y1);
++    }
++    void attachZ(Target &rt, Depth *z)
++    {
++        const GLuint zt = z ? z->tex : 0;
++        if (rt.ztex == zt)
++            return;
++        glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, zt, 0);
++        rt.ztex = zt;
++    }
++    Target *findTarget(uint32_t fbp, uint32_t fbw, bool sixteen)
++    {
++        for (Target &t : m_rt)
++            if (t.used && t.fbp == fbp && t.fbw == fbw && t.is16 == sixteen)
++                return &t;
++        return nullptr;
++    }
++    void dropTarget(Target &o)
++    {
++        if (m_haveCur && m_cur.rt == &o)
++        {
++            flush();
++            m_haveCur = false;
++        }
++        download(o);
++        glDeleteTextures(1, &o.tex);
++        glDeleteFramebuffers(1, &o.fbo);
++        o.used = false;
++    }
++    void dropTargets()
++    {
++        for (int i = 0; i < kTargets; ++i)
++        {
++            if (m_rt[i].used)
++            {
++                glDeleteTextures(1, &m_rt[i].tex);
++                glDeleteFramebuffers(1, &m_rt[i].fbo);
++            }
++            if (m_z[i].used)
++                glDeleteTextures(1, &m_z[i].tex);
++            m_rt[i].used = false;
++            m_z[i].used = false;
++        }
++        m_haveCur = false;
++        m_v.clear();
++    }
++    // rows y0..y1 of a target take their content from VRAM; older targets that claim that VRAM are retired first
++    void claimRows(Target &rt, int y0, int y1)
++    {
++        uint32_t b0, b1;
++        rowsBlocks(rt, y0, y1, b0, b1);
++        for (Target &o : m_rt)
++            if (o.used && &o != &rt && overlaps(o, b0, b1 - b0))
++                dropTarget(o);
++        std::vector<uint32_t> px;
++        vramReadRgba(rt.fbp, rt.fbw, rt.is16 ? GS_PSM_CT16 : GS_PSM_CT32, 0, y0, rt.w, y1 - y0 + 1, px);
++        uploadRect(rt, 0, y0, rt.w, y1 - y0 + 1, px.data());
++    }
++    Target *getTarget(uint32_t fbp, uint32_t fbw, bool sixteen, int needH)
++    {
++        const int ph = sixteen ? 64 : 32;
++        needH = std::min(needH, 1024);
++        needH = std::max((needH + ph - 1) / ph * ph, ph);
++        Target *rt = findTarget(fbp, fbw, sixteen);
++        if (rt && rt->h >= needH)
++        {
++            rt->lru = ++m_tick;
++            if (needH > rt->vh)
++            {
++                flush();
++                const int y0 = rt->vh;
++                rt->vh = needH;
++                claimRows(*rt, y0, needH - 1);
++            }
++            return rt;
++        }
++        flush();
++        const int w = static_cast<int>(fbw ? fbw : 1u) * 64;
++        if (rt)
++        {
++            const int keep = rt->vh;
++            dropTarget(*rt);
++            needH = std::max(needH, keep);
++        }
++        else
++        {
++            for (Target &t : m_rt)
++                if (!t.used)
++                {
++                    rt = &t;
++                    break;
++                }
++            if (!rt)
++            {
++                Target *v = &m_rt[0];
++                for (Target &t : m_rt)
++                    if (t.lru < v->lru)
++                        v = &t;
++                dropTarget(*v);
++            }
++        }
++        rt = nullptr;
++        for (Target &t : m_rt)
++            if (!t.used)
++            {
++                rt = &t;
++                break;
++            }
++        const int h = needH <= 512 ? 512 : 1024;
++        *rt = Target{};
++        rt->used = true;
++        rt->fbp = fbp;
++        rt->fbw = fbw;
++        rt->is16 = sixteen;
++        rt->w = w;
++        rt->h = h;
++        rt->lru = ++m_tick;
++        rt->vh = needH;
++        rt->tex = newTex(w * m_scale, h * m_scale, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++        glGenFramebuffers(1, &rt->fbo);
++        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->tex, 0);
++        claimRows(*rt, 0, needH - 1);
++        return rt;
++    }
++    Depth *getDepth(uint32_t zbp, int w, int h)
++    {
++        for (Depth &z : m_z)
++            if (z.used && z.zbp == zbp)
++            {
++                if (z.w == w && z.h == h)
++                {
++                    z.lru = ++m_tick;
++                    return &z;
++                }
++                for (Target &t : m_rt)
++                    if (t.used && t.ztex == z.tex)
++                        attachZ(t, nullptr);
++                glDeleteTextures(1, &z.tex);
++                z.used = false;
++                break;
++            }
++        Depth *z = nullptr;
++        for (Depth &d : m_z)
++            if (!d.used)
++            {
++                z = &d;
++                break;
++            }
++        if (!z)
++        {
++            z = &m_z[0];
++            for (Depth &d : m_z)
++                if (d.lru < z->lru)
++                    z = &d;
++            for (Target &t : m_rt)
++                if (t.used && t.ztex == z->tex)
++                    attachZ(t, nullptr);
++            glDeleteTextures(1, &z->tex);
++        }
++        *z = Depth{};
++        z->used = true;
++        z->zbp = zbp;
++        z->w = w;
++        z->h = h;
++        z->lru = ++m_tick;
++        // depth starts at 0 (the GS clears it by drawing; undefined contents would show through)
++        const std::vector<float> zeros(static_cast<size_t>(w * m_scale) * static_cast<size_t>(h * m_scale), 0.0f);
++        glGenTextures(1, &z->tex);
++        glBindTexture(GL_TEXTURE_2D, z->tex);
++        glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL_DEPTH_COMPONENT32F), w * m_scale, h * m_scale, 0, GL_DEPTH_COMPONENT, GL_FLOAT, zeros.data());
++        texParams(z->tex, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
++        return z;
++    }
++    // [bp, bp + nblocks) overlaps a target with GPU-only content: read it back
++    void syncRange(uint32_t bp, uint32_t nblocks, const char *why)
++    {
++        (void)why;
++        for (Target &o : m_rt)
++            if (o.used && dirtyOverlaps(o, bp, nblocks))
++            {
++                flush();
++                download(o);
++            }
++    }
++    static uint32_t transferBlocks(uint32_t bw, uint32_t psm, uint32_t y0, uint32_t w, uint32_t h)
++    {
++        const uint32_t bpp = psm == GS_PSM_T4 ? 4u : psm == GS_PSM_T8 ? 8u : is16(psm) ? 16u : 32u;
++        return ((bw ? bw * 64u : w) * (y0 + h) * bpp / 8u) / 256u + 32u;
++    }
++    // VRAM written by a transfer: refresh overlapping targets
++    void vramWritten(uint32_t bp, uint32_t bw, uint32_t psm, int x0, int y0, int w, int h)
++    {
++        const uint32_t nb = transferBlocks(bw, psm, static_cast<uint32_t>(std::max(y0, 0)), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
++        for (Target &o : m_rt)
++        {
++            if (!o.used || !overlaps(o, bp, nb))
++                continue;
++            flush();
++            const bool same = bp == o.fbp && bw == o.fbw && (psm == GS_PSM_CT32 || psm == GS_PSM_CT24 || is16(psm)) && is16(psm) == o.is16;
++            const int rx0 = std::max(x0, 0), ry0 = std::max(y0, 0);
++            const int rw = std::min(w, o.w - rx0), rh = h;
++            if (same && rw > 0 && rh > 0 && ry0 + rh <= o.vh)
++            {
++                std::vector<uint32_t> px;
++                vramReadRgba(o.fbp, o.fbw, o.is16 ? GS_PSM_CT16 : GS_PSM_CT32, rx0, ry0, rw, rh, px);
++                uploadRect(o, rx0, ry0, rw, rh, px.data());
++            }
++            else
++                dropTarget(o); // memory reused for something else (its drawing was saved before the write)
++        }
++    }
++    static uint32_t texBlocks(const GSTex0Reg &t)
++    {
++        const uint32_t bpp = t.psm == GS_PSM_T4 ? 4u : t.psm == GS_PSM_T8 ? 8u : is16(t.psm) ? 16u : 32u;
++        const uint32_t w = 1u << std::min<uint32_t>(t.tw, 10u), h = 1u << std::min<uint32_t>(t.th, 10u);
++        const uint32_t tbw = t.tbw ? t.tbw * 64u : w;
++        return tbw * h * bpp / 8u / 256u + 32u;
++    }
++    // a texture that is a render target (same address, a colour format the target holds)
++    Target *texTarget(const GSTex0Reg &t)
++    {
++        for (Target &o : m_rt)
++        {
++            if (!o.used || o.fbp != t.tbp0)
++                continue;
++            const bool sixteen = is16(t.psm);
++            if ((t.psm == GS_PSM_CT32 || t.psm == GS_PSM_CT24 || sixteen) && sixteen == o.is16 &&
++                (t.tbw == o.fbw || (1u << t.tw) <= o.fbw * 64u))
++                return &o;
++        }
++        return nullptr;
++    }
++    // decoded (CPU) texture as a GL texture
++    GLuint cpuTexture(const GSDrawState &state, int &tw, int &th)
++    {
++        std::lock_guard<std::mutex> lock(m_cpu->m_mutex);
++        const GSCpuBackend::DecodedTexture *d = m_cpu->PrepareTexture(state);
++        if (!d || d->w <= 0 || d->h <= 0)
++            return 0;
++        GlTexture &g = m_textures[d];
++        tw = d->w;
++        th = d->h;
++        if (g.tex && g.epoch == d->decodeEpoch && g.key0 == d->key[0] && g.key1 == d->key[1] && g.key2 == d->key[2] &&
++            g.clutVersion == d->clutVersion && g.w == d->w && g.h == d->h)
++            return g.tex;
++        // APE2_GL_TEXLOG=1: textures uploaded (size, format, address, why)
++        static const bool texLog = std::getenv("APE2_GL_TEXLOG") != nullptr;
++        if (texLog)
++        {
++            static int shown = 0;
++            if (shown < 400)
++            {
++                ++shown;
++                const auto &t0 = state.context.tex0;
++                std::fprintf(stderr, "[gpu:tex] %dx%d psm=0x%x tbp0=0x%x tbw=%u cbp=0x%x cpsm=%u %s epoch=%llu clutv=%u\n", d->w, d->h,
++                             t0.psm, t0.tbp0, t0.tbw, t0.cbp, t0.cpsm, g.tex ? "stale" : "new",
++                             static_cast<unsigned long long>(d->decodeEpoch), d->clutVersion);
++            }
++        }
++        // decode every tile that has not been decoded yet
++        auto &dt = const_cast<GSCpuBackend::DecodedTexture &>(*d);
++        const auto &dtex = dt.decodeState.context.tex0;
++        const bool indexed = dtex.psm == GS_PSM_T8 || dtex.psm == GS_PSM_T8H || dtex.psm == GS_PSM_T4 ||
++                             dtex.psm == GS_PSM_T4HL || dtex.psm == GS_PSM_T4HH;
++        if (indexed)
++        {
++            // palette textures: the palette once, then one VRAM read per texel (DecodeTexel looks the CLUT up
++            // for every texel)
++            uint32_t pal[256];
++            const int entries = (dtex.psm == GS_PSM_T8 || dtex.psm == GS_PSM_T8H) ? 256 : 16;
++            for (int i = 0; i < entries; ++i)
++                pal[i] = m_cpu->LookupCLUT(dt.decodeState, static_cast<uint8_t>(i), dtex.cpsm, dtex.csm, dtex.csa, dtex.psm, dt.clut.data());
++            const uint8_t *base = dt.rawBase ? dt.rawBase : m_cpu->m_vram;
++            for (int vv = 0; vv < dt.h; ++vv)
++            {
++                uint32_t *row = dt.texels.data() + static_cast<size_t>(vv) * static_cast<size_t>(dt.w);
++                for (int uu = 0; uu < dt.w; ++uu)
++                    row[uu] = pal[GSMem::ReadTexture(m_cpu->m_texturePageCache, base, dtex.psm, dtex.tbp0, dtex.tbw,
++                                                     static_cast<uint32_t>(uu), static_cast<uint32_t>(vv)) &
++                                  static_cast<uint32_t>(entries - 1)];
++            }
++            for (size_t i = 0; i < dt.tileCount; ++i)
++                dt.tileReady[i].store(1u, std::memory_order_release);
++        }
++        for (size_t i = 0; i < dt.tileCount; ++i)
++        {
++            if (dt.tileReady[i].load(std::memory_order_acquire))
++                continue;
++            const int u0 = static_cast<int>(i % static_cast<size_t>(dt.tilesW)) * 8, v0 = static_cast<int>(i / static_cast<size_t>(dt.tilesW)) * 8;
++            const int u1 = std::min(u0 + 8, dt.w), v1 = std::min(v0 + 8, dt.h);
++            for (int vv = v0; vv < v1; ++vv)
++                for (int uu = u0; uu < u1; ++uu)
++                    dt.texels[static_cast<size_t>(vv) * static_cast<size_t>(dt.w) + static_cast<size_t>(uu)] =
++                        m_cpu->DecodeTexel(dt.decodeState, uu, vv, dt.clut.data(), dt.rawBase);
++            dt.tileReady[i].store(1u, std::memory_order_release);
++        }
++        if (!g.tex)
++            glGenTextures(1, &g.tex);
++        glBindTexture(GL_TEXTURE_2D, g.tex);
++        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++        if (g.w != d->w || g.h != d->h)
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, d->w, d->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, d->texels.data());
++        else
++            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->w, d->h, GL_RGBA, GL_UNSIGNED_BYTE, d->texels.data());
++        g.epoch = d->decodeEpoch;
++        g.key0 = d->key[0];
++        g.key1 = d->key[1];
++        g.key2 = d->key[2];
++        g.clutVersion = d->clutVersion;
++        g.w = d->w;
++        g.h = d->h;
++        ++m_stTexUploads;
++        return g.tex;
++    }
++
++    // ---------------------------------------------------------------- batches
++    void bindDst(DrawState &s, int x0, int y0, int x1, int y1)
++    {
++        Target &rt = *s.rt;
++        glActiveTexture(GL_TEXTURE1);
++        if (m_barrier)
++        {
++            glBindTexture(GL_TEXTURE_2D, rt.tex);
++            glTextureBarrier();
++            glUniform2f(u_dstoff, 0, 0);
++        }
++        else
++        {
++            const int S = m_scale;
++            int w = (x1 - x0 + 1) * S, h = (y1 - y0 + 1) * S;
++            if (w < 1 || h < 1)
++                w = h = 1;
++            if (!m_dstCopyTex || m_dstCopyW < w || m_dstCopyH < h)
++            {
++                if (m_dstCopyTex)
++                {
++                    glDeleteTextures(1, &m_dstCopyTex);
++                    glDeleteFramebuffers(1, &m_dstCopyFbo);
++                }
++                m_dstCopyW = std::max(w, m_dstCopyW);
++                m_dstCopyH = std::max(h, m_dstCopyH);
++                m_dstCopyTex = newTex(m_dstCopyW, m_dstCopyH, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++                glGenFramebuffers(1, &m_dstCopyFbo);
++                glBindFramebuffer(GL_FRAMEBUFFER, m_dstCopyFbo);
++                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_dstCopyTex, 0);
++            }
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, rt.fbo);
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_dstCopyFbo);
++            glDisable(GL_SCISSOR_TEST);
++            glBlitFramebuffer(x0 * S, y0 * S, x0 * S + w, y0 * S + h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++            glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
++            glEnable(GL_SCISSOR_TEST);
++            glActiveTexture(GL_TEXTURE1);
++            glBindTexture(GL_TEXTURE_2D, m_dstCopyTex);
++            glUniform2f(u_dstoff, static_cast<float>(x0 * S), static_cast<float>(y0 * S));
++        }
++        glActiveTexture(GL_TEXTURE0);
++        ++m_stDstReads;
++    }
++    void applyAndDraw(DrawState &s)
++    {
++        Target &rt = *s.rt;
++        glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
++        attachZ(rt, s.zb);
++        const int S = m_scale;
++        glViewport(0, 0, rt.w * S, rt.h * S);
++        glUseProgram(m_prog);
++        glUniform1i(u_tex, 0);
++        glUniform1i(u_dst, 1);
++        glUniform4f(u_vp, 2.0f / rt.w, 2.0f / rt.h, 1.0f / 4294967296.0f, 0);
++        glUniform4i(u_mode, s.mode[0], s.mode[1], s.mode[2], s.mode[3]);
++        glUniform4i(u_atst, s.atst[0], s.atst[1], s.atst[2], s.atst[3]);
++        glUniform4i(u_blend, s.blend[0], s.blend[1], s.blend[2], s.blend[3]);
++        glUniform4i(u_misc, s.misc[0], s.misc[1], s.misc[2], s.misc[3]);
++        glUniform1f(u_fix, s.fix);
++        glUniform4i(u_fog, s.fog[0], s.fog[1], s.fog[2], s.fog[3]);
++        glEnable(GL_SCISSOR_TEST);
++        glScissor(s.scx0 * S, s.scy0 * S, (s.scx1 - s.scx0 + 1) * S, (s.scy1 - s.scy0 + 1) * S);
++        if (s.depthTest)
++        {
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(static_cast<GLenum>(s.depthFunc));
++        }
++        else
++            glDisable(GL_DEPTH_TEST);
++        glDepthMask(s.depthWrite ? 1 : 0);
++        glColorMask(static_cast<GLboolean>(s.cmask[0]), static_cast<GLboolean>(s.cmask[1]), static_cast<GLboolean>(s.cmask[2]), static_cast<GLboolean>(s.cmask[3]));
++        if (s.blOn)
++        {
++            glEnable(GL_BLEND);
++            glBlendEquationSeparate(static_cast<GLenum>(s.blEq), GL_FUNC_ADD);
++            glBlendFuncSeparate(static_cast<GLenum>(s.blSf), static_cast<GLenum>(s.blDf), GL_ONE, GL_ZERO);
++        }
++        else
++            glDisable(GL_BLEND);
++        glActiveTexture(GL_TEXTURE0);
++        if (s.mode[0])
++        {
++            glBindTexture(GL_TEXTURE_2D, s.tex);
++            const GLint f = s.bilinear ? GL_LINEAR : GL_NEAREST;
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, s.wms == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, s.wmt == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++        }
++        if (s.needDst)
++            bindDst(s, std::max(m_bx0, 0), std::max(m_by0, 0), std::min(m_bx1, rt.w - 1), std::min(m_by1, rt.h - 1));
++        glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
++        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_v.size() * sizeof(Vert)), m_v.data(), GL_STREAM_DRAW);
++        glEnableVertexAttribArray(0);
++        glVertexAttribPointer(0, 4, GL_FLOAT, 0, sizeof(Vert), reinterpret_cast<void *>(0));
++        glEnableVertexAttribArray(1);
++        glVertexAttribPointer(1, 4, GL_FLOAT, 0, sizeof(Vert), reinterpret_cast<void *>(16));
++        glEnableVertexAttribArray(2);
++        glVertexAttribPointer(2, 4, GL_FLOAT, 0, sizeof(Vert), reinterpret_cast<void *>(32));
++        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_v.size()));
++        if (s.pass2)
++        {
++            // AFAIL: the pixels that failed the alpha test, with the reduced write mask
++            glUniform4i(u_atst, s.atst[0], s.atst[1], 1, s.atst[3]);
++            const int af = s.pass2; // 1 FB_ONLY, 2 ZB_ONLY, 3 RGB_ONLY
++            glColorMask(static_cast<GLboolean>(af != 2 && s.cmask[0]), static_cast<GLboolean>(af != 2 && s.cmask[1]),
++                        static_cast<GLboolean>(af != 2 && s.cmask[2]), static_cast<GLboolean>(af == 1 && s.cmask[3]));
++            glDepthMask(af == 2 && s.depthWrite ? 1 : 0);
++            glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(m_v.size()));
++        }
++        const int x0 = std::max(m_bx0, s.scx0), y0 = std::max(m_by0, s.scy0);
++        const int x1 = std::min(m_bx1, s.scx1), y1 = std::min(m_by1, s.scy1);
++        if (s.cmask[0] || s.cmask[1] || s.cmask[2] || s.cmask[3])
++            mark(rt, x0, y0, x1, y1);
++        ++m_stBatches;
++    }
++    void flush()
++    {
++        m_ndb = 0;
++        if (m_v.empty())
++            return;
++        applyAndDraw(m_cur);
++        m_v.clear();
++        m_bx0 = m_by0 = 1 << 20;
++        m_bx1 = m_by1 = -(1 << 20);
++    }
++
++    // GS state -> batch state (PAL's hw_state_from)
++    void stateFrom(const GSDrawState &st, DrawState &s, Target *rt, Depth *zb, GLuint tex, int texRt)
++    {
++        s = DrawState{};
++        const auto &c = st.context;
++        s.rt = rt;
++        s.zb = zb;
++        s.scx0 = c.scissor.x0;
++        s.scy0 = c.scissor.y0;
++        s.scx1 = std::min<int>(c.scissor.x1, rt->w - 1);
++        s.scy1 = std::min<int>(c.scissor.y1, rt->h - 1);
++        const int tme = st.prim.tme ? 1 : 0;
++        s.mode[0] = tme;
++        s.mode[1] = tme ? c.tex0.tfx : 0;
++        s.mode[2] = tme ? c.tex0.tcc : 0;
++        s.mode[3] = st.prim.iip ? 1 : 0;
++        if (tme)
++        {
++            s.tex = tex;
++            s.texRt = texRt;
++            s.bilinear = st.linearFilter ? 1 : 0;
++            s.wms = static_cast<int>(c.clamp & 1u);
++            s.wmt = static_cast<int>((c.clamp >> 2) & 1u);
++        }
++        const uint64_t test = c.test;
++        const int ate = static_cast<int>(test & 1u), atst = static_cast<int>((test >> 1) & 7u), aref = static_cast<int>((test >> 4) & 0xFFu);
++        const int afail = static_cast<int>((test >> 12) & 3u), date = static_cast<int>((test >> 14) & 1u), datm = static_cast<int>((test >> 15) & 1u);
++        const int zte = static_cast<int>((test >> 16) & 1u), ztst = static_cast<int>((test >> 17) & 3u);
++        const bool zwrite = !c.zbuf.zmask;
++        s.depthTest = zb && zte && ztst >= 2;
++        s.depthFunc = ztst == 3 ? static_cast<int>(GL_GREATER) : static_cast<int>(GL_GEQUAL);
++        s.depthWrite = zb && zwrite;
++        if (zb && zte && ztst == 1)
++        {
++            s.depthTest = 1;
++            s.depthFunc = static_cast<int>(GL_ALWAYS);
++        }
++        const uint32_t m = c.frame.fbmsk;
++        if (rt->is16)
++        {
++            s.cmask[0] = !(m & 0xf8u);
++            s.cmask[1] = !(m & 0xf800u);
++            s.cmask[2] = !(m & 0xf80000u);
++            s.cmask[3] = !(m & 0x80000000u);
++        }
++        else
++        {
++            s.cmask[0] = (m & 0xffu) != 0xffu;
++            s.cmask[1] = (m & 0xff00u) != 0xff00u;
++            s.cmask[2] = (m & 0xff0000u) != 0xff0000u;
++            s.cmask[3] = (m & 0xff000000u) != 0xff000000u;
++        }
++        if (c.frame.psm == GS_PSM_CT24)
++            s.cmask[3] = 0;
++        s.atst[0] = ate ? atst : 8;
++        s.atst[1] = aref;
++        s.atst[2] = 0;
++        if (ate && afail != 0)
++        {
++            if (atst == 0)
++            {
++                // NEVER + AFAIL: a pure write mask
++                s.atst[0] = 8;
++                if (afail == 1)
++                    s.depthWrite = 0;
++                else if (afail == 2)
++                    s.cmask[0] = s.cmask[1] = s.cmask[2] = s.cmask[3] = 0;
++                else
++                {
++                    s.cmask[3] = 0;
++                    s.depthWrite = 0;
++                }
++            }
++            else if (atst != 1)
++                s.pass2 = afail; // first pass: passing pixels, full write
++            else
++                s.atst[0] = 8;
++        }
++        s.atst[3] = date ? 1 + datm : 0;
++        s.misc[0] = static_cast<int>(c.fba & 1u);
++        s.misc[3] = static_cast<int>(st.colclamp & 1u);
++        if (st.prim.fge)
++        {
++            s.fog[0] = 1;
++            s.fog[1] = st.fogR;
++            s.fog[2] = st.fogG;
++            s.fog[3] = st.fogB;
++        }
++        const uint64_t alpha = c.alpha;
++        const int A = static_cast<int>(alpha & 3u), B = static_cast<int>((alpha >> 2) & 3u), C = static_cast<int>((alpha >> 4) & 3u), D = static_cast<int>((alpha >> 6) & 3u);
++        const int fix = static_cast<int>((alpha >> 32) & 0xFFu);
++        s.fix = static_cast<float>(fix);
++        int shader = 0;
++        if (st.prim.abe)
++        {
++            if (A == B)
++            {
++                if (D == 0)
++                {
++                }
++                else if (D == 1)
++                {
++                    s.blOn = 1;
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_ZERO;
++                    s.blDf = GL_ONE;
++                }
++                else
++                {
++                    s.blOn = 1;
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_ZERO;
++                    s.blDf = GL_ZERO;
++                }
++            }
++            else if (C == 1 || (C == 2 && fix > 128))
++                shader = 1;
++            else
++            {
++                const int fsrc = C == 2 ? 1 : 0;
++                s.misc[2] = fsrc;
++                const int F = GL_SRC1_ALPHA, IF = GL_ONE_MINUS_SRC1_ALPHA;
++                s.blOn = 1;
++                if (A == 0 && B == 1 && D == 1)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = F;
++                    s.blDf = IF;
++                }
++                else if (A == 0 && B == 1 && D == 2)
++                {
++                    s.blEq = GL_FUNC_SUBTRACT;
++                    s.blSf = F;
++                    s.blDf = F;
++                }
++                else if (A == 0 && B == 2 && D == 1)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = fsrc ? F : GL_ONE;
++                    s.blDf = GL_ONE;
++                    if (!fsrc)
++                        s.misc[2] = 3;
++                }
++                else if (A == 0 && B == 2 && D == 2)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = fsrc ? F : GL_ONE;
++                    s.blDf = GL_ZERO;
++                    if (!fsrc)
++                        s.misc[2] = 3;
++                }
++                else if (A == 1 && B == 0 && D == 0)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = IF;
++                    s.blDf = F;
++                }
++                else if (A == 1 && B == 0 && D == 2)
++                {
++                    s.blEq = GL_FUNC_REVERSE_SUBTRACT;
++                    s.blSf = F;
++                    s.blDf = F;
++                }
++                else if (A == 2 && B == 0 && D == 1)
++                {
++                    s.blEq = GL_FUNC_REVERSE_SUBTRACT;
++                    s.blSf = fsrc ? F : GL_ONE;
++                    s.blDf = GL_ONE;
++                    if (!fsrc)
++                        s.misc[2] = 3;
++                }
++                else if (A == 2 && B == 1 && D == 0)
++                {
++                    s.blEq = GL_FUNC_SUBTRACT;
++                    s.blSf = GL_ONE;
++                    s.blDf = F;
++                }
++                else if (A == 1 && B == 2 && D == 0)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_ONE;
++                    s.blDf = F;
++                }
++                else if (A == 1 && B == 2 && D == 2)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_ZERO;
++                    s.blDf = F;
++                }
++                else if (A == 2 && B == 1 && D == 1)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_ZERO;
++                    s.blDf = IF;
++                }
++                else if (A == 1 && B == 2 && D == 1 && C == 0)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_DST_COLOR;
++                    s.blDf = GL_ONE;
++                    s.misc[2] = 2;
++                }
++                else if (A == 2 && B == 0 && D == 2)
++                {
++                    s.blEq = GL_FUNC_ADD;
++                    s.blSf = GL_ZERO;
++                    s.blDf = GL_ZERO;
++                }
++                else
++                {
++                    s.blOn = 0;
++                    shader = 1;
++                }
++            }
++        }
++        if (st.prim.abe && st.pabe && !(A == B && D == 0))
++            shader = 1;
++        if (shader)
++        {
++            s.blOn = 0;
++            s.blend[0] = 1;
++            s.blend[1] = A * 16 + B * 4 + D;
++            s.blend[2] = C;
++            s.misc[1] = st.pabe ? 1 : 0;
++            s.misc[2] = 0;
++        }
++        s.needDst = shader || date;
++    }
++
++    // ---------------------------------------------------------------- primitives
++    void vert(const GSVertex &v, const GSVertex &col, float x, float y, bool tme, bool fst, float zf, float fog)
++    {
++        Vert o{};
++        o.x = x;
++        o.y = y;
++        o.z = zf;
++        o.f = fog;
++        o.r = col.r;
++        o.g = col.g;
++        o.b = col.b;
++        o.a = col.a;
++        if (tme)
++        {
++            if (fst)
++            {
++                o.s = static_cast<float>(v.u) * m_fu;
++                o.t = static_cast<float>(v.v) * m_fv;
++                o.q = 1.0f;
++            }
++            else
++            {
++                o.s = v.s * m_su;
++                o.t = v.t * m_sv;
++                o.q = v.q;
++            }
++        }
++        else
++        {
++            o.s = o.t = 0;
++            o.q = 1;
++        }
++        m_v.push_back(o);
++    }
++
++    void prim(const GSPrimitiveBatch &batch)
++    {
++        const GSDrawState &st = batch.state;
++        const auto &c = st.context;
++        const uint64_t test = c.test;
++        const int zte = static_cast<int>((test >> 16) & 1u), ztst = static_cast<int>((test >> 17) & 3u);
++        if (zte && ztst == 0)
++            return; // depth test NEVER
++        const GSPrimType type = st.prim.type;
++        const int nv = batch.vertexCount;
++        if (nv == 0)
++            return;
++        const float ofx = static_cast<float>(c.xyoffset.ofx >> 4), ofy = static_cast<float>(c.xyoffset.ofy >> 4);
++        float px[3], py[3];
++        for (int i = 0; i < nv; ++i)
++        {
++            px[i] = batch.vertices[i].x - ofx;
++            py[i] = batch.vertices[i].y - ofy;
++        }
++        float fx0 = px[0], fx1 = px[0], fy0 = py[0], fy1 = py[0];
++        for (int i = 1; i < nv; ++i)
++        {
++            fx0 = std::min(fx0, px[i]);
++            fx1 = std::max(fx1, px[i]);
++            fy0 = std::min(fy0, py[i]);
++            fy1 = std::max(fy1, py[i]);
++        }
++        int bx0 = std::max(static_cast<int>(std::floor(fx0)), static_cast<int>(c.scissor.x0));
++        int by0 = std::max(static_cast<int>(std::floor(fy0)), static_cast<int>(c.scissor.y0));
++        int bx1 = std::min(static_cast<int>(std::ceil(fx1)), static_cast<int>(c.scissor.x1));
++        int by1 = std::min(static_cast<int>(std::ceil(fy1)), static_cast<int>(c.scissor.y1));
++        if (bx1 < bx0 || by1 < by0)
++            return;
++
++        // target and depth
++        const bool sixteen = is16(c.frame.psm);
++        Target *rt = getTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, sixteen, by1 + 1);
++        Depth *zb = nullptr;
++        const bool zwrite = !c.zbuf.zmask;
++        if (zte && (ztst >= 2 || zwrite || ztst == 1))
++            zb = getDepth(GSInternal::framePageBaseToBlock(c.zbuf.zbp), rt->w, rt->h);
++        // texture
++        GLuint tex = 0;
++        int texRt = 0, tw = 1, th = 1;
++        const bool tme = st.prim.tme;
++        if (tme)
++        {
++            tw = std::max<int>(1, st.textureWidth);
++            th = std::max<int>(1, st.textureHeight);
++            m_fu = 1.0f / (16.0f * tw);
++            m_fv = 1.0f / (16.0f * th);
++            m_su = m_sv = 1.0f;
++            if (Target *src = texTarget(c.tex0))
++            {
++                tex = src->tex;
++                texRt = 1;
++                m_fu = 1.0f / (16.0f * src->w);
++                m_fv = 1.0f / (16.0f * src->h);
++                m_su = static_cast<float>(tw) / src->w;
++                m_sv = static_cast<float>(th) / src->h;
++            }
++            else
++            {
++                syncRange(c.tex0.tbp0, texBlocks(c.tex0), "texture");
++                int dw = tw, dh = th;
++                tex = cpuTexture(st, dw, dh);
++            }
++        }
++        DrawState s;
++        stateFrom(st, s, rt, zb, tex, texRt);
++        if (tme && !tex)
++            s.mode[0] = 0;
++        // a target sampled while drawing into itself: draw from a snapshot of it
++        if (s.texRt && tex == rt->tex)
++        {
++            const int W = rt->w * m_scale, H = rt->h * m_scale;
++            flush();
++            if (!m_snapTex || m_snapW != W || m_snapH != H)
++            {
++                if (m_snapTex)
++                {
++                    glDeleteTextures(1, &m_snapTex);
++                    glDeleteFramebuffers(1, &m_snapFbo);
++                }
++                m_snapTex = newTex(W, H, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++                m_snapW = W;
++                m_snapH = H;
++                glGenFramebuffers(1, &m_snapFbo);
++                glBindFramebuffer(GL_FRAMEBUFFER, m_snapFbo);
++                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_snapTex, 0);
++            }
++            glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_snapFbo);
++            glDisable(GL_SCISSOR_TEST);
++            glBlitFramebuffer(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++            s.tex = m_snapTex;
++        }
++        // primitives that read the destination can share a draw only if they don't overlap
++        bool dstConflict = false;
++        if (s.needDst && !m_v.empty())
++        {
++            if (m_ndb >= kMaxDstBoxes)
++                dstConflict = true;
++            else
++                for (int i = 0; i < m_ndb; ++i)
++                    if (bx0 <= m_db[i][2] && m_db[i][0] <= bx1 && by0 <= m_db[i][3] && m_db[i][1] <= by1)
++                    {
++                        dstConflict = true;
++                        break;
++                    }
++        }
++        if (!m_haveCur || !(s == m_cur) || m_v.size() + 6 > kMaxVerts || dstConflict)
++        {
++            flush();
++            m_cur = s;
++            m_haveCur = true;
++        }
++        if (s.needDst)
++        {
++            m_db[m_ndb][0] = bx0;
++            m_db[m_ndb][1] = by0;
++            m_db[m_ndb][2] = bx1;
++            m_db[m_ndb][3] = by1;
++            ++m_ndb;
++        }
++        m_bx0 = std::min(m_bx0, bx0);
++        m_by0 = std::min(m_by0, by0);
++        m_bx1 = std::max(m_bx1, bx1);
++        m_by1 = std::max(m_by1, by1);
++
++        const bool fst = st.prim.fst;
++        const double zmax = c.zbuf.psm == GS_PSM_Z16 || c.zbuf.psm == GS_PSM_Z16S ? 65535.0 : c.zbuf.psm == GS_PSM_Z24 ? 16777215.0 : 4294967295.0;
++        auto zOf = [zmax](const GSVertex &v)
++        { return static_cast<float>(std::min(v.z, zmax)); };
++        const GSVertex *vx = batch.vertices.data();
++        switch (type)
++        {
++        case GS_PRIM_TRIANGLE:
++        case GS_PRIM_TRISTRIP:
++        case GS_PRIM_TRIFAN:
++        {
++            if (nv < 3)
++                return;
++            const bool flat = !st.prim.iip;
++            for (int i = 0; i < 3; ++i)
++                vert(vx[i], flat ? vx[2] : vx[i], px[i], py[i], tme, fst, zOf(vx[i]), static_cast<float>(vx[i].fog));
++            break;
++        }
++        case GS_PRIM_SPRITE:
++        {
++            if (nv < 2)
++                return;
++            // corners from the two vertices; colour, Z, Q and fog of the second
++            const GSVertex &a = vx[0], &b = vx[1];
++            GSVertex v[4] = {a, b, b, b};
++            v[1].v = a.v;
++            v[1].t = a.t;
++            v[2].u = a.u;
++            v[2].s = a.s;
++            float xs[4] = {px[0], px[1], px[0], px[1]}, ys[4] = {py[0], py[0], py[1], py[1]};
++            v[0].q = b.q;
++            const float zf = zOf(b);
++            static const int idx[6] = {0, 1, 2, 1, 3, 2};
++            for (int i = 0; i < 6; ++i)
++            {
++                GSVertex t = v[idx[i]];
++                t.q = b.q;
++                vert(t, b, xs[idx[i]], ys[idx[i]], tme, fst, zf, static_cast<float>(b.fog));
++            }
++            break;
++        }
++        case GS_PRIM_LINE:
++        case GS_PRIM_LINESTRIP:
++        {
++            if (nv < 2)
++                return;
++            // a thin quad one native pixel wide
++            const float dx = px[1] - px[0], dy = py[1] - py[0];
++            const bool horiz = std::fabs(dx) >= std::fabs(dy);
++            float xs[4] = {px[0], px[0], px[1], px[1]}, ys[4] = {py[0], py[0], py[1], py[1]};
++            if (horiz)
++            {
++                ys[1] += 1.0f;
++                ys[3] += 1.0f;
++            }
++            else
++            {
++                xs[1] += 1.0f;
++                xs[3] += 1.0f;
++            }
++            const GSVertex *src[4] = {&vx[0], &vx[0], &vx[1], &vx[1]};
++            static const int idx[6] = {0, 2, 1, 1, 2, 3};
++            for (int i = 0; i < 6; ++i)
++            {
++                const GSVertex &v = *src[idx[i]];
++                vert(v, st.prim.iip ? v : vx[1], xs[idx[i]], ys[idx[i]], tme, fst, zOf(v), static_cast<float>(vx[1].fog));
++            }
++            break;
++        }
++        default:
++        {
++            float xs[4] = {px[0], px[0] + 1.0f, px[0], px[0] + 1.0f}, ys[4] = {py[0], py[0], py[0] + 1.0f, py[0] + 1.0f};
++            static const int idx[6] = {0, 1, 2, 1, 3, 2};
++            for (int i = 0; i < 6; ++i)
++                vert(vx[0], vx[0], xs[idx[i]], ys[idx[i]], tme, fst, zOf(vx[0]), static_cast<float>(vx[0].fog));
++            break;
++        }
++        }
++        ++m_stDraws;
++    }
++
++    friend void ape2GsGlDisplay(GSRasterBackend *backend, uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2);
++};
++
++std::unique_ptr<GSRasterBackend> ape2MakeRasterBackend()
++{
++    if (gpuRequested())
++    {
++        const char *mt = std::getenv("APE2_MTGS");
++        if (mt && std::atoi(mt) < 2)
++            std::fprintf(stderr, "[gpu] the GPU renderer needs the GS thread (APE2_MTGS=2); using the software renderer\n");
++        else
++            return std::make_unique<GSGlBackend>();
++    }
++    return std::make_unique<GSCpuBackend>();
++}
++
++void ape2GsGlDisplay(GSRasterBackend *backend, uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2)
++{
++    if (auto *gl = dynamic_cast<GSGlBackend *>(backend))
++    {
++        gl->m_inDisplayDownload = true;
++        gl->Display(pmode, dispfb1, dispfb2);
++        gl->m_inDisplayDownload = false;
++    }
++}
++
++#else
++
++#include "runtime/gs/gs_cpu_backend.h"
++#include <memory>
++void ape2CreateGsGlContext() {}
++std::unique_ptr<GSRasterBackend> ape2MakeRasterBackend() { return std::make_unique<GSCpuBackend>(); }
++void ape2GsGlDisplay(GSRasterBackend *, uint64_t, uint64_t, uint64_t) {}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 3ad8d3d..862b3dc 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -110,8 +110,11 @@ namespace
+ }
+ 
+ 
++std::unique_ptr<GSRasterBackend> ape2MakeRasterBackend(); // CPU, or the GPU renderer (zz_ape2_gs_gl.cpp)
++void ape2GsGlDisplay(GSRasterBackend *backend, uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2);
++
+ GS::GS()
+-    : m_backend(std::make_unique<GSCpuBackend>())
++    : m_backend(ape2MakeRasterBackend())
+ {
+     reset();
+ }
+@@ -122,7 +125,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
+     if (!m_backend)
+-        m_backend = std::make_unique<GSCpuBackend>();
++        m_backend = ape2MakeRasterBackend();
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+@@ -511,9 +514,23 @@ void GS::refreshDisplaySnapshot()
+ void GS::setDisplayShadow(uint32_t offset, uint64_t value)
+ {
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+-    const uint32_t index = (offset >> 4) & 15u;
+-    m_displayShadow[index] = value;
+-    m_displayShadowValid |= 1u << index;
++    if (offset != 0xFFFFFFFFu)
++    {
++        const uint32_t index = (offset >> 4) & 15u;
++        m_displayShadow[index] = value;
++        m_displayShadowValid |= 1u << index;
++    }
++    // a buffer swap or a vsync mark (offset ~0): the GPU renderer puts the displayed buffers' drawing in VRAM
++    if (offset == 0xFFFFFFFFu || offset == 0x70u || offset == 0x90u || offset == 0x00u)
++    {
++        auto shown = [this](uint32_t off, uint64_t eeValue)
++        {
++            const uint32_t i = off >> 4;
++            return (m_displayShadowValid & (1u << i)) ? m_displayShadow[i] : eeValue;
++        };
++        if (m_privRegs && m_backend)
++            ape2GsGlDisplay(m_backend.get(), shown(0x00u, m_privRegs->pmode), shown(0x70u, m_privRegs->dispfb1), shown(0x90u, m_privRegs->dispfb2));
++    }
+ }
+ 
+ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+@@ -1854,7 +1871,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ {
+     if (!backend)
+-        backend = std::make_unique<GSCpuBackend>();
++        backend = ape2MakeRasterBackend();
+ 
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index aa43ede..f84133d 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -2056,6 +2056,8 @@ void PS2Memory::applyGsSpecial(uint8_t kind, uint32_t offset, uint64_t value)
+     }
+     else if (kind == 3u)
+     {
++        if (m_gsDisplayFn)
++            m_gsDisplayFn(0xFFFFFFFFu, 0u); // vsync mark: see GS::setDisplayShadow
+         {
+             std::lock_guard<std::mutex> lock(m_frameMarkMutex);
+             g_vsyncMarksDone.store(value, std::memory_order_release);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1fd999b..b2e6222 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -794,6 +794,10 @@ bool PS2Runtime::initialize(const char *title)
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        {
++            void ape2CreateGsGlContext(); // APE2_GS_RENDERER=gl: the GS thread's GL context (zz_ape2_gs_gl.cpp)
++            ape2CreateGsGlContext();
++        }
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif

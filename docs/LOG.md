@@ -550,3 +550,18 @@
 - The PAL port reaches full speed with its GPU renderer (gs_hw.h, OpenGL 3.3, 1x-8x resolution); its software
   rasteriser is also the slow path (hot spot: SSE span functions). Next: a GPU backend.
 - Reported while playing: the camera shakes left/right a little in some areas (to investigate).
+
+## GPU renderer (0047)
+- Kernel/zz_ape2_gs_gl.cpp: the GS drawn with OpenGL 3.3, a C++ port of the PAL port's gs_hw.h/gl.h
+  (JackyPendrag0n/ae2-recomp, with permission) behind the existing raster backend interface. Default;
+  APE2_GS_RENDERER=cpu for the software renderer. APE2_GS_SCALE=N sets internal resolution (display still goes
+  through VRAM at 1x for now). APE2_GL_TEXLOG=1 logs texture uploads.
+- GSCpuBackend stays the owner of VRAM (transfers, CLUTs, texture decode); primitives go to GPU render targets
+  batched by state. Coherence as PAL: targets read back before CPU reads of their VRAM; uploads pushed into or
+  retire targets; textures at a target's address sample the target (render-to-texture). The GS thread reads back
+  the displayed buffers at buffer swaps and vsync marks (GS::setDisplayShadow), so presentation is unchanged.
+- The GS thread's context: a hidden GLFW window (raylib's GLFW) sharing the main context, created on the main
+  thread after InitWindow; GL functions loaded with wglGetProcAddress.
+- Palette textures are decoded with the palette built once (per-texel CLUT lookups were 2/3 of the GS thread).
+- Stage run: median 59 fps (p25 56), from 49 with the software renderer; VU worker ~89% and GS thread ~85% busy.
+  Confirmed in play: renders correctly; the sister's camera-filter effect now looks right.
