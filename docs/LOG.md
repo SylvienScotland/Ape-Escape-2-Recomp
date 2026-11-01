@@ -520,3 +520,18 @@
 - Title 40 -> 48-58 fps, gameplay 27-35 -> 38-50 fps. The worker is now ~96% busy in gameplay (VIF1/VU1 ~1/3,
   GS front end + raster submit ~2/3); the EE waits on VIF1 register reads (sceGsSyncPath) about half the time.
   Next: split VIF1/VU1 and the GS front end onto two threads (PAL does), and avoid the per-frame VIF1_STAT wait.
+
+## GS thread and one frame of pipelining (0044)
+- APE2_MTGS=2 (default with 4+ cores): the worker runs VIF1/VU1 only; the GIF packets reaching the GS go in
+  batches to a second thread that runs the GS front end (PAL's MTVU + MTGS layout). Alone this changed little:
+  the EE waited for all drawing in sceGsSyncPath every frame, so the three threads took turns.
+- sceGsSyncPath with the worker: puts a frame mark in the queue and waits only for the previous one (the EE
+  computes frame N+1 while N is drawn). Display register writes (PMODE, SMODE2, DISPFB/DISPLAY 1-2, BGCOLOR) go
+  down the queue in order and presentation uses those copies (GS::setDisplayShadow), so a swap never shows a
+  frame before it is drawn.
+- The EE also stays at most two vsync marks ahead of the GS thread (the load screen does not call
+  sceGsSyncPath and ran ~2 s ahead, i.e. input lag, until this bound).
+- Title/menus 45-58 fps; stages ~40-50, heavy full-screen effects 10-30. The GS thread is now the limit
+  (~99% busy, mostly Submit waiting on raster batches: flush reasons 10 = 4096-primitive batch, 1 = texture
+  page still being drawn).
+- Note: APE2_GS_THREADS above 16 crashes when the title's 3D starts (reproducible; default 16 is fine).
