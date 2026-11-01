@@ -1,0 +1,58 @@
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index bc4a48c..540e7ee 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -58,7 +58,11 @@ namespace ps2recomp
+                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
+                                    ft, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // The EE's SQRT.S fd, ft takes its operand from the ft field (bits 16-20), not fs: reading fs
++                // made e.g. sqrt.s $f1,$f1 compute sqrt($f0). Ape Escape 2's atan (0x1A2D50) then jumped by
++                // ~0.28 rad when its argument crossed infinity, so the camera yaw it measures flipped every frame
++                // when the eye was right behind the player: the left/right camera snapping (recomp patch 0050).
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index bf1ae70..718a506 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -452,9 +452,19 @@ void EeScheduler::postEvent(EeEvent event)
+     m_eventCv.notify_one();
+ }
+ 
++// Debugging aid: while > 0 (ape2HoldCheckpoints), guest calls run to completion without a checkpoint, so a
++// logging override sees a hooked function's final results.
++static int g_ape2CheckpointHold = 0;
++void ape2HoldCheckpoints(int delta)
++{
++    g_ape2CheckpointHold += delta;
++}
++
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
+     accountCycles(cycles);
++    if (g_ape2CheckpointHold > 0 && !m_stopRequested.load(std::memory_order_acquire))
++        return false;
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+@@ -474,8 +484,15 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return false;
+     }
+ 
++    // The EE kernel does not time-slice: a running thread keeps the CPU until it blocks or yields, or a thread of
++    // strictly higher priority (lower number) becomes ready. Rotating equal-priority threads here interleaved the
++    // game's threads in ways the PS2 never does (Ape Escape 2 recomp patch 0050; the PAL port's pick_next keeps
++    // the running thread on ties). APE2_TIMESLICE=1 restores the round robin.
++    static const bool roundRobin = std::getenv("APE2_TIMESLICE") != nullptr;
+     const GuestThread *running = currentThread();
+-    if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++    if (running != nullptr &&
++        (roundRobin ? hasReadyAtOrAbovePriority(running->currentPriority)
++                    : (running->currentPriority > 0 && hasReadyAtOrAbovePriority(running->currentPriority - 1))))
+     {
+         m_rescheduleRequested = true;
+         m_timeSliceExpired = true;

@@ -30,6 +30,28 @@ namespace
             std::fprintf(stderr, "[cam] #%llu ra=%06x eye %.1f %.1f %.1f target %.1f %.1f %.1f vf0 %g %g %g %g s1=%06x\n",
                          static_cast<unsigned long long>(n), GPR_U32(ctx, 31), eye[0], eye[1], eye[2], target[0], target[1],
                          target[2], vf0[0], vf0[1], vf0[2], vf0[3], GPR_U32(ctx, 17));
+            // the pieces 0x26F5E8 builds the eye from: the slot's eye, the second camera (0x4D08F0) eye/target,
+            // blend factor (+0x90) and the offset added to the eye (+0x150)
+            const uint32_t slot = GPR_U32(ctx, 17) & 0x1FFFFF0u;
+            float se[4], oe[4], ot[4], off[4], ofs2[4], f;
+            std::memcpy(se, rdram + slot + 0x150u, 16);
+            std::memcpy(oe, rdram + 0x4D0960u, 16);
+            std::memcpy(ot, rdram + 0x4D0970u, 16);
+            std::memcpy(&f, rdram + 0x4D0980u, 4);
+            std::memcpy(off, rdram + 0x4D0A40u, 16);
+            std::memcpy(ofs2, rdram + 0x4D0A50u, 16);
+            float yaw[4], dist[2], st[4];
+            std::memcpy(yaw, rdram + slot + 0x210u, 16);
+            std::memcpy(dist, rdram + slot + 0x1D8u, 8);
+            std::memcpy(st, rdram + slot + 0x160u, 16);
+            std::fprintf(stderr, "[cam] #%llu parts slotEye %.3f %.3f %.3f slotTgt %.3f %.3f %.3f yaw %.4f %.4f %.4f dist %.3f %.3f\n",
+                         static_cast<unsigned long long>(n), se[0], se[1], se[2], st[0], st[1], st[2], yaw[1], yaw[2], yaw[3],
+                         dist[0], dist[1]);
+            (void)oe;
+            (void)ot;
+            (void)f;
+            (void)off;
+            (void)ofs2;
         }
         static const bool flip = std::getenv("APE2_CAMFLIP") != nullptr; // experiment: mirror eye height
         if (flip)

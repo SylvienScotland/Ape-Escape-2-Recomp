@@ -581,3 +581,21 @@
   stage frame 0x19BCE0, PAL 0x19CF28, marked by overrides/zz_ape2_frame_mark.cpp), at most four periods, and
   only while stage frames are running; a slow frame now plays slightly slower (as in the PAL port) instead of
   jumping. APE2_VSYNC_FRAMELOCK=0 disables it. (Marking at sceGsSyncPath did not work: 12 fps.)
+
+## Camera snapping: SQRT.S read the wrong register (0050)
+- Symptom: the camera snapped left/right while running, and every time with LB (recentre) facing a wall.
+- Chase (with the player reproducing): the gameplay camera's yaw (+0x214, slot 0x4CBAF0) is re-measured each
+  frame by 0x275BB8 from target-eye (atan2 via 0x1A2D50); logged next to the eye it came out mirrored about
+  the angle straight behind Jimmy, so every correction overshot to the other side. 0x1A2D50's large-argument
+  path uses the half-angle formula t/(1+sqrt(1+t^2)) with `sqrt.s $f1,$f1` (0x46010044, shown by the
+  disassembler as `c1 0x10044`). The recompiler took SQRT.S's operand from fs; on the EE it is ft (as the
+  PAL port's recompiler does): it computed sqrt($f0) = 1, and atan jumped by ~0.28 rad when its argument
+  crossed infinity, i.e. whenever the eye passed right behind the player. 12 of the game's 17 SQRT.S used a
+  different register in fs and ft and were all wrong. Fixed in fpu_translator.cpp; confirmed in play.
+- Along the way (kept): the EE scheduler no longer round-robins equal-priority threads at the end of a time
+  slice (the EE kernel only preempts for a strictly higher priority; APE2_TIMESLICE=1 restores it), and
+  ape2HoldCheckpoints() lets a logging override run a hooked call to completion.
+- Debugging tools in overrides/zz_ape2_camstep.cpp: APE2_CAMSTEP (eye change per camera step), APE2_CAMRAY
+  (camera rays with real results; the hook finishes the collision walk 0x1CE7B0, whose recursion is compiled
+  as a goto and returns through the scheduler), APE2_CAMDAMP=1 (the yaw damping tried before the fix);
+  zz_ape2_camlog.cpp prints the slot's eye/target/yaw/distance.
