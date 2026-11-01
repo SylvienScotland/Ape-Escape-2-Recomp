@@ -565,3 +565,8 @@
 - Palette textures are decoded with the palette built once (per-texel CLUT lookups were 2/3 of the GS thread).
 - Stage run: median 59 fps (p25 56), from 49 with the software renderer; VU worker ~89% and GS thread ~85% busy.
   Confirmed in play: renders correctly; the sister's camera-filter effect now looks right.
+
+## Game thread in the PS2's FPU mode (0048)
+- The game thread now runs with round toward zero + flush-to-zero/denormals-are-zero, as the PAL port's guest
+  threads (PCSX2's default "chop" mode); it ran in the host's round-to-nearest before. A first try at the
+  camera shaking left/right in some areas. APE2_FPU_NEAREST=1 for the old rounding.

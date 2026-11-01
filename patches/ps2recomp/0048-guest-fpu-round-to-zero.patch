@@ -1,0 +1,15 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b2e6222..d29e233 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2529,6 +2529,10 @@ void PS2Runtime::run()
+     std::thread gameThread([&]()
+                            {
+         ThreadNaming::SetCurrentThreadName("GameThread");
++        // The EE FPU and VU0 round toward zero and flush denormals (PCSX2's default "chop" mode); the game code
++        // runs in that mode, as the PAL port's guest threads do (Ape Escape 2 recomp patch 0048).
++        // APE2_FPU_NEAREST=1 keeps the host's round-to-nearest (denormals still flushed) for comparison.
++        _mm_setcsr(0x1F80u | (std::getenv("APE2_FPU_NEAREST") ? 0u : 0x6000u) | 0x8000u | 0x0040u);
+         try
+         {
+             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
