@@ -599,3 +599,17 @@
   (camera rays with real results; the hook finishes the collision walk 0x1CE7B0, whose recursion is compiled
   as a goto and returns through the scheduler), APE2_CAMDAMP=1 (the yaw damping tried before the fix);
   zz_ape2_camlog.cpp prints the slot's eye/target/yaw/distance.
+
+## Garbage textures in the hub (keyboards) and level 1: investigation so far (0051)
+- Tools: F9 in the game window (with APE2_FRAME_DUMP set) dumps the next 60 frames as burst_NNNN.ppm; during a
+  burst the GPU renderer logs primitives over the keyboard area ([gpu:kb] texture, fingerprint of the decoded
+  texels, [gpu:kbuv] ST/Q, [gpu:kbz] TEST/ALPHA/Z), every host->local upload ([gpu:up], [gpu:updata] with a
+  hash of the uploaded data) and writes each distinct texture as tex_<hash>.ppm. APE2_PATH3_LOG=1 logs
+  MSKPATH3 transitions; APE2_MSKPATH3=0 ignores MSKPATH3 (as PAL does); [vif1] reports a DIRECT that ends
+  inside a PACKED/REGLIST GIF packet.
+- Findings: garbage in both renderers (not the GPU path); the game never uses MSKPATH3; CLUT loading matches
+  PAL; with APE2_GS_TEXCACHE=0 everything is garbage (the software rasteriser reads VRAM late), so the cache's
+  page copies are needed. Textures are streamed into 0x2A00-0x4000 at a new address every frame, all uploads
+  as CT32 (4/8-bit textures uploaded as 32-bit data); the Z32 buffer ends exactly at 0x2A00. In garbage frames
+  the keyboard samples an atlas slot where its image was not uploaded: the game's texture streaming and our
+  VRAM disagree. Next: trace the game's texture manager (which upload it expects before the keyboard draw).

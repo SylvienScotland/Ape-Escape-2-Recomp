@@ -1,0 +1,244 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 8bf9d66..27643bb 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -31,6 +31,7 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -309,6 +310,11 @@ public:
+             {
+                 m_upload = command;
+                 m_uploadActive = true;
++                extern std::atomic<int> g_ape2FrameDumpBurst;
++                if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0)
++                    std::fprintf(stderr, "[gpu:up] burst %d dbp=0x%x dbw=%u dpsm=0x%x at %u,%u %ux%u\n", g_ape2FrameDumpBurst.load(),
++                                 command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsax,
++                                 command.trxpos.dsay, command.trxreg.rrw, command.trxreg.rrh);
+             }
+             else if (command.direction == 2u)
+                 vramWritten(command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, command.trxpos.dsax,
+@@ -321,9 +327,20 @@ public:
+         m_cpu->UploadImage(data, sizeBytes);
+         if (onGl() && m_uploadActive)
+         {
++            for (uint32_t i = 0; i < sizeBytes; i += 4)
++            {
++                uint32_t w = 0;
++                std::memcpy(&w, data + i, 4);
++                m_uploadHash = (m_uploadHash ^ w) * 16777619u;
++            }
+             const GSTransferSnapshot snap = m_cpu->GetTransferSnapshot();
+             if (snap.copiedPixels >= snap.totalPixels)
+             {
++                extern std::atomic<int> g_ape2FrameDumpBurst;
++                if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0)
++                    std::fprintf(stderr, "[gpu:updata] burst %d dbp=0x%x %ux%u datahash=%08x\n", g_ape2FrameDumpBurst.load(),
++                                 m_upload.bitbltbuf.dbp, m_upload.trxreg.rrw, m_upload.trxreg.rrh, m_uploadHash);
++                m_uploadHash = 2166136261u;
+                 m_uploadActive = false;
+                 vramWritten(m_upload.bitbltbuf.dbp, m_upload.bitbltbuf.dbw, m_upload.bitbltbuf.dpsm, m_upload.trxpos.dsax,
+                             m_upload.trxpos.dsay, m_upload.trxreg.rrw, m_upload.trxreg.rrh);
+@@ -469,6 +486,7 @@ private:
+     float m_fu = 1, m_fv = 1, m_su = 1, m_sv = 1;
+     GSTransferCommand m_upload{};
+     bool m_uploadActive = false;
++    uint32_t m_uploadHash = 2166136261u;
+     struct GlTexture
+     {
+         GLuint tex = 0;
+@@ -1560,6 +1578,61 @@ private:
+                 int dw = tw, dh = th;
+                 tex = cpuTexture(st, dw, dh);
+             }
++            // during an F9 frame-dump burst: textured primitives over the hub keyboards (debugging aid)
++            extern std::atomic<int> g_ape2FrameDumpBurst;
++            if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && bx0 >= 160 && bx1 <= 240 && by0 >= 95 && by1 <= 150)
++            {
++                uint32_t h = 2166136261u;
++                uint64_t epoch = 0;
++                if (!texRt)
++                {
++                    std::lock_guard<std::mutex> lock(m_cpu->m_mutex);
++                    if (const GSCpuBackend::DecodedTexture *d = m_cpu->PrepareTexture(st))
++                    {
++                        for (size_t i = 0; i < d->texels.size(); i += 7)
++                            h = (h ^ d->texels[i]) * 16777619u;
++                        epoch = d->decodeEpoch;
++                        // each distinct texture once, as tex_<hash>.ppm next to the frame dumps
++                        static std::unordered_map<uint32_t, bool> written;
++                        const char *dir = std::getenv("APE2_FRAME_DUMP");
++                        if (dir && !written[h] && d->w > 0 && d->h > 0 && static_cast<size_t>(d->w) * d->h == d->texels.size())
++                        {
++                            written[h] = true;
++                            char path[512];
++                            std::snprintf(path, sizeof(path), "%s/tex_%08x.ppm", dir, h);
++                            if (FILE *f = std::fopen(path, "wb"))
++                            {
++                                std::fprintf(f, "P6\n%d %d\n255\n", d->w, d->h);
++                                for (uint32_t t : d->texels)
++                                {
++                                    const uint8_t rgb[3] = {static_cast<uint8_t>(t), static_cast<uint8_t>(t >> 8), static_cast<uint8_t>(t >> 16)};
++                                    std::fwrite(rgb, 1, 3, f);
++                                }
++                                std::fclose(f);
++                            }
++                        }
++                    }
++                }
++                {
++                    const GSVertex *v = batch.vertices.data();
++                    std::fprintf(stderr, "[gpu:kbz] prim %u test %llx alpha %llx abe %d z %.0f %.0f %.0f zbp 0x%x zpsm 0x%x fbp 0x%x\n",
++                                 static_cast<unsigned>(st.prim.type), static_cast<unsigned long long>(c.test),
++                                 static_cast<unsigned long long>(c.alpha), st.prim.abe ? 1 : 0, v[0].z, v[1].z, v[2].z,
++                                 c.zbuf.zbp, c.zbuf.psm, c.frame.fbp);
++                }
++                std::fprintf(stderr, "[gpu:kb] burst %d bbox %d,%d-%d,%d tbp0=0x%x tbw=%u psm=0x%x %dx%d cbp=0x%x cpsm=%u csa=%u tfx=%u rt=%d texhash=%08x clutv=%u epoch=%llu\n",
++                             g_ape2FrameDumpBurst.load(), bx0, by0, bx1, by1, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, tw, th, c.tex0.cbp,
++                             c.tex0.cpsm, c.tex0.csa, c.tex0.tfx, texRt, h, m_cpu->m_clutVersion,
++                             static_cast<unsigned long long>(epoch));
++                if (c.tex0.psm == GS_PSM_T4 && tw == 256)
++                {
++                    const GSVertex *v = batch.vertices.data();
++                    std::fprintf(stderr, "[gpu:kbuv] prim %u fst %d clamp %llx v0 st %.5f %.5f q %.5f uv %u %u | v1 st %.5f %.5f q %.5f uv %u %u | v2 st %.5f %.5f q %.5f uv %u %u\n",
++                                 static_cast<unsigned>(st.prim.type), st.prim.fst ? 1 : 0, static_cast<unsigned long long>(c.clamp),
++                                 v[0].s, v[0].t, v[0].q, v[0].u, v[0].v, v[1].s, v[1].t, v[1].q, v[1].u, v[1].v,
++                                 v[2].s, v[2].t, v[2].q, v[2].u, v[2].v);
++                }
++            }
+         }
+         DrawState s;
+         stateFrom(st, s, rt, zb, tex, texRt);
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 862b3dc..ee2b9ba 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -564,12 +564,39 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
+ // (presented RGB, unscaled) and one line with the raw display registers is printed:
+ //   [frame:dump] n=3 file=... size=640x448 pmode=.. smode2=.. dispfb1=.. display1=.. dispfb2=.. display2=..
+ // With APE2_FRAME_DUMP_VRAM=1 the whole 4 MiB of GS local memory is also written as <dir>/vram_NNNN.bin.
++// F9 in the game window (with APE2_FRAME_DUMP set): the next 60 presented frames are written as burst_NNNN.ppm
++std::atomic<int> g_ape2FrameDumpBurst{0};
++
+ static void dumpPresentationFrame(const PresentationFrame &frame, const GSPresentationRequest &request,
+                                   const GSRasterBackend &backend)
+ {
+     static const char *dir = std::getenv("APE2_FRAME_DUMP");
+     if (!dir || !*dir || frame.width == 0u || frame.height == 0u)
+         return;
++    static uint32_t burstDumped = 0u;
++    if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && burstDumped < 1200u)
++    {
++        g_ape2FrameDumpBurst.fetch_sub(1, std::memory_order_relaxed);
++        char path[512];
++        std::snprintf(path, sizeof(path), "%s/burst_%04u.ppm", dir, burstDumped++);
++        if (FILE *f = std::fopen(path, "wb"))
++        {
++            std::fprintf(f, "P6\n%u %u\n255\n", frame.width, frame.height);
++            std::vector<uint8_t> row(static_cast<size_t>(frame.width) * 3u);
++            for (uint32_t y = 0; y < frame.height; ++y)
++            {
++                const size_t src = static_cast<size_t>(y) * kHostFrameWidth * 4u;
++                if (src + static_cast<size_t>(frame.width) * 4u > frame.pixels.size())
++                    break;
++                for (uint32_t x = 0; x < frame.width; ++x)
++                    for (uint32_t c = 0; c < 3u; ++c)
++                        row[x * 3u + c] = frame.pixels[src + x * 4u + c];
++                std::fwrite(row.data(), 1, row.size(), f);
++            }
++            std::fclose(f);
++        }
++        return;
++    }
+     static const uint32_t every = []
+     {
+         const char *e = std::getenv("APE2_FRAME_DUMP_EVERY");
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index d29e233..3293b95 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -2614,6 +2614,13 @@ void PS2Runtime::run()
+         }
+         EndDrawing();
+ 
++        if (IsKeyPressed(KEY_F9))
++        {
++            extern std::atomic<int> g_ape2FrameDumpBurst; // gs_frontend.cpp: burst frame dump (APE2_FRAME_DUMP)
++            g_ape2FrameDumpBurst.store(60);
++            std::fprintf(stderr, "[frame:dump] F9: dumping the next 60 frames\n");
++        }
++
+         if (WindowShouldClose())
+         {
+             RUNTIME_LOG("[run] window close requested, breaking out of loop");
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index bd77e8f..f01d3c2 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -78,7 +78,19 @@ namespace
+             }
+ 
+             if (payloadBytes > static_cast<uint64_t>(sizeBytes - offset))
++            {
++                // a PACKED/REGLIST packet continues in the next DIRECT: that continuation is parsed as a new
++                // GIFtag (debugging report)
++                static int reports = 0;
++                if (reports < 40)
++                {
++                    ++reports;
++                    std::fprintf(stderr, "[vif1] DIRECT ends inside a %s packet: %llu of %llu payload bytes (nloop %u nreg %u)\n",
++                                 flg == 0u ? "PACKED" : "REGLIST", static_cast<unsigned long long>(sizeBytes - offset),
++                                 static_cast<unsigned long long>(payloadBytes), nloop, nreg);
++                }
+                 return 0u;
++            }
+             offset += static_cast<uint32_t>(payloadBytes);
+         }
+ 
+@@ -660,8 +672,42 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         else if (opcode == VIF_MSKPATH3)
+         {
+             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
++            // APE2_MSKPATH3=0: ignore it, as the PAL port does (texture uploads go in kick order) - experiment
++            // for textures drawn from stale VRAM (hub keyboards)
++            static const bool honour = !std::getenv("APE2_MSKPATH3") || std::atoi(std::getenv("APE2_MSKPATH3")) != 0;
++            if (!honour)
++                continue;
+             const bool wasMasked = m_path3Masked;
+             m_path3Masked = (imm & 0x8000u) != 0u;
++            static const bool logMask = std::getenv("APE2_PATH3_LOG") != nullptr;
++            if (logMask && wasMasked != m_path3Masked)
++            {
++                // held PATH3 data at an unmask: transfers and GIF packets (EOP tags) in them
++                uint32_t eops = 0, bytes = 0;
++                for (const auto &p : m_path3MaskedFifo)
++                {
++                    bytes += static_cast<uint32_t>(p.size());
++                    for (size_t off = 0; off + 16u <= p.size();)
++                    {
++                        uint64_t tag = 0;
++                        std::memcpy(&tag, p.data() + off, 8);
++                        const uint32_t nloop = static_cast<uint32_t>(tag & 0x7FFFu), flg = static_cast<uint32_t>((tag >> 58) & 3u);
++                        uint32_t nreg = static_cast<uint32_t>((tag >> 60) & 0xFu);
++                        if (nreg == 0u)
++                            nreg = 16u;
++                        const size_t pay = flg == 0u ? static_cast<size_t>(nloop) * nreg * 16u
++                                         : flg == 1u ? ((static_cast<size_t>(nloop) * nreg * 8u + 15u) & ~size_t(15))
++                                                     : static_cast<size_t>(nloop) * 16u;
++                        if (tag & 0x8000u)
++                            ++eops;
++                        off += 16u + pay;
++                    }
++                }
++                static int lines = 0;
++                if (lines++ < 400)
++                    std::fprintf(stderr, "[path3] %s: held %zu transfers, %u bytes, %u EOP packets\n",
++                                 m_path3Masked ? "mask" : "unmask", m_path3MaskedFifo.size(), bytes, eops);
++            }
+             if (wasMasked && !m_path3Masked)
+                 flushMaskedPath3Packets();
+             continue;
