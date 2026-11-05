@@ -3666,3 +3666,42 @@ Retracted hypothesis, recorded so it is not tried again: the voice mixer's phase
 Also corrected in this entry's favour: the earlier probe-offset test (`produced N -> device M`) can no longer be used, because interpolation makes the device bytes differ from the produced bytes sample by sample. Verification now rests on the underrun counter, the silent-chunk fraction and the fill level.
 
 Build note: this was a full rebuild after `ps2_audio.h` changed, and took ~20 minutes because it recompiles ~240 generated unity units plus the VU program unit; incremental builds after touching only one .cpp remain ~90 s. A `run_terminal_command` timeout killed two attempts mid-link before a background build finally completed, and a runner restart interrupted a third - the resulting `build223b.log` is the authoritative one.
+
+### 0214 - Measured, not guessed: the resampler was muffling the music
+
+Player description after build 223: "slightly muffled, pixely, the beat a little too deep, the yell a little too high pitched". That is a description of interpolation error, so it was measured rather than theorised about.
+
+Method: the device capture (`APE2_AUDIO_DEV`) and the guest-side capture (`APE2_SPU2_PCM`) cover the same 17 s of the same track, so a long-term average spectrum (LTAS) over each whole file compares them without needing sample alignment. Window-by-window comparison is useless here: a 0.19% rate difference smears a 0.5 s window by ~58 frames, and correlation across such windows measured 0.01-0.15 no matter the offset. An earlier attempt to lock the two streams sample-for-sample failed for exactly that reason and produced no usable numbers.
+
+LTAS of build 223 (linear interpolation), device minus produced:
+
+- 30-500 Hz: within 0.01 dB
+- 500 Hz-2 kHz: +0.03 dB
+- 2-5 kHz: -0.14 dB
+- 5-10 kHz: **-0.68 dB**
+- 10-16 kHz: **-1.96 dB**
+- 16-23 kHz: **-3.62 dB**
+
+Linear interpolation at a fractional position is a low-pass, and the predicted response matches: -0.44 dB at 6 kHz, -1.75 dB at 12 kHz, -2.99 dB at 16 kHz, -4.20 dB at 20 kHz. So the "muffled" was mine, introduced in 0213.
+
+Quantisation was ruled out as the cause of "pixely": both streams have the same delta structure (49.87% / 49.95% of non-zero deltas even, 12.40% / 12.42% divisible by 8), so nothing is being bit-crushed anywhere.
+
+Also produced `dumps/audio/dev223.wav` and `pcm223.wav` so the device-side bytes and the guest-side bytes can be A/B'd by ear: if the WAV sounds right while the game does not, the remaining difference is raylib's `ma_data_converter` (raylib's `AUDIO_DEVICE_SAMPLE_RATE` is 0, i.e. the Windows default, and `raudio.c:581` converts our 48 kHz stream to it).
+
+### 0215 - Catmull-Rom resampling, and a rate decision once per callback
+
+Two changes in `streamFillCallback`:
+
+1. Linear interpolation replaced with 4-point Catmull-Rom (`-0.5, 1.5, -1.5, 0.5` / `1, -2.5, 2, -0.5`), falling back to linear while fewer than four frames are buffered.
+2. The rate ratio is now computed once per callback with a quarter-weight one-pole, instead of once per sample. Recomputing it per sample let the ratio move at sample granularity, which modulates pitch.
+
+Run 0234 (build 224):
+
+- underruns **0**, device 48,029/s, queue `pushed=3200 played=3188 underruns=0 dropped=0 depth=12`
+- LTAS device minus produced: **-0.10 dB at 5-10 kHz** (was -0.68), **-0.66 dB at 10-16 kHz** (was -1.96), **-1.92 dB at 16-23 kHz** (was -3.62)
+- zero clicks above 20,000; 6 above 12,000; no dropout chunk after start
+- `dumps/audio/dev224.wav` written for listening
+
+The residual 16-23 kHz loss is Catmull-Rom's own response near Nyquist; removing it needs a windowed-sinc kernel, which is only worth doing if the player still hears dullness.
+
+Patch 0054 was regenerated to cover the cubic version, and both new patches are now recorded in `C:\dev\PS2Recomp\.ape2_patches_applied` - the build script re-applies every patch in `patches/ps2recomp`, so a patch left unrecorded there is applied on top of itself and fails.
