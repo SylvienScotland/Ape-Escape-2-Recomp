@@ -1,0 +1,880 @@
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,9 +1,11 @@
+ #pragma once
+ 
+ #include "iop_sio2.h"
++#include "iop_spu2.h"
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -22,6 +24,8 @@
+         static constexpr uint32_t HardwareEnd = 0x1F900000u;
+         static constexpr uint32_t Spu2Base = 0x1F900000u;
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
++        // 0167: guest PC of the instruction touching hardware, so SPU2 writes can be attributed to code.
++        static uint32_t s_currentPc;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+         static constexpr uint32_t HeapBase = 0x00070000u; // was 0x120000: modules end ~0x52000; games need the rest as heap
+@@ -70,7 +74,20 @@
+         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+ 
+         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
++
++        // 0161: drop the ADMAS busy bit for the channel whose transfer just completed.
++        void completeSpu2Dma();
++        // 0077: autonomous auto-DMA - the per-block period to keep re-scheduling, while it stays armed.
++        [[nodiscard]] std::optional<uint64_t> dmaRearmDelay(int irq) const noexcept;
+         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
++
++        // 0075: SPU2 playback. The game feeds streamed PCM into IOP RAM and arms SPU2 auto-DMA on it; the DMA
++        // block used to be discarded, so nothing was ever audible. pullSpu2Pcm hands the armed buffer to the
++        // host as 16-bit stereo frames, advancing a read cursor at the hardware playback rate.
++        [[nodiscard]] size_t pullSpu2Pcm(int16_t *destination, size_t frameCount);
++        [[nodiscard]] bool spu2StreamArmed() const noexcept { return m_spu2Armed; }
++        // 0145: lets a probe tell whether an SPU2 access came from the driver interrupt handler.
++        void setSpu2HandlerContext(bool value) noexcept { m_inSpu2Handler = value; }
+ 
+         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+ 
+@@ -90,7 +107,20 @@
+         uint32_t m_interruptStatus = 0;
+         uint32_t m_interruptMask = 0;
+         uint32_t m_interruptControl = 1;
++        struct AdmaTimer
++        {
++            bool active = false;
++            int irq = 0;
++            uint64_t delayCycles = 0;
++        };
+         std::optional<DmaStart> m_dmaStart;
+-        mutable IopSio2 m_sio2; // mutable: reading DATAOUT pops its FIFO (patch 0018)
++        uint32_t m_admasWord = 0u;
++        uint32_t m_admasBit = 0u;
++        AdmaTimer m_admaTimer; // 0077: autonomous auto-DMA block interrupt
++        mutable IopSio2 m_sio2;
++        IopSpu2 m_spu2; // 0093: real voices, ADPCM and mixing replace the IOP-RAM PCM ring // mutable: reading DATAOUT pops its FIFO (patch 0018)
++        uint32_t m_spu2ReadAddr = 0u; // playback cursor inside the armed auto-DMA buffer
++        bool m_spu2Armed = false;
++        mutable bool m_inSpu2Handler = false; // 0145
+     };
+ }
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1,25 +1,245 @@
++#include <chrono>
+ #include "iop_memory.h"
++#include "iop_spu2.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace ps2x::iop::detail
+ {
++namespace
++{
++    // 0113: A/B switch for the whole SPU2 core. With APE2_SPU2_OFF=1 the core is bypassed entirely, which is
++    // byte-for-byte the pre-audio path: no register file, no mixer, no module RAM writes.
++    bool spu2Enabled()
++    {
++        static const bool enabled = []() {
++            const char *env = std::getenv("APE2_SPU2_OFF");
++            return !(env != nullptr && std::atoi(env) != 0);
++        }();
++        return enabled;
++    }
++}
++
+     namespace
+     {
+         constexpr uint32_t kDmaSpu0Chcr = 0x1F8010C8u;
+         constexpr uint32_t kDmaSpu1Chcr = 0x1F801508u;
+         constexpr uint32_t kDmaStart = 1u << 24u;
+         constexpr int kDmaSpu0Irq = 0x24;
+-        constexpr int kDmaSpu1Irq = 0x28;
++        constexpr int kDmaSpu1Irq = 0x28; // 0142 reverted: 0x11 regressed streaming (stread 32 -> 1); SNDN2DRV's own IRQ 17 handler is not the stream completion
+         // SPU2 AutoDMA (ADMA): the SPU pulls the stream block as it plays it, so the DMA only completes
+         // after one 32-bit word (one 16-bit stereo frame) per 48 kHz sample. Completing at bus speed
+         // makes sound drivers refill their stream thousands of times per second (Ape Escape 2 recomp
+         // patch 0008). ADMAS is SPU2 core offset 0x1B0 (bit 0 = core0, bit 1 = core1).
+         constexpr uint32_t kSpu2Core0AdmasWord = 0x1F9001B0u;
+         constexpr uint32_t kSpu2CoreStride = 0x400u;
+-        constexpr uint64_t kAdmaCyclesPerWord = 36'864'000ull / 48'000ull; // IOP clock / 48 kHz = 768
++        // 0071: auto-DMA pacing, in IOP cycles per 16-bit word (768 per stereo frame = 36.864 MHz / 48 kHz).
++        // Calibrated against [spu2:lap]: 768 gives 2.04 block refreshes per 2 KB ring lap, i.e. every block is
++        // refreshed exactly once per lap. 384 overran (4.15) and 934 starved the reader (1.68). Kept overridable
++        // through APE2_SPU2_ADMA_CYCLES in case IOP timing changes.
++        uint64_t admaCyclesPerWord()
++        {
++            static const uint64_t value = []()
++            {
++                if (const char *env = std::getenv("APE2_SPU2_ADMA_CYCLES"))
++                {
++                    const long parsed = std::strtol(env, nullptr, 10);
++                    if (parsed >= 32 && parsed <= 100000)
++                        return static_cast<uint64_t>(parsed);
++                }
++                return 1240ull;
++            }();
++            return value;
++        }
++
++        namespace
++        {
++            // 0071: SPU2 auto-DMA ring playback. The driver keeps a small ring in IOP RAM (measured: base
++            // 0x4be40, 2048 bytes, i.e. two 1 KB blocks) and re-arms its blocks continuously; the SPU2 reads that
++            // ring and wraps. Blocks are copied into a shadow at arm time because reading IOP RAM while the driver
++            // rewrites it produced tearing - constant noise instead of music.
++            constexpr uint32_t kSpu2ShadowCapacity = 16u * 1024u;
++
++            struct Spu2Ring
++            {
++                uint32_t base = 0u;
++                uint32_t size = 0u;
++                uint32_t cursor = 0u;
++                bool ready = false;
++                std::vector<uint8_t> shadow = std::vector<uint8_t>(kSpu2ShadowCapacity, 0u);
++                uint64_t framesOut = 0u;
++                unsigned arms = 0u;
++                unsigned armsThisLap = 0u;
++                unsigned laps = 0u;
++                uint64_t armsLapSum = 0u;
++                unsigned freshArms = 0u;
++                unsigned staleArms = 0u;
++            };
++
++            Spu2Ring &spu2Ring()
++            {
++                static Spu2Ring ring;
++                return ring;
++            }
++
++            // 0074: auto-DMA hands over one block per interrupt, so playback consumes armed blocks in order.
++            // The wrap-ring model replayed the newest 2 KB every 10.7 ms (98% repeated output chunks).
++            constexpr size_t kSpu2QueueBlocks = 64u;
++            constexpr size_t kSpu2BlockCapacity = 2048u;
++            // 0204: the driver produces ~298 blocks/s while the 48 kHz device consumes 187.5, so the backlog is
++            // capped and the newest block is discarded on overflow. Dropping the oldest block instead made playback
++            // jump forward mid-phrase, which is heard as chopped audio.
++            constexpr size_t kSpu2QueueTargetDepth = 16u;
++
++            struct Spu2Queue
++            {
++                static constexpr size_t kBlocks = kSpu2QueueBlocks;
++                std::array<std::array<uint8_t, kSpu2BlockCapacity>, kSpu2QueueBlocks> blocks{};
++                size_t blockBytes = 0u;
++                size_t head = 0u; // index of the next block to play
++                size_t count = 0u;
++                size_t playOffset = 0u;
++                uint8_t lastFrame[4] = {0u, 0u, 0u, 0u};
++                uint64_t pushed = 0u;
++                uint64_t played = 0u;
++                uint64_t underruns = 0u;
++                uint64_t dropped = 0u;
++                uint64_t framesOut = 0u;
++            };
++
++            Spu2Queue &spu2Queue()
++            {
++                static Spu2Queue queue;
++                return queue;
++            }
++
++            void spu2QueuePush(const std::vector<uint8_t> &ram, uint32_t address, uint32_t sizeBytes)
++            {
++                if (sizeBytes < 4u || sizeBytes > kSpu2BlockCapacity || address == 0u)
++                    return;
++                if (static_cast<uint64_t>(address) + sizeBytes > ram.size())
++                    return;
++                Spu2Queue &queue = spu2Queue();
++                static const auto wallStart = std::chrono::steady_clock::now(); // 0204: wall clock for rate accounting
++                if (queue.blockBytes == 0u)
++                    queue.blockBytes = sizeBytes;
++                if (sizeBytes != queue.blockBytes)
++                    return;
++                if (queue.count >= kSpu2QueueTargetDepth)
++                {
++                    ++queue.dropped;
++                    return;
++                }
++                std::memcpy(queue.blocks[(queue.head + queue.count) % Spu2Queue::kBlocks].data(), ram.data() + address,
++                            sizeBytes);
++                ++queue.count;
++                if (++queue.pushed % 200u == 0u)
++                {
++                    std::fprintf(stderr, "[spu2:wall] pushed=%llu played=%llu dropped=%llu secs=%ld\n", static_cast<unsigned long long>(queue.pushed), static_cast<unsigned long long>(queue.played), static_cast<unsigned long long>(queue.dropped), static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - wallStart).count()));
++                    std::fprintf(stderr,
++                                 "[spu2:queue] pushed=%llu played=%llu underruns=%llu dropped=%llu depth=%llu "
++                                 "audioOut=%.1fs\n",
++                                 static_cast<unsigned long long>(queue.pushed),
++                                 static_cast<unsigned long long>(queue.played),
++                                 static_cast<unsigned long long>(queue.underruns),
++                                 static_cast<unsigned long long>(queue.dropped),
++                                 static_cast<unsigned long long>(queue.count),
++                                 static_cast<double>(queue.framesOut) / 48'000.0);
++                }
++            }
++
++            // 0074: playback reads the ring out of live IOP RAM the way the SPU2 ADMA engine does. The shadow copy
++            // freezes a slot at its arm-time contents, so a slot the driver rewrites in place keeps replaying old
++            // audio. APE2_SPU2_SHADOW=1 restores the old behaviour for comparison.
++            bool shadowPlayback()
++            {
++                static const bool value = std::getenv("APE2_SPU2_SHADOW") != nullptr;
++                return value;
++            }
++
++            void spu2RingRefresh(const std::vector<uint8_t> &ram, uint32_t address, uint32_t sizeBytes)
++            {
++                if (address == 0u || sizeBytes == 0u || sizeBytes > kSpu2ShadowCapacity)
++                    return;
++                if (static_cast<uint64_t>(address) + sizeBytes > ram.size())
++                    return;
++
++                Spu2Ring &ring = spu2Ring();
++                if (!ring.ready)
++                {
++                    ring.base = address;
++                    ring.size = sizeBytes;
++                    ring.cursor = address;
++                    ring.ready = true;
++                    std::fprintf(stderr, "[spu2:ring] base=0x%08x size=%u\n", ring.base, ring.size);
++                }
++                else
++                {
++                    const int64_t delta = static_cast<int64_t>(address) - static_cast<int64_t>(ring.base);
++                    const bool inside = delta >= 0 &&
++                                        static_cast<uint32_t>(delta) + sizeBytes <= ring.size;
++                    if (!inside)
++                    {
++                        const uint64_t magnitude = static_cast<uint64_t>(delta < 0 ? -delta : delta);
++                        if (magnitude <= 0x20000u)
++                        {
++                            if (delta < 0)
++                            {
++                                ring.size += static_cast<uint32_t>(-delta);
++                                ring.base = address;
++                            }
++                            else
++                            {
++                                ring.size = static_cast<uint32_t>(delta) + sizeBytes;
++                            }
++                            if (ring.size > kSpu2ShadowCapacity)
++                                ring.size = kSpu2ShadowCapacity;
++                            std::fprintf(stderr, "[spu2:ring] grown base=0x%08x size=%u\n", ring.base,
++                                         ring.size);
++                        }
++                        else
++                        {
++                            ring.base = address;
++                            ring.size = sizeBytes;
++                            ring.cursor = address;
++                            std::fprintf(stderr, "[spu2:ring] moved base=0x%08x size=%u\n", ring.base,
++                                         ring.size);
++                        }
++                        if (ring.cursor < ring.base || ring.cursor >= ring.base + ring.size)
++                            ring.cursor = ring.base;
++                    }
++                }
++
++                if (address < ring.base || address - ring.base + sizeBytes > ring.size)
++                    return; // this block is outside the ring being played
++
++                const size_t slotOffset = address - ring.base;
++                const bool slotChanged =
++                    std::memcmp(ring.shadow.data() + slotOffset, ram.data() + address, sizeBytes) != 0;
++                if (slotChanged)
++                    ++ring.freshArms;
++                else
++                    ++ring.staleArms;
++                std::memcpy(ring.shadow.data() + slotOffset, ram.data() + address, sizeBytes);
++                ++ring.arms;
++                ++ring.armsThisLap;
++                // 0074: the armed block is the next piece of the stream; queue it for one-shot playback.
++                // 0204: a re-arm of bytes already queued would play the same audio twice (1167 of 8200 arms), which
++                // is audible as a stutter on every repeat - only queue a slot whose contents actually changed.
++                if (slotChanged)
++                    spu2QueuePush(ram, address, sizeBytes);
++                if (ring.arms % 200u == 0u)
++                    std::fprintf(stderr,
++                                 "[spu2:arm] arms=%u fresh=%u stale=%u framesOut=%llu (%.1f fresh blocks/s over %.1fs)\n",
++                                 ring.arms, ring.freshArms, ring.staleArms,
++                                 static_cast<unsigned long long>(ring.framesOut), static_cast<double>(ring.freshArms),
++                                 static_cast<double>(ring.framesOut) / 48'000.0);
++            }
++        }
+ 
+         uint32_t alignUp(uint32_t value, uint32_t alignment)
+         {
+@@ -45,7 +265,9 @@
+         m_interruptMask = 0;
+         m_interruptControl = 1;
+         m_dmaStart.reset();
++        m_admaTimer = AdmaTimer{};
+         m_sio2.reset();
++        m_spu2.reset(); // 0093: clear voices and sample RAM with the rest of the machine
+     }
+ 
+     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
+@@ -69,6 +291,32 @@
+     uint16_t IopMemory::read16(uint32_t address) const
+     {
+         const uint32_t phys = physicalAddress(address);
++        // 0105: libsd reads voice registers with 16-bit loads (lhu). Those never consulted the SPU2 core,
++        // so every status the driver polled came back as 0 regardless of what the engine held.
++        // 0112: this changed what the driver observes, so it is switchable - APE2_SPU2_ROUTE16=0 restores the
++        // pre-0105 behaviour (reads fall through to the plain byte path) to A/B the boot regression.
++        static const bool routeSpu2Reads = []() {
++            const char *env = std::getenv("APE2_SPU2_ROUTE16");
++            return env == nullptr || std::atoi(env) != 0;
++        }();
++        if (routeSpu2Reads && spu2Enabled() && IopSpu2::contains(phys))
++        {
++            const uint32_t word = m_spu2.read32(phys & ~3u);
++            const uint16_t half = static_cast<uint16_t>((word >> ((phys & 3u) * 8u)) & 0xFFFFu);
++            // 0169: what the driver polls, what value it gets, and from which instruction.
++            static unsigned long long rrdLog = 0ull;
++            if (std::getenv("APE2_SPU2_RRD") != nullptr && rrdLog++ < 20000ull)
++                std::fprintf(stderr, "[spu2:rrd] off=0x%x val=0x%x pc=0x%x%c", phys - 0x1F900000u,
++                             static_cast<unsigned>(half), s_currentPc, 10);
++            if (m_inSpu2Handler && std::getenv("APE2_SPU2_HIRQ") != nullptr)
++            {
++                static unsigned hHalfReads = 0u;
++                if (hHalfReads++ < 80u)
++                    std::fprintf(stderr, "[spu2:hirq] read16 off=0x%x = 0x%x%c", phys - 0x1F900000u,
++                                 static_cast<unsigned>(half), 10);
++            }
++            return half;
++        }
+         if (phys + 1u < RamSize)
+         {
+             uint16_t value;
+@@ -132,9 +380,69 @@
+         writeHardware32(aligned, current);
+     }
+ 
++    uint32_t IopMemory::s_currentPc = 0u;
++
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        // 0097: libsd programs voices with 16-bit stores (`sh`); they must not be turned into two byte
++        // read-modify-writes, which previously never reached the SPU2 core.
++        if (spu2Enabled() && IopSpu2::contains(phys))
++        {
++            const uint32_t aligned = phys & ~3u;
++            uint32_t current = m_spu2.read32(aligned);
++            const uint32_t shift = (phys & 3u) * 8u;
++            current = (current & ~(0xFFFFu << shift)) | (static_cast<uint32_t>(value) << shift);
++            // 0101: full histogram of 16-bit SPU2 register writes, uncapped - the earlier log kept only the
++            // first 12 and that hid the voice programming.
++            static unsigned long long halfTotal = 0ull;
++            static unsigned long long halfByOffset[0x800] = {0ull};
++            const uint32_t halfOffset = phys - 0x1F900000u;
++            // 0167: which guest code writes this register, and does anything ever write KEYON (0x1b8/0x1bc)?
++            static unsigned long long pcLog = 0ull;
++            // 0171: cap raised to 20000: the 400-entry window may have cut off volume/keyon writes made later.
++            if (std::getenv("APE2_SPU2_WPC") != nullptr && pcLog++ < 20000ull)
++                std::fprintf(stderr, "[spu2:wpc] off=0x%x val=0x%x pc=0x%x%c", halfOffset,
++                             static_cast<unsigned>(value), IopMemory::s_currentPc, 10);
++            ++halfTotal;
++            if (halfOffset < 0x1000u)
++                ++halfByOffset[halfOffset >> 1];
++            if (m_inSpu2Handler && std::getenv("APE2_SPU2_HIRQ") != nullptr)
++            {
++                static unsigned hWrites = 0u;
++                if (hWrites++ < 80u)
++                    std::fprintf(stderr, "[spu2:hirq] write off=0x%x = 0x%x%c", halfOffset,
++                                 static_cast<unsigned>(value), 10);
++            }
++            if (halfTotal % 200ull == 0ull)
++            {
++                unsigned bestOff[10] = {0u};
++                unsigned long long bestCnt[10] = {0ull};
++                for (unsigned i = 0u; i < 0x800u; ++i)
++                {
++                    for (unsigned slot = 0u; slot < 10u; ++slot)
++                    {
++                        if (halfByOffset[i] > bestCnt[slot])
++                        {
++                            for (unsigned shift = 9u; shift > slot; --shift)
++                            {
++                                bestCnt[shift] = bestCnt[shift - 1u];
++                                bestOff[shift] = bestOff[shift - 1u];
++                            }
++                            bestCnt[slot] = halfByOffset[i];
++                            bestOff[slot] = i;
++                            break;
++                        }
++                    }
++                }
++                std::fprintf(stderr, "[spu2:hist] total=%llu top:", halfTotal);
++                for (unsigned slot = 0u; slot < 6u; ++slot)
++                    std::fprintf(stderr, " 0x%03x=%llu", bestOff[slot] * 2u, bestCnt[slot]);
++                std::fprintf(stderr, "%c", 10);
++            }
++            m_spu2.write32(aligned, current);
++            return;
++        }
+         if (phys + 1u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -153,6 +461,19 @@
+     void IopMemory::write32(uint32_t address, uint32_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
++        // 0174: write32 has its own SPU2 handling, so writes that never reach writeHardware32 were unlogged -
++        // and key-on is exactly the kind of 32-bit store that would hide there.
++        static unsigned long long w32Log = 0ull;
++        if (std::getenv("APE2_SPU2_WPC32") != nullptr && (phys & 0xFFF00000u) == 0x1F900000u && w32Log++ < 4000ull)
++            std::fprintf(stderr, "[spu2:w32] off=0x%x val=0x%x pc=0x%x%c", phys - 0x1F900000u, value,
++                         IopMemory::s_currentPc, 10);
++        // 0102: the EE polls these two driver status buffers forever; are they ever written at all?
++        if (phys >= 0x4BA40u && phys < 0x4BC80u)
++        {
++            static unsigned statusWrites = 0u;
++            if (++statusWrites <= 24u)
++                std::fprintf(stderr, "[sndn:status] write 0x%x = 0x%x%c", phys, value, 10);
++        }
+         if ((phys & 3u) == 0u && phys + 3u < RamSize)
+         {
+             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+@@ -243,6 +564,25 @@
+ 
+     uint32_t IopMemory::readHardware32(uint32_t address) const
+     {
++        // 0093: envelopes and current addresses come from the engine once it is running voices.
++        // 0097: the driver polls these registers before it ever keys a voice, so the engine must answer
++        // unconditionally - gating reads on keyonCount() hid every pre-play status poll.
++        if (spu2Enabled() && IopSpu2::contains(address))
++        {
++            const uint32_t spuValue = m_spu2.read32(address);
++            static unsigned long long rrdLog32 = 0ull;
++            if (std::getenv("APE2_SPU2_RRD") != nullptr && rrdLog32++ < 200ull && (address & 0xFFFu) >= 0x300u)
++                std::fprintf(stderr, "[spu2:rrd32] off=0x%x val=0x%x pc=0x%x%c", address - 0x1F900000u, spuValue,
++                             s_currentPc, 10);
++            // 0145: what does the driver's interrupt handler actually read back?
++            if (m_inSpu2Handler && std::getenv("APE2_SPU2_HIRQ") != nullptr)
++            {
++                static unsigned hReads = 0u;
++                if (hReads++ < 80u)
++                    std::fprintf(stderr, "[spu2:hirq] read off=0x%x = 0x%x%c", address - 0x1F900000u, spuValue, 10);
++            }
++            return spuValue;
++        }
+         const auto value = m_hardware.find(address);
+         if (value != m_hardware.end())
+             return value->second;
+@@ -261,6 +601,11 @@
+ 
+     void IopMemory::writeHardware32(uint32_t address, uint32_t value)
+     {
++        // 0173: 32-bit SPU2 writes (key-on is commonly a `sw`) were never logged; capture them with the writer PC.
++        static unsigned long long wpc32Log = 0ull;
++        if (std::getenv("APE2_SPU2_WPC32") != nullptr && (address & 0xFFF00000u) == 0x1F900000u && wpc32Log++ < 4000ull)
++            std::fprintf(stderr, "[spu2:wpc32] off=0x%x val=0x%x pc=0x%x%c", address - 0x1F900000u, value,
++                         IopMemory::s_currentPc, 10);
+         switch (address)
+         {
+         case 0x1F801070u:
+@@ -275,6 +620,51 @@
+         default:
+             break;
+         }
++
++        // 0077: clearing ADMAS's auto bits is how the driver stops the stream.
++        if ((address == kSpu2Core0AdmasWord || address == kSpu2Core0AdmasWord + kSpu2CoreStride) &&
++            (value & 0x3u) == 0u)
++        {
++            if (m_admaTimer.active)
++                std::fprintf(stderr, "[spu2:auto] stopped by ADMAS write 0x%x\n", value);
++            m_admaTimer.active = false;
++        }
++
++        // 0088: SPU2 register traffic, including the legacy PS1 window at 0x1F801C00 that libsd uses for
++        // core0 voices. Counted per window with the first few addresses printed, so the real programming traffic
++        // (KEYON, voice pitch/start/ADSR) can be identified instead of assumed.
++        {
++            const bool legacy = address >= 0x1F801C00u && address < 0x1F801E00u;
++            const bool core0 = address >= Spu2Base && address < Spu2Base + 0x400u;
++            const bool core1 = address >= Spu2Base + 0x400u && address < Spu2Base + 0x800u;
++            const bool common = address >= Spu2Base + 0x800u && address < Spu2End;
++            if (legacy || core0 || core1 || common)
++            {
++                static unsigned legacyCount = 0u;
++                static unsigned core0Count = 0u;
++                static unsigned core1Count = 0u;
++                static unsigned commonCount = 0u;
++                static unsigned keyonCount = 0u;
++                unsigned &counter = legacy ? legacyCount : core0 ? core0Count : core1 ? core1Count : commonCount;
++                ++counter;
++
++                const uint32_t low = address & 0x3FFu;
++                const bool isKeyon = (low == 0x1B8u) || (legacy && address == 0x1F801D88u);
++                if (isKeyon)
++                    ++keyonCount;
++
++                const unsigned total = legacyCount + core0Count + core1Count + commonCount;
++                if (total <= 8u || isKeyon || total % 5000u == 0u)
++                    std::fprintf(stderr,
++                                                      "[spu2:reg] addr=0x%08x val=0x%08x legacy=%u core0=%u core1=%u common=%u keyon=%u\n",
++                                 address, value, legacyCount, core0Count, core1Count, commonCount, keyonCount);
++            }
++        }
++
++        // 0093: hand the value to the real SPU2 register file so voices can be keyed and mixed.
++        if (spu2Enabled() && IopSpu2::contains(address))
++            m_spu2.write32(address, value);
++
+ 
+         m_hardware[address] = value;
+         if ((address != kDmaSpu0Chcr && address != kDmaSpu1Chcr) || (value & kDmaStart) == 0u)
+@@ -291,6 +681,12 @@
+             status = current->second;
+         status |= 0x80u << shift;
+         m_hardware[alignedStatus] = status;
++        // 0114: reads of the SPU2 window come from the core (readHardware32), so a status bit that only lives in
++        // the flat map is invisible to the guest - the driver polls this completion flag and never saw it, which
++        // stalled the stream pump and left the game on the loading screen. Push it into the core too.
++        if (spu2Enabled() && IopSpu2::contains(alignedStatus))
++            if (std::getenv("APE2_SPU2_NOSTATUS") == nullptr) // 0126 diag: 0114 status mirror off
++            m_spu2.write32(alignedStatus, status);
+ 
+         const uint32_t blockControlAddress = address - sizeof(uint32_t);
+         uint32_t blockControl = 0u;
+@@ -304,9 +700,139 @@
+         uint32_t admas = 0u;
+         if (const auto current = m_hardware.find(admasWord); current != m_hardware.end())
+             admas = current->second & 0xFFFFu;
+-        const bool autoDma = (admas & (secondCore ? 2u : 1u)) != 0u;
++        const bool autoDma = (admas & (secondCore ? 2u : 1u)) != 0u || secondCore; // 0135
++        // 0161: what is the driver actually trying to move? Record every SPU2 channel arm so its retry loop can be
++        // matched to a transfer instead of guessed at.
++        {
++            const uint32_t srcReg = secondCore ? 0x1F801500u : 0x1F8010C0u;
++            uint32_t src = 0u;
++            if (const auto it = m_hardware.find(srcReg); it != m_hardware.end())
++                src = it->second & 0x1FFFFFu;
++            static unsigned armLog = 0u;
++            if (armLog++ < 40u)
++                std::fprintf(stderr, "[dmaq] ch=%d src=0x%06x words=%llu bcr=0x%08x auto=%d%c", secondCore ? 1 : 0, src,
++                             static_cast<unsigned long long>(transferWords), blockControl, autoDma ? 1 : 0, 10);
++        }
+         if (autoDma)
+-            delayCycles = std::max<uint64_t>(delayCycles, transferWords * kAdmaCyclesPerWord);
++            delayCycles = std::max<uint64_t>(delayCycles, transferWords * admaCyclesPerWord());
++
++        // 0077: auto-DMA runs on its own once armed, so remember the block period and keep raising
++        // the completion interrupt without waiting for another CHCR write from the driver.
++        if (autoDma)
++        {
++            m_admaTimer.active = true;
++            m_admaTimer.irq = secondCore ? kDmaSpu1Irq : kDmaSpu0Irq;
++            m_admaTimer.delayCycles = delayCycles;
++            std::fprintf(stderr, "[spu2:auto] armed irq=%d block=%llu cycles (%.2f ms)\n",
++                         m_admaTimer.irq, static_cast<unsigned long long>(delayCycles),
++                         static_cast<double>(delayCycles) / 36864.0);
++        }
++
++        // 0161: ADMAS is the hardware's "is this channel transferring?" bit and nothing ever wrote it, which is why
++        // the driver's wait loop (0157: 12,784 laps) could never end. Set it when a block is really armed, and clear
++        // it when the scheduled completion event fires - a busy/idle cycle keyed to a real transfer, not a latch.
++        {
++            const uint32_t admasWord = kSpu2Core0AdmasWord + (secondCore ? kSpu2CoreStride : 0u);
++            uint32_t admasValue = 0u;
++            if (const auto it = m_hardware.find(admasWord); it != m_hardware.end())
++                admasValue = it->second;
++            admasValue |= secondCore ? 2u : 1u;
++            m_hardware[admasWord] = admasValue;
++            if (spu2Enabled() && IopSpu2::contains(admasWord))
++                m_spu2.write32(admasWord, admasValue);
++            m_admasWord = admasWord;
++            m_admasBit = secondCore ? 2u : 1u;
++        }
++
++        // 0093: every DMA block the driver sends is sample data for SPU2 RAM, at the core's transfer address.
++        {
++            const uint32_t madrReg = secondCore ? 0x1F801500u : 0x1F8010C0u;
++            uint32_t source = 0u;
++            if (const auto current = m_hardware.find(madrReg); current != m_hardware.end())
++                source = current->second & 0x1FFFFFu;
++            const uint32_t bytes = static_cast<uint32_t>(transferWords) * 4u;
++            if (source != 0u && bytes != 0u)
++            {
++                std::vector<uint8_t> block(bytes);
++                if (readRam(source, block.data(), block.size()))
++                    m_spu2.transferWrite(secondCore ? 1 : 0, block.data(), bytes);
++            }
++        }
++
++        // 0071: the auto-DMA source is the streamed music. Each arm marks a block the driver has (re)written, so
++        // it is copied into the shadow ring there and played from by pullSpu2Pcm at 48 kHz.
++        if (autoDma && secondCore)
++        {
++            const uint32_t madrWord = 0x1F801500u;
++            uint32_t streamSource = 0u;
++            if (const auto current = m_hardware.find(madrWord); current != m_hardware.end())
++                streamSource = current->second & 0x1FFFFFu;
++            if (streamSource != 0u)
++            {
++                m_spu2Armed = true;
++                spu2RingRefresh(m_ram, streamSource, static_cast<uint32_t>(transferWords) * 4u);
++            }
++        }
++
++        // 0072: the block is discarded once the interrupt is scheduled, so capture it while it is still in IOP RAM.
++        // APE2_SPU2_DUMP=<dir> appends each core's stream to <dir>/spu2_coreN.bin.
++        if (autoDma)
++        {
++            if (const char *dumpDir = std::getenv("APE2_SPU2_DUMP"))
++            {
++                static std::FILE *files[2] = {nullptr, nullptr};
++                std::FILE *&file = files[secondCore ? 1 : 0];
++                if (!file)
++                {
++                    char path[512];
++                    std::snprintf(path, sizeof(path), "%s/spu2_core%u.bin", dumpDir, secondCore ? 1u : 0u);
++                    file = std::fopen(path, "wb");
++                }
++                const uint32_t madrReg = secondCore ? 0x1F801500u : 0x1F8010C0u;
++                uint32_t source = 0u;
++                if (const auto current = m_hardware.find(madrReg); current != m_hardware.end())
++                    source = current->second & 0x1FFFFFu;
++                // 0073: snapshot all of IOP RAM a few times, so the region that actually holds the PCM can be
++                // found by measurement instead of guessing which buffer the driver is supposed to use.
++                {
++                    static unsigned ramDumpArms[2] = {0u, 0u};
++                    unsigned &arms = ramDumpArms[secondCore ? 1 : 0];
++                    ++arms;
++                    static unsigned ramDumps = 0u;
++                    static const unsigned armDumpAt[5] = {40u, 80u, 120u, 3000u, 12000u};
++                    if (ramDumps < 5u && arms >= armDumpAt[ramDumps])
++                    {
++                        ++ramDumps;
++                        char ramPath[512];
++                        std::snprintf(ramPath, sizeof(ramPath), "%s/iopram_%u.bin", dumpDir, ramDumps);
++                        if (std::FILE *ramFile = std::fopen(ramPath, "wb"))
++                        {
++                            std::fwrite(m_ram.data(), 1, m_ram.size(), ramFile);
++                            std::fclose(ramFile);
++                            std::fprintf(stderr, "[IOP] RAM snapshot %u (arm %u)\n", ramDumps, arms);
++                        }
++                    }
++                }
++                std::vector<uint8_t> block(static_cast<size_t>(transferWords) * 4u);
++                if (file && source != 0u && readRam(source, block.data(), block.size()))
++                {
++                    std::fwrite(block.data(), 1, block.size(), file);
++                    std::fflush(file);
++                    static unsigned tapped[2] = {0u, 0u};
++                    unsigned &count = tapped[secondCore ? 1 : 0];
++                    if (count < 4u)
++                    {
++                        ++count;
++                        const uint16_t *half = reinterpret_cast<const uint16_t *>(block.data());
++                        std::fprintf(stderr,
++                                     "[IOP] SPU2 tap core%u src=0x%08x words=%llu first=%04x %04x %04x %04x %04x %04x\n",
++                                     secondCore ? 1u : 0u, source,
++                                     static_cast<unsigned long long>(transferWords),
++                                     half[0], half[1], half[2], half[3], half[4], half[5]);
++                    }
++                }
++            }
++        }
+         static int logged[2] = {0, 0};
+         if (logged[secondCore ? 1 : 0] < 4)
+         {
+@@ -321,9 +847,184 @@
+         };
+     }
+ 
++            size_t IopMemory::pullSpu2Pcm(int16_t *destination, size_t frameCount)
++    {
++        // 0093: play what the SPU2 voices produce. 48 kHz stereo is the hardware output rate, so one video frame is
++        // 800 frames and no resampling is involved.
++        if (!destination || frameCount == 0u)
++            return 0u;
++
++        // 0115: cost isolation - APE2_SPU2_NOMIX=1 keeps the register/DMA path intact but skips mixing,
++        // which tells apart "the mixer is too slow" from "the register path is too slow".
++        static const bool mixDisabled = []() {
++            const char *env = std::getenv("APE2_SPU2_NOMIX");
++            return env != nullptr && std::atoi(env) != 0;
++        }();
++        if (mixDisabled)
++            return 0u;
++        const size_t frames = m_spu2.mix(destination, frameCount);
++        { // 0136: is the mixer producing anything for the device?
++            static int mixLogged = 0;
++            if (frames != 0u && mixLogged++ < 5)
++            {
++                int peak = 0;
++                for (size_t i = 0; i < frames * 2u; ++i)
++                {
++                    const int v = destination[i] < 0 ? -static_cast<int>(destination[i]) : destination[i];
++                    if (v > peak)
++                        peak = v;
++                }
++                std::fprintf(stderr, "[spu2:mix] frames=%zu peak=%d%c", frames, peak, 10);
++            }
++        }
++        if (frames == 0u)
++            return 0u;
++
++        // 0208: split the two contributions so a voice mix cannot hide inside the stream. The mixer output is
++        // snapshotted before the ring blocks are summed in, and the ring blocks themselves go to their own file,
++        // so "what the guest wrote" and "what the mixer added" can be compared against the final output.
++        static const char *refStreamPath = std::getenv("APE2_SPU2_REF");
++        static const char *refMixPath = std::getenv("APE2_SPU2_REFMIX");
++        static std::FILE *refStreamFile = nullptr;
++        static std::FILE *refMixFile = nullptr;
++        static bool refOpened = false;
++        if (!refOpened)
++        {
++            refOpened = true;
++            if (refStreamPath != nullptr)
++                refStreamFile = std::fopen(refStreamPath, "wb");
++            if (refMixPath != nullptr)
++                refMixFile = std::fopen(refMixPath, "wb");
++            std::fprintf(stderr, "[spu2:ref] stream=%s mix=%s\n",
++                         refStreamFile != nullptr ? refStreamPath : "-",
++                         refMixFile != nullptr ? refMixPath : "-");
++        }
++        if (refMixFile != nullptr)
++        {
++            std::fwrite(destination, sizeof(int16_t) * 2u, frames, refMixFile);
++            std::fflush(refMixFile);
++        }
++        size_t streamFilled = 0u;
++
++        // 0193: streamed music never enters the voices - it lands in the IOP queue. Nothing ever drained that
++        // queue, so it overflowed (dropped blocks) and every frame came out silent. Drain it here, on top of the
++        // voice mix, so the armed PCM actually reaches the device.
++        {
++            Spu2Queue &queue = spu2Queue();
++            if (queue.count != 0u && queue.blockBytes != 0u)
++            {
++                static size_t blockCursor = 0u;
++                const size_t blockFrames = queue.blockBytes / 4u;
++                size_t filledFrames = 0u;
++                while (filledFrames < frames && queue.count != 0u && blockFrames != 0u)
++                {
++                    const size_t take = std::min(blockFrames - blockCursor, frames - filledFrames);
++                    const int16_t *src = reinterpret_cast<const int16_t *>(queue.blocks[queue.head].data()) +
++                                         blockCursor * 2u;
++                    for (size_t i = 0; i < take * 2u; ++i)
++                    {
++                        const int mixed = static_cast<int>(destination[filledFrames * 2u + i]) + static_cast<int>(src[i]);
++                        destination[filledFrames * 2u + i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
++                    }
++                    if (refStreamFile != nullptr)
++                        std::fwrite(src, sizeof(int16_t) * 2u, take, refStreamFile);
++                    filledFrames += take;
++                    blockCursor += take;
++                    if (blockCursor >= blockFrames)
++                    {
++                        blockCursor = 0u;
++                        queue.head = (queue.head + 1u) % Spu2Queue::kBlocks;
++                        --queue.count;
++                        ++queue.played;
++                    }
++                }
++                streamFilled = filledFrames;
++                queue.framesOut += filledFrames;
++                static int streamLogged = 0;
++                if (streamLogged++ < 6)
++                {
++                    int streamPeak = 0;
++                    for (size_t i = 0; i < filledFrames * 2u; ++i)
++                    {
++                        const int v = destination[i] < 0 ? -static_cast<int>(destination[i]) : destination[i];
++                        if (v > streamPeak)
++                            streamPeak = v;
++                    }
++                    std::fprintf(stderr, "[spu2:stream] filled=%zu/%zu peak=%d played=%llu depth=%llu\n",
++                                 filledFrames, frames, streamPeak, static_cast<unsigned long long>(queue.played),
++                                 static_cast<unsigned long long>(queue.count));
++                }
++            }
++        }
++
++        if (refStreamFile != nullptr)
++        {
++            size_t remaining = frames - streamFilled;
++            static const int16_t silence[2u * 512u] = {};
++            while (remaining != 0u)
++            {
++                const size_t chunk = std::min<size_t>(remaining, 512u);
++                std::fwrite(silence, sizeof(int16_t) * 2u, chunk, refStreamFile);
++                remaining -= chunk;
++            }
++            std::fflush(refStreamFile);
++        }
++
++        if (const char *pcmPath = std::getenv("APE2_SPU2_PCM"))
++        {
++            static std::FILE *pcmFile = nullptr;
++            static bool opened = false;
++            if (!opened)
++            {
++                opened = true;
++                pcmFile = std::fopen(pcmPath, "wb");
++            }
++            if (pcmFile)
++            {
++                std::fwrite(destination, sizeof(int16_t) * 2u, frames, pcmFile);
++                std::fflush(pcmFile);
++            }
++        }
++        return frames;
++    }
++
++    void IopMemory::completeSpu2Dma()
++    {
++        if (m_admasWord == 0u || m_admasBit == 0u)
++            return;
++        uint32_t value = 0u;
++        if (const auto it = m_hardware.find(m_admasWord); it != m_hardware.end())
++            value = it->second & ~m_admasBit;
++        m_hardware[m_admasWord] = value;
++        if (spu2Enabled() && IopSpu2::contains(m_admasWord))
++            m_spu2.write32(m_admasWord, value);
++        static unsigned logged = 0u;
++        if (logged++ < 24u)
++            std::fprintf(stderr, "[spu2:admas] idle word=0x%03x now=0x%04x%c", m_admasWord & 0x3FFu, value, 10);
++    }
++
++    std::optional<uint64_t> IopMemory::dmaRearmDelay(int irq) const noexcept
++    {
++        static unsigned calls = 0u;
++        ++calls;
++        static unsigned irq40 = 0u;
++        const bool shout = (irq == 40 && irq40 < 20u);
++        if (shout)
++            ++irq40;
++        if (shout || calls <= 3u || calls % 400u == 0u)
++            std::fprintf(stderr, "[spu2:auto] rearm query #%u irq=%d active=%d timerIrq=%d delay=%llu\n", calls, irq,
++                         m_admaTimer.active ? 1 : 0, m_admaTimer.irq,
++                         static_cast<unsigned long long>(m_admaTimer.delayCycles));
++        if (!m_admaTimer.active || m_admaTimer.irq != irq || m_admaTimer.delayCycles == 0u)
++            return std::nullopt;
++        return m_admaTimer.delayCycles;
++    }
++
+     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
+     {
+-        std::optional<DmaStart> result = m_dmaStart;
++        // 0161: the block that was armed has now completed, so the channel goes idle again.
++        completeSpu2Dma();
++        const std::optional<DmaStart> result = m_dmaStart;
+         m_dmaStart.reset();
+         return result;
+     }

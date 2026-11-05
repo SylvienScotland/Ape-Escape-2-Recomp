@@ -28,6 +28,13 @@ correctly (see LOG "Picture: from garbled to a correct title screen").
 Speed: 2D screens ~20 fps; 3D intro / title ~0.5-1 fps. The IOP SPU2 AutoDMA storm is fixed (0008).
 
 ## Next steps
+
+- Textures: keyboards flicker; LOG 0055 settles the mechanism - every quad is submitted twice (4-bit opaque
+  `69b7178e`/`b2a140cd` at `test=0x50000`, then 8-bit blended `aaf96689` at `test=0x5b000`) at *identical* depth,
+  1,477 exact-coplanar duplicates measured, 612 of them keyboard atlas. Upload history is ruled out. Next step is
+  the env-gated suppression A/B: drop the blended submission for exact duplicates and judge the keyboards at distance.
+Textures (LOG 0053): the saved hub burst shows the decode is deterministic and every draw follows an upload to the address it samples, so the open question is guest ordering (which ring content is valid at that moment), not the decoder. Next: read the game's own TEX0 table at draw time.
+
 1. Performance: the 3D scenes are now pure emulation cost, ~50% GS software rasterizer (DrawTriangle,
    SampleTexture, lerpChannel, LookupCLUT) and ~45% VU1 interpreter (commitReadyPipelines,
    calculatePairReadyCycle: cycle-accurate pipeline bookkeeping). Profile with perf.txt host rankings.

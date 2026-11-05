@@ -1,0 +1,2 @@
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\dev\Ape-Escape-2-Recomp\tools\build_windows.ps1 -Ps2RecompDir C:\dev\PS2Recomp -GameDir "C:\Users\truga\Downloads\Ape Escape 2 demounted" -IsoPath "C:\Users\truga\Downloads\Ape Escape 2 (USA)\Ape Escape 2 (USA).iso" -SkipToolBuild -SkipRecomp -NoRun

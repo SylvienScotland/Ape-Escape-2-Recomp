@@ -11,3 +11,27 @@ build/
 out/
 boot.log
 generated_recomp.log
+dumps/
+run_tex.log
+__pycache__/
+run_tex*.log
+build*.log
+kb*.txt
+
+# Run logs, captured audio and one-off scratch output (evidence, not source)
+*.log
+*.raw
+*.exe
+*.tgz
+*.bak
+imgui.ini
+pad.ini
+engine_work_*.patch
+after_fmv.txt
+boot_summary.txt
+clean_play.log
+handlers.txt
+movie.txt
+perf.txt
+ps2_log.txt
+tail.txt
