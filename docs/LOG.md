@@ -4005,3 +4005,20 @@ tad slow but better", some slowdowns in movies and gameplay. Open: frame rate (g
 74% busy: ~56 destination reads and ~35 texture uploads per frame), and light green bands where the mip level
 changes on the floors (the game asks for trilinear filtering; we pick one level per triangle - the PAL port
 does the same).
+### 0229 - Frame rate: table-driven texture decode in the GPU renderer (0062)
+
+Profiling the slow gameplay (~40-48 fps): the EE was idle 55-77% and waited on the GS thread (`[mtgs]`: GS
+thread 99% busy, EE waits ~1.1 s per 5 s), and the GS thread's work was decoding textures: ~35 decodes a frame,
+every texel through the generic `GSMem::ReadTexture` / `DecodeTexel` (streamed textures move slots every frame,
+and each mip level is a texture of its own). (A first GS-thread sample in a light stretch showed it idle -
+pair the sampler with `[mtgs]` before concluding.)
+
+`GSGlBackend::fastDecode` (zz_ape2_gs_gl.cpp) is the PAL port's `tex_decode` (port/src/gs.c,
+JackyPendrag0n/ae2-recomp): in-page byte/nibble offsets from tables built once from our GS block/column tables
+(CT32 layout 64x32, T8 128x64, T4 128x128), the page from row arithmetic, a palette expanded once; T8, T4, CT32,
+CT24, T8H, T4HL, T4HH. CT16 and the rest keep the generic path. `APE2_FASTDEC=0` disables it;
+`APE2_FASTDEC_CHECK=1` decodes the first 300 textures both ways: 0 of 300 mismatched in a play session (T8, T4,
+CT32 among them).
+
+Result in the same stage: 52-60 fps (was 40-48), GS thread ~30% busy. Player: "feels a lot smoother, not 60 but
+smoother". Still open: the remaining dips, and the mip-level bands on the floors.

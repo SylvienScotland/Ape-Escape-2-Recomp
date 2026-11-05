@@ -1,0 +1,185 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 07458af..310c4c6 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -29,6 +29,9 @@
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "runtime/gs/ps2_gs_psmct32.h"
++#include "runtime/gs/ps2_gs_psmt8.h"
++#include "runtime/gs/ps2_gs_psmt4.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -1086,6 +1089,117 @@ private:
+         return nullptr;
+     }
+     // decoded (CPU) texture as a GL texture
++    // 0062: in-page byte (T4: nibble) offsets, built once from the GS swizzle tables (the PAL port's X8/X4)
++    struct SwizzleTables
++    {
++        uint16_t x32[32][64];  // CT32 layout (also T8H, T4HL, T4HH): page 64x32, bytes
++        uint16_t x8[64][128];  // T8: page 128x64, bytes
++        uint16_t x4[128][128]; // T4: page 128x128, nibbles
++        SwizzleTables()
++        {
++            for (uint32_t y = 0; y < 32; ++y)
++                for (uint32_t x = 0; x < 64; ++x)
++                    x32[y][x] = static_cast<uint16_t>(GSPSMCT32::addrPSMCT32(0u, 1u, x, y));
++            for (uint32_t y = 0; y < 64; ++y)
++                for (uint32_t x = 0; x < 128; ++x)
++                    x8[y][x] = static_cast<uint16_t>(GSPSMT8::addrPSMT8(0u, 2u, x, y));
++            for (uint32_t y = 0; y < 128; ++y)
++                for (uint32_t x = 0; x < 128; ++x)
++                    x4[y][x] = static_cast<uint16_t>(GSPSMT4::addrPSMT4(0u, 2u, x, y));
++        }
++    };
++    bool fastDecode(GSCpuBackend::DecodedTexture &dt, const uint8_t *v)
++    {
++        static const SwizzleTables T;
++        const auto &tex = dt.decodeState.context.tex0;
++        const uint32_t bp = tex.tbp0, bw = tex.tbw, mask = (4u << 20) - 1u;
++        const int w = dt.w, h = dt.h;
++        uint32_t *out = dt.texels.data();
++        const uint8_t psm = tex.psm;
++        const bool indexed = psm == GS_PSM_T8 || psm == GS_PSM_T8H || psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
++        uint32_t pal[256];
++        if (indexed)
++        {
++            const int entries = (psm == GS_PSM_T8 || psm == GS_PSM_T8H) ? 256 : 16;
++            for (int i = 0; i < entries; ++i)
++                pal[i] = m_cpu->LookupCLUT(dt.decodeState, static_cast<uint8_t>(i), tex.cpsm, tex.csm, tex.csa, psm, dt.clut.data());
++        }
++        switch (psm)
++        {
++        case GS_PSM_T8:
++        {
++            const uint32_t pw = (bw >> 1) ? (bw >> 1) : 1u;
++            for (int y = 0; y < h; ++y)
++            {
++                const uint32_t rb = bp * 256u + static_cast<uint32_t>(y >> 6) * pw * 8192u;
++                const uint16_t *xt = T.x8[y & 63];
++                uint32_t *o = out + static_cast<size_t>(y) * w;
++                for (int x = 0; x < w; ++x)
++                    o[x] = pal[v[(rb + static_cast<uint32_t>(x >> 7) * 8192u + xt[x & 127]) & mask]];
++            }
++            return true;
++        }
++        case GS_PSM_T4:
++        {
++            const uint32_t pw = (bw >> 1) ? (bw >> 1) : 1u;
++            for (int y = 0; y < h; ++y)
++            {
++                const uint32_t rb = bp * 512u + static_cast<uint32_t>(y >> 7) * pw * 16384u;
++                const uint16_t *xt = T.x4[y & 127];
++                uint32_t *o = out + static_cast<size_t>(y) * w;
++                for (int x = 0; x < w; ++x)
++                {
++                    const uint32_t a = (rb + static_cast<uint32_t>(x >> 7) * 16384u + xt[x & 127]) & (mask * 2u + 1u);
++                    o[x] = pal[(v[a >> 1] >> ((a & 1u) * 4u)) & 15u];
++                }
++            }
++            return true;
++        }
++        case GS_PSM_CT32:
++        case GS_PSM_CT24:
++        case GS_PSM_T8H:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++        {
++            const uint32_t pw = bw ? bw : 1u;
++            const auto &texa = dt.decodeState.texa;
++            for (int y = 0; y < h; ++y)
++            {
++                const uint32_t rb = bp * 256u + static_cast<uint32_t>(y >> 5) * pw * 8192u;
++                const uint16_t *xt = T.x32[y & 31];
++                uint32_t *o = out + static_cast<size_t>(y) * w;
++                for (int x = 0; x < w; ++x)
++                {
++                    uint32_t c;
++                    std::memcpy(&c, v + ((rb + static_cast<uint32_t>(x >> 6) * 8192u + xt[x & 63]) & mask), 4);
++                    switch (psm)
++                    {
++                    case GS_PSM_CT32:
++                        o[x] = c;
++                        break;
++                    case GS_PSM_CT24:
++                        c &= 0x00FFFFFFu;
++                        o[x] = c | (static_cast<uint32_t>((texa.aem && c == 0u) ? 0u : texa.ta0) << 24);
++                        break;
++                    case GS_PSM_T8H:
++                        o[x] = pal[c >> 24];
++                        break;
++                    case GS_PSM_T4HL:
++                        o[x] = pal[(c >> 24) & 15u];
++                        break;
++                    default:
++                        o[x] = pal[c >> 28];
++                        break;
++                    }
++                }
++            }
++            return true;
++        }
++        default:
++            return false;
++        }
++    }
++
+     GLuint cpuTexture(const GSDrawState &state, int &tw, int &th)
+     {
+         std::lock_guard<std::mutex> lock(m_cpu->m_mutex);
+@@ -1117,7 +1231,51 @@ private:
+         const auto &dtex = dt.decodeState.context.tex0;
+         const bool indexed = dtex.psm == GS_PSM_T8 || dtex.psm == GS_PSM_T8H || dtex.psm == GS_PSM_T4 ||
+                              dtex.psm == GS_PSM_T4HL || dtex.psm == GS_PSM_T4HH;
+-        if (indexed)
++        // Ape Escape 2 recomp patch 0062: table-driven decode, the PAL port's tex_decode (port/src/gs.c,
++        // JackyPendrag0n/ae2-recomp): the in-page byte offset of each texel comes from a table built once from the
++        // GS block/column tables, the page from row arithmetic, and indexed formats look up a palette expanded once.
++        // The generic per-texel path (GSMem::ReadTexture / DecodeTexel for every texel of every decode) was the GS
++        // thread's main cost in busy scenes. CT16 and the rarer formats keep the generic path.
++        // APE2_FASTDEC=0 disables it; APE2_FASTDEC_CHECK=1 compares both for the first textures.
++        static const bool fastOn = [] { const char *e = std::getenv("APE2_FASTDEC"); return !(e && e[0] == '0'); }();
++        static const bool fastCheck = std::getenv("APE2_FASTDEC_CHECK") != nullptr;
++        const uint8_t *vbase = dt.rawBase ? dt.rawBase : m_cpu->m_vram;
++        bool fastDone = false;
++        {
++            static int told = 0;
++            if (fastCheck && told++ < 3)
++                std::fprintf(stderr, "[gpu:fastdec] on=%d base=%p size=%u psm=0x%x\n", fastOn ? 1 : 0, static_cast<const void *>(vbase), m_cpu->m_vramSize, dtex.psm);
++        }
++        if (fastOn && vbase && m_cpu->m_vramSize == (4u << 20))
++            fastDone = fastDecode(dt, vbase);
++        if (fastDone && fastCheck)
++        {
++            static int checked = 0, bad = 0;
++            if (checked < 300)
++            {
++                ++checked;
++                int mism = 0;
++                for (int vv = 0; vv < dt.h && mism < 1; ++vv)
++                    for (int uu = 0; uu < dt.w; ++uu)
++                        if (dt.texels[static_cast<size_t>(vv) * static_cast<size_t>(dt.w) + static_cast<size_t>(uu)] !=
++                            m_cpu->DecodeTexel(dt.decodeState, uu, vv, dt.clut.data(), dt.rawBase))
++                        {
++                            ++mism;
++                            break;
++                        }
++                if (mism)
++                    ++bad;
++                if (mism || checked % 10 == 0)
++                    std::fprintf(stderr, "[gpu:fastdec] check %d: psm=0x%x %dx%d %s (%d of %d mismatched)\n", checked, dtex.psm, dt.w, dt.h,
++                                 mism ? "MISMATCH" : "ok", bad, checked);
++            }
++        }
++        if (fastDone)
++        {
++            for (size_t i = 0; i < dt.tileCount; ++i)
++                dt.tileReady[i].store(1u, std::memory_order_release);
++        }
++        else if (indexed)
+         {
+             // palette textures: the palette once, then one VRAM read per texel (DecodeTexel looks the CLUT up
+             // for every texel)
