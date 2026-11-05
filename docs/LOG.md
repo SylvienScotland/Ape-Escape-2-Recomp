@@ -3706,6 +3706,107 @@ The residual 16-23 kHz loss is Catmull-Rom's own response near Nyquist; removing
 
 Patch 0054 was regenerated to cover the cubic version, and both new patches are now recorded in `C:\dev\PS2Recomp\.ape2_patches_applied` - the build script re-applies every patch in `patches/ps2recomp`, so a patch left unrecorded there is applied on top of itself and fails.
 
+### 0216 - Where the level music should come from, and what the game actually asks for
+
+**Superseded by 0223:** the hub/stage music, voices and effects are played on SPU2 voices from the sound banks; they were silent because the SPU2 register layout was wrong, not because the game never asked for them.
+
+The player reported that audio only exists in the intro: the hub and every stage have no music and no voice
+lines, and the "yell" mentioned earlier was in the intro music. That invalidates the working assumption from
+0211 that the streamed SPU2 queue is the game's music path. It is one path, and it is the intro's.
+
+Disc layout (walked from the ISO's own directory records, LSN = real sector):
+
+- `APE2_USA/PCM/BGM/*.SPS` - 15 streamed tracks, 8-39k sectors each (`TITLE.SPS` at 0x5b9f0, `NO28.SPS` at
+  0xb74ef, `THEME.SPS` at 0xcee36, `PINK.SPS` at 0x53fe7)
+- `APE2_USA/SOUND/BGM/*.BIN` - 4 small banks (`BGMB_TIT`, `BGMH_TIT`, `BGMB_CLE`, `BGMH_CLE`)
+- `APE2_USA/VOICE/**/*.VGS` and `APE2_USA/SOUND/SE/*.BIN` - voice lines and effect banks
+- `APE2_USA/MODULES/LIBSD.IRX` and `SNDN2DRV.IRX` - the sound driver, loaded as `load-emulated`
+
+A session that reached the title screen and streamed its music for 60 s shows **exactly one** stream open -
+`cdrom0:/APE2_USA/pcm/bgm/title.sps` - and no CD read inside any SPS music range beyond it. The intro stream,
+the CD layer and the device are therefore fine; the game never asks for a stage track in that session. What is
+still missing is the request itself, not the machinery behind it.
+
+Added a `APE2_IOP_CDLOG` trace (`iop_cdvd.cpp`) for `sceCdSearchFile` names and periodic read LSNs. It did not
+fire for the game's own loads: Ape Escape 2 issues those through the runtime's `ape2:cdread` hook, not through
+the IOP cdvd imports, so that trace stays useful only for driver-level reads. The `ape2:cdread` line already
+prints LSN and is capped at 64 calls, which is what identified `TITLE.SPS` above.
+
+### 0217 - Unconditional debug prints removed from the hot path (major frame cost)
+
+Measured in a 60 s play session: **79,387 log lines, of which 62,912 were `[iop:sema]` and 13,687 were
+`[spu2:auto]`**. Neither was gated by an environment variable, so every build paid for them: the semaphore
+`SIGNAL`/`WAIT` prints alone fire on every semaphore operation, and the auto-DMA prints fire per arm and per
+rearm query. Both paths are hot while music streams.
+
+Now gated: `[iop:sema]` behind `APE2_IOP_SEMA`, the `[spu2:auto]` prints (arm, rearm query, interrupt dispatch
+attempts) behind `APE2_SPU2_AUTO`. Behaviour is unchanged when they are set.
+
+Run 0235 (build 226, no diagnostic variables, only `APE2_FRAME_PROF`): **1,410 lines in 45 s** against 79,387 in
+60 s, i.e. roughly 56x less log traffic. Title screen: `[frame:prof] loops=120 per 2000 ms` = a steady 60 fps,
+`[audio:dev] rate=47960/s underruns=0`, queue `pushed=2000 played=1993 dropped=1 depth=7`.
+
+Not yet measured: frame rate inside a stage. The player reported "major fps slow down" in levels before this
+change, and the log cost above is only part of whatever that is - it must be re-measured in a level before this
+is called fixed.
+
+### 0218 - The stutter was my own stale-repeat injection (reverted to opt-in)
+
+Device captures analysed for exact-zero frames, gaps >=10 ms and repeated 256-frame blocks:
+
+- build 224 (`dev224.wav`): 2.29% zeros, **0** gaps >=10 ms, 0% repeats - the known-good profile
+- build 226 before the injection: underruns 0 until 44 s, then 3,828
+- build 227 with the "repeat the stale slot" path: **44.03% zeros, 810 gaps >=10 ms, max 93.9 ms, median gap
+  1,371 frames = 28.6 ms, 26% repeated blocks** - the music was chopped into ~29 ms pieces. 28.6 ms is the
+  35 ms throttle of that path showing through.
+- build 230 with the path gated off by default (`APE2_SPU2_STALEREPEAT` opt-in): **2.0% zeros, 2 gaps,
+  underruns 0 at 43.99 s, and zero frame windows below 60 fps in a 65 s session**
+
+So 0221's fix converted dropouts into audible repeats and made the stutter worse, and the "driver stops
+refilling at 14 s" reading was partly an artefact of it. The path stays in the tree behind the flag for
+further experiments, off by default.
+
+Two measurement traps worth remembering: the `[sndn]` trace was capped at the first 120 calls (all inside the
+first four seconds of boot), so bucketing it by time produced a fake "driver went quiet" signal; and the
+`ape2:cdread` trace was capped at 64 calls, which hid everything after boot.
+
+### 0219 - Driver heartbeat, wider read trace, and where the title audio actually comes from
+
+- `[sndn]` now keeps logging every 1,000th call forever instead of stopping at 120, so a driver that goes
+  quiet mid-track is visible.
+- `ape2:cdread` now logs the first 64 reads, every 20th read after that, and every failure.
+- First result from the widened trace: only **27 reads in a 50 s session, all within the first 4 s, zero
+  failures**. The title music therefore is not fed by repeated CD reads - it goes through the movie/stream
+  player's host file path into the driver. Read tracing alone will not explain a stream stall; the sndn
+  command stream is the place to look.
+
+Tooling note: two edits in this pass silently did not land (a `str_replace` that reported success but left the
+file byte-identical, and a capture written to an invalid path from a doubled backslash), so every edit is now
+verified with a `grep` for its marker and every capture path is checked for existence before it is analysed.
+
+### 0220 - Frame-drop investigation: real fps, IOP bursts, and a negative result
+
+The `[frame:prof]` line counts host loop iterations, not guest frames, so it read a perfect 120/2 s while the
+game actually dropped frames. The `[perf]` line is the honest counter: guest frames over 2 s.
+
+Baseline over a 65 s session (build 230): guest fps median 59.5, **worst 44.3**, with windows at 44.3, 47.4,
+47.5, 49.9 and 50.0. Each dip lines up with an IOP sample of 441, 727, 560, 552 or 479 MHz against 36.86 MHz
+hardware, i.e. the IOP executing 12-20x the cycles the real chip could in that window.
+
+Hypothesis tested: `EeScheduler` converts the wall time a guest dispatch took into EE-equivalent cycles and
+hands them to the IOP after every dispatch, capped at a full second, so one long dispatch releases a burst that
+runs synchronously on the EE thread. Added `APE2_IOP_CATCHUP_MS` (slice cap, 0 = old behaviour) and A/B'd two
+58 s sessions:
+
+- cap 5 ms: worst 47.4 fps, 10 windows under 55 fps, 1 under 50, IOP max 715 MHz
+- cap 0 (old): worst 50.5 fps, 7 windows under 55 fps, 0 under 50, IOP max 432 MHz
+
+The cap made it marginally worse, so the burst hypothesis is **not** supported and the default is back to the
+old one-second behaviour. The knob is kept for later experiments. Both runs: audio underruns 0, rate 48,013/s.
+
+Not yet measured: frame rate inside a stage. Every measurement in this entry is the title screen, so a
+stage-specific drop remains possible and needs a run with the player driving.
+
 ### 0222 - The intro music was read with the wrong stereo layout (0055)
 
 Player report: the intro music sounds "slightly muffled, pixely, the beat a little too deep, the yell a little too
