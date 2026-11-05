@@ -3724,3 +3724,35 @@ wrong way. Fixed in `iop_memory.cpp` (patch 0055); `APE2_SPU2_REF` now writes th
 fix a 45 s intro run's device capture has roughness 0.27/0.26 (dev224: 0.46) and L/R correlation 0.86.
 Listening files: `dumps/audio/dev_fixed.wav` (fixed build) and `dumps/audio/intro_planar_fixed.wav` (the dump
 re-read planar). The pacing, queue and resampler from 0204-0215 are unchanged.
+
+### 0223 - Hub and stage music, voices and effects: the SPU2 register layout was wrong (0056)
+
+Player report: only the intro had audio; the hub and stages had no music, voices or effects. That audio comes
+from the sound banks played on SPU2 voices (the PAL port plays it the same way), and our SPU2 model had the
+register layout wrong almost everywhere, so none of LIBSD's voice programming reached a voice:
+
+- it took VMIXL (0x188/0x18A, which libsd's init sets to 0xffffff, as PAL's `sd_init` does) for key-on - the
+  "key-ons with unprogrammed voices" of 0175/0194/0195 were mixer masks; the real KON (0x1A0/0x1A2) and KOFF
+  (0x1A4/0x1A6) were never decoded
+- voice sample addresses were looked for inside the voice parameter block; they are at 0x1C0 + voice*0xC (SSA,
+  LSAX, NAX as hi/lo halfword pairs), and the parameter block is VOLL VOLR PITCH ADSR1 ADSR2 ENVX VOLXL VOLXR
+- TSA (0x1A8) was scaled as a PS1 address (x8); SPU2 addresses are halfword pairs (x2)
+- ADPCM data was decoded from byte 1 of each block instead of byte 2 (byte 1 holds the loop flags)
+- 16-bit register writes went through a 32-bit read-modify-write, rewriting the neighbouring register (a KON
+  low write would re-key the high voices)
+- core-1 auto-DMA blocks (the stream) were also copied to SPU RAM at TSA, over the sample banks
+
+Fix (patch 0056): `iop_spu2.cpp` rewritten with the real layout (master volumes at 0x760 + core*0x28, ENDX at
+0x340, PIO data port at 0x1AC) and the PAL port's voice engine (`port/src/spu2.c`, JackyPendrag0n/ae2-recomp):
+VAG ADPCM, ADSR, Catmull-Rom pitch, volume sweeps, loop flags/ENDX. `IopMemory::write16/read16` now reach one
+register; auto-DMA blocks no longer write SPU RAM. New diagnostics: `APE2_SPU2_KONLOG=1` (key-ons with their
+parameters), `APE2_SPU2_STAT=1` (voices on once a second), `[spu2:dma]` (bank uploads).
+
+Measured in the hub (77 s device capture, `dumps/audio/hub_voices.wav`): banks upload over core 0 (444,992 bytes
+at 0x05400 and others), key-ons carry real pitch/volume/ADSR, up to 17 voices sound at once, continuous output
+at rms 2,500-4,400 with no clipping (silent before). Player confirmed: music, voices and effects all play.
+Not yet emulated: the effect unit (reverb; the game sets Studio C at ~20%, which PAL emulates).
+
+Patch 0056 also carries the clone's other changes that no earlier patch had recorded (the IOP-side sound work
+of 0071-0221: `iop_spu2` in CMake, intrman/RPC/cdvd/kernel/emulator changes, `EeScheduler`, `SIF`, the GS
+debugging in `zz_ape2_gs_gl.cpp`, `zz_ape2_hangdump.cpp`), so the patch set rebuilds the working tree.
