@@ -1,0 +1,153 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 270a1dd..867e762 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -1495,6 +1495,37 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
+         break;
+     }
+ 
++    {
++        // APE2_PIXPROBE="x,y;x,y": every write that reaches the depth test at these pixels during a frame-dump
++        // burst (debugging aid, Ape Escape 2 recomp)
++        static std::vector<std::pair<int, int>> probes = []
++        {
++            std::vector<std::pair<int, int>> v;
++            if (const char *e = std::getenv("APE2_PIXPROBE"))
++            {
++                int px = 0, py = 0, n = 0;
++                for (const char *p = e; *p;)
++                {
++                    if (std::sscanf(p, "%d,%d%n", &px, &py, &n) != 2)
++                        break;
++                    v.emplace_back(px, py);
++                    p += n;
++                    if (*p == ';' || *p == '/')
++                        ++p;
++                }
++            }
++            return v;
++        }();
++        extern std::atomic<int> g_ape2FrameDumpBurst;
++        if (!probes.empty() && g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0)
++            for (const auto &pr : probes)
++                if (pr.first == x && pr.second == y)
++                    std::fprintf(stderr, "[pix] burst %d %d,%d fbp=0x%x z=%u stored=%u ztst=%u pass=%d rgba=%02x%02x%02x%02x tme=%d tbp0=0x%x psm=0x%x type=%d abe=%d alpha=%llx fog=%d zbp=0x%x zpsm=0x%x zmsk=%d\n",
++                                 g_ape2FrameDumpBurst.load(std::memory_order_relaxed), x, y, ctx.frame.fbp, static_cast<uint32_t>(z), storedZ,
++                                 ztestMethod, zpass ? 1 : 0, r, g, b, a, state.prim.tme ? 1 : 0, ctx.tex0.tbp0, ctx.tex0.psm,
++                                 static_cast<int>(state.prim.type), state.prim.abe ? 1 : 0, static_cast<unsigned long long>(ctx.alpha),
++                                 state.prim.fge ? 1 : 0, ctx.zbuf.zbp, ctx.zbuf.psm, ctx.zbuf.zmask ? 1 : 0, static_cast<unsigned long long>(ctx.test), static_cast<unsigned long long>(ctx.tex1), ctx.tex0.tfx, ctx.tex0.tcc);
++    }
+     {
+         // APE2_GS_ZTEST_OFF=1: every depth test passes (debugging aid, Ape Escape 2 recomp)
+         static const bool ztestOff = [] { const char *e = std::getenv("APE2_GS_ZTEST_OFF"); return e && e[0] == '1'; }();
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index b53e19f..9bdb41a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1559,7 +1559,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+             command.trxreg = m_trxreg;
+             command.direction = m_trxdir;
+             extern thread_local int g_ape2GifPath;
+-            if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0 && m_trxdir == 0u)
++            static const bool upLog = std::getenv("APE2_UPLOG") != nullptr;
++            if ((upLog || g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0) && m_trxdir == 0u)
+                 std::fprintf(stderr, "[gs:up] path %d dbp=0x%x dbw=%u dpsm=0x%x %ux%u\n", g_ape2GifPath, m_bitbltbuf.dbp,
+                              m_bitbltbuf.dbw, m_bitbltbuf.dpsm, m_trxreg.rrw, m_trxreg.rrh);
+             m_backend->BeginTransfer(command);
+@@ -2003,6 +2004,19 @@ namespace
+         return m;
+     }
+ 
++    // The level for an LOD: the nearest-mipmap filters (MMIN 2, 4) round it; the trilinear ones (MMIN 3, 5) take
++    // its integer part as the base level and blend toward the next, here the base level alone (the PAL port rounds
++    // in every mode, which in the title flyover sampled a level too far on the distant hill: sky through it).
++    // APE2_MIPROUND=<bias> forces one bias for every mode.
++    float mipRound(int mmin)
++    {
++        static const char *e = std::getenv("APE2_MIPROUND");
++        static const float forced = e ? static_cast<float>(std::atof(e)) : -1.0f;
++        if (forced >= 0.0f)
++            return forced;
++        return (mmin == 3 || mmin == 5) ? 0.0f : 0.5f;
++    }
++
+     bool mipBilinearMin(const MipParams &m) { return m.mmin == 1 || m.mmin == 4 || m.mmin == 5; }
+ 
+     // -1: magnified (MMAG filter on level 0)
+@@ -2029,7 +2043,7 @@ namespace
+         }
+         if (lod <= 0.0f)
+             return -1;
+-        return std::min(static_cast<int>(lod + 0.5f), 6);
++        return std::min(static_cast<int>(lod + mipRound(m.mmin)), 6);
+     }
+ 
+     void mipApply(GSPrimitiveBatch &b, const MipParams &m, int lv)
+@@ -2131,7 +2145,7 @@ namespace
+             if (!(v[i]->q > 1e-20f))
+                 return false;
+             const float lod = -std::log2(v[i]->q) * sc + m.k;
+-            int l = lod <= 0.0f ? -1 : static_cast<int>(lod + 0.5f);
++            int l = lod <= 0.0f ? -1 : static_cast<int>(lod + mipRound(m.mmin));
+             l = std::min(l, m.mxl);
+             lo = std::min(lo, l);
+             hi = std::max(hi, l);
+@@ -2142,7 +2156,7 @@ namespace
+         double qb[10];
+         int nb = 0;
+         for (int k = lo + 1; k <= hi && nb < 10; ++k)
+-            qb[nb++] = std::exp2(-((k == 0 ? 0.0 : k - 0.5) - m.k) / sc);
++            qb[nb++] = std::exp2(-((k == 0 ? 0.0 : k - mipRound(m.mmin)) - m.k) / sc);
+         GSVertex pt[3 + 3 * 10];
+         double pq[3 + 3 * 10];
+         int np = 0;
+@@ -2181,6 +2195,29 @@ namespace
+                 ++np;
+             }
+         }
++        static const bool areaLog = std::getenv("APE2_MIPLOG") != nullptr;
++        auto area = [](const GSVertex &a, const GSVertex &b, const GSVertex &c)
++        { return std::fabs((static_cast<double>(b.x) - a.x) * (static_cast<double>(c.y) - a.y) - (static_cast<double>(c.x) - a.x) * (static_cast<double>(b.y) - a.y)) * 0.5; };
++        double pieceArea = 0.0;
++        for (int l = lo; l <= hi && areaLog; ++l)
++        {
++            const double qmax = l == lo ? 1e300 : qb[l - lo - 1], qmin = l == hi ? -1e300 : qb[l - lo];
++            const GSVertex *poly[3 + 3 * 10];
++            int n = 0;
++            for (int i = 0; i < np; ++i)
++                if (pq[i] <= qmax && pq[i] >= qmin)
++                    poly[n++] = &pt[i];
++            for (int i = 1; i + 1 < n; ++i)
++                pieceArea += area(*poly[0], *poly[i], *poly[i + 1]);
++        }
++        if (areaLog)
++        {
++            const double full = area(*v[0], *v[1], *v[2]);
++            static int reports = 0;
++            if (full > 4.0 && std::fabs(pieceArea - full) > 0.02 * full && reports++ < 40)
++                std::fprintf(stderr, "[mipsplit] area %.1f pieces %.1f lo %d hi %d np %d q %g %g %g xy %.1f,%.1f %.1f,%.1f %.1f,%.1f\n", full, pieceArea, lo, hi, np,
++                             v[0]->q, v[1]->q, v[2]->q, v[0]->x, v[0]->y, v[1]->x, v[1]->y, v[2]->x, v[2]->y);
++        }
+         // each level's piece: the outline points with Q in its range (Q falls as LOD rises)
+         for (int l = lo; l <= hi; ++l)
+         {
+@@ -2193,6 +2230,7 @@ namespace
+             if (n < 3)
+                 continue;
+             GSPrimitiveBatch piece = in;
++            piece.state.prim.type = GS_PRIM_TRIANGLE; // independent triangles, as the PAL port emits them
+             for (int i = 1; i + 1 < n; ++i)
+             {
+                 piece.vertices[0] = *poly[0];
+@@ -2220,7 +2258,10 @@ namespace
+         }
+         const GSPrimType type = in.state.prim.type;
+         const bool tri = in.vertexCount == 3 && (type == GS_PRIM_TRIANGLE || type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN);
+-        static const bool noSplit = std::getenv("APE2_GS_MIPSPLIT") && std::getenv("APE2_GS_MIPSPLIT")[0] == '0';
++        // splitting is off by default: the game draws terrain in several passes that need the same depth per pixel
++        // (ZTST GEQUAL), and a triangle cut into pieces rasterises slightly different depths than the whole one -
++        // whole pieces of the title screen's distant hill failed the next pass (sky through). APE2_GS_MIPSPLIT=1
++        static const bool noSplit = !(std::getenv("APE2_GS_MIPSPLIT") && std::getenv("APE2_GS_MIPSPLIT")[0] == '1');
+         if (tri && !noSplit && force == -100 && !in.state.prim.fst && !m.lcm && m.mmin >= 2 && m.mxl > 0 && mipSplit(be, in, m))
+             return;
+         GSPrimitiveBatch b = in;

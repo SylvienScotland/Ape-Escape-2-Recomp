@@ -3926,5 +3926,34 @@ Also in 0059, found on the way and kept because it matches the PAL port's `rt_hw
 interleave mode and the toSPR source chain (were silently dropped, channel never finished). This game never
 uses scratchpad DMA (`APE2_SPR_LOG=1` saw none), so it changes nothing here.
 
-Not caused by this: blue patches on the title screen's distant hill (sky showing through) appear with
-`APE2_GS_MIPMAP=0` too; the earlier "clean" title frames caught the camera elsewhere in its flyover. Next.
+Correction (0227): the blue patches on the title screen's distant hill *were* caused by this. The
+"also with `APE2_GS_MIPMAP=0`" check was invalid - see 0227.
+
+### 0227 - Title hill: trilinear base level and no triangle cut (0060); my A/B scripts were broken
+
+Player report after 0059: blue patches through the green hill in the title flyover. Found the hard way that
+my test scripts never applied their settings: `runab.cmd NAME=VALUE` / `runtitle.cmd NAME=VALUE` pass the
+argument through cmd, which splits it at `=` (and at `,` and `;`), so `set %~1` set nothing. Every A/B in
+0226 that passed a variable on the command line (VU1 deferral off, `APE2_MTGS=0`, mipmaps off, software
+renderer, VU interpreter) actually ran the default build. The 0059 conclusion rests on the default-build
+trace and the player's confirmation, so it stands; the "not caused by mipmapping" note did not. Test scripts
+now carry the variables as `set` lines (`scratchpad/tb_*.cmd`).
+
+With working A/Bs (title burst at frame 2400, `scratchpad/runtburst.cmd`):
+- `APE2_GS_MIPMAP=0`: no patches. 0059: patches. So 0059 caused them.
+- The game uploads every level the hill uses (`APE2_UPLOG=1`: 0x33c0, 0x34c0, 0x3500, 0x3510 = MIPTBP1),
+  and the decoded levels look right, so addresses and decoding are fine.
+- Level = integer part of LOD instead of rounded: most patches gone. The hill's TEX1 has MMIN 5
+  (LINEAR_MIPMAP_LINEAR); the GS rounds the LOD only for the nearest-mipmap filters (MMIN 2, 4) and takes its
+  integer part as the base level for the trilinear ones (blending toward the next). The PAL port rounds in
+  every mode. Now per mode (`mipRound`); `APE2_MIPROUND=<bias>` forces one.
+- `APE2_GS_MIPSPLIT=0` (no triangle cut): all patches gone. The pieces cover their triangle exactly (an area
+  check under `APE2_MIPLOG` found no shortfall), and the patches have the triangles' straight edges: the
+  terrain is drawn in several passes that need the same depth per pixel (ZTST GEQUAL), and a triangle cut
+  into pieces rasterises slightly different depths than the whole one, so a following pass fails on whole
+  pieces. The cut is now opt-in (`APE2_GS_MIPSPLIT=1`): one level per primitive, as the PAL port itself
+  describes as close for the small polygons the game draws.
+
+Title burst after 0060: clean in every sampled frame. Also kept for later: `APE2_PIXPROBE=x,y/x,y` (software
+renderer, during a burst: every write reaching the depth test at those pixels) - note the display is a copy of
+another buffer, so screen and frame-buffer coordinates need not match.
