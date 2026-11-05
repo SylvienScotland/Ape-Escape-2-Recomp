@@ -11,8 +11,7 @@
 //             Skipped: [gp-0x3C0] = 0 ("no bank"). New Game -> D2.PSS failed here with an IOP heap
 //             allocation of 0x54D90 bytes right after the movie stream buffer.
 //
-// APE2_MOVIES=1 restores the original functions (the older zz_ape2_skipfmv path then ends each
-// movie at its first frame).
+// Since 0061 this is only installed with APE2_MOVIES=0: by default the movies play.
 
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -54,10 +53,12 @@ namespace
 
     void ape2_movies_apply(PS2Runtime &runtime)
     {
+        // 0061: the IPU is emulated (ps2_ipu.cpp) and libmpeg runs as game code, so movies play; APE2_MOVIES=0
+        // skips them as before
         const char *env = std::getenv("APE2_MOVIES");
-        if (env && env[0] == '1')
+        if (!(env && env[0] == '0'))
         {
-            std::cerr << "[ape2:movies] APE2_MOVIES=1: original movie start kept" << std::endl;
+            std::cerr << "[ape2:movies] FMVs play (APE2_MOVIES=0 skips them)" << std::endl;
             return;
         }
         runtime.registerFunction(kApe2MovieStart, ape2_movie_start);

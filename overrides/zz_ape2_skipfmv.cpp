@@ -20,6 +20,7 @@
 #include "game_overrides.h"
 #include "ps2_recompiled_functions.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -64,6 +65,10 @@ namespace
 
     void ape2_skipfmv_apply(PS2Runtime &runtime)
     {
+        // 0061: superseded by the IPU emulation; only for APE2_MOVIES=firstframe (end each movie at its first frame)
+        const char *env = std::getenv("APE2_MOVIES");
+        if (!(env && std::strcmp(env, "firstframe") == 0))
+            return;
         runtime.registerFunction(0x00370220u, ape2_mpeg_getpicture_raw8);
         runtime.registerFunction(0x003702F0u, ape2_mpeg_isend);
         std::cerr << "[ape2:fmv] FMV skip installed" << std::endl;

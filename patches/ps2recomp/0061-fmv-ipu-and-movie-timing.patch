@@ -1,0 +1,1975 @@
+diff --git a/ps2xRecomp/src/lib/control_flow_emitter.cpp b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+index 4bf8dc5..af27723 100644
+--- a/ps2xRecomp/src/lib/control_flow_emitter.cpp
++++ b/ps2xRecomp/src/lib/control_flow_emitter.cpp
+@@ -404,12 +404,14 @@ namespace ps2recomp
+         case OPCODE_BNE:
+         case OPCODE_BNEL:
+             return fmt::format("GPR_U64(ctx, {}) != GPR_U64(ctx, {})", rsReg, rtReg);
++        // BLEZ/BGTZ/BLTZ/BGEZ test the whole 64-bit register on the R5900 (Ape Escape 2 recomp patch 0061: a
++        // 32-bit test read libmpeg's 64-bit IPU_CMD as negative whenever its data word had bit 31 set)
+         case OPCODE_BLEZ:
+         case OPCODE_BLEZL:
+-            return fmt::format("GPR_S32(ctx, {}) <= 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) <= 0", rsReg);
+         case OPCODE_BGTZ:
+         case OPCODE_BGTZL:
+-            return fmt::format("GPR_S32(ctx, {}) > 0", rsReg);
++            return fmt::format("GPR_S64(ctx, {}) > 0", rsReg);
+         case OPCODE_REGIMM:
+             switch (m_branchInst.rt)
+             {
+@@ -417,12 +419,12 @@ namespace ps2recomp
+             case REGIMM_BLTZL:
+             case REGIMM_BLTZAL:
+             case REGIMM_BLTZALL:
+-                return fmt::format("GPR_S32(ctx, {}) < 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) < 0", rsReg);
+             case REGIMM_BGEZ:
+             case REGIMM_BGEZL:
+             case REGIMM_BGEZAL:
+             case REGIMM_BGEZALL:
+-                return fmt::format("GPR_S32(ctx, {}) >= 0", rsReg);
++                return fmt::format("GPR_S64(ctx, {}) >= 0", rsReg);
+             default:
+                 return "false";
+             }
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index a4ca018..3bf4597 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -384,6 +384,7 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
+     src/lib/ps2_iop_host.cpp
++    src/lib/ps2_ipu.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+     src/lib/ps2_rom_device.cpp
+diff --git a/ps2xRuntime/include/runtime/ps2_ipu.h b/ps2xRuntime/include/runtime/ps2_ipu.h
+new file mode 100644
+index 0000000..8b7c8b9
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_ipu.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <cstdint>
++
++// The IPU (the PS2's MPEG-2 decoder), for FMV playback (Ape Escape 2 recomp patch 0061). Ported from the PAL
++// port's port/src/ipu.c (JackyPendrag0n/ae2-recomp). The game's own libmpeg drives it through the IPU
++// registers (0x10002000-0x10002030), the FIFOs (0x10007000 out, 0x10007010 in) and DMA channels 3 (fromIPU)
++// and 4 (toIPU).
++namespace ps2ipu
++{
++    struct Host
++    {
++        void *user = nullptr;
++        uint32_t &(*reg)(void *user, uint32_t address) = nullptr;   // a DMA channel register
++        uint8_t *(*mem)(void *user, uint32_t address) = nullptr;     // 16 bytes of DMA memory (RAM or SPR)
++        void (*dmaDone)(void *user, int channel) = nullptr;           // D_STAT + DMAC interrupt
++        void (*intc)(void *user, int cause) = nullptr;                // INTC interrupt (IPU = 8)
++    };
++
++    void setHost(const Host &host);
++    bool handles(uint32_t address);
++    uint32_t read32(uint32_t address);
++    uint64_t read64(uint32_t address);
++    void write32(uint32_t address, uint32_t value);
++    void fifoRead(uint8_t out[16]);
++    void fifoWrite(const uint8_t in[16]);
++    void dmaStart(int channel); // a CHCR write that set STR on channel 3 or 4
++    void poll();                // a read of channel 3/4's CHCR
++    // Called with the host time each burst of IPU work took, so the EE clock can be charged for it: on the PS2 the
++    // IPU decodes in parallel while the EE waits, and that wait takes real time (patch 0061).
++    void setChargeHook(void (*hook)(uint64_t hostNs));
++    // An IPU command was started within the last `ms` milliseconds (a movie is playing).
++    bool activeWithin(int ms);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 7bb827f..0b13f23 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -4,6 +4,7 @@
+ #include <deque>
+ #include <array>
+ #include "runtime/ee_scheduler.h"
++#include "runtime/ps2_ipu.h"
+ 
+ #include "ps2_log.h"
+ #include "ps2_runtime_macros.h"
+@@ -405,6 +406,7 @@ void EeScheduler::run()
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
+             const auto callStart = std::chrono::steady_clock::now(); // 0130
++            const uint64_t callStartCycle = m_eeCycle;               // 0061
+             function(m_rdram, &context, &m_runtime);
+             {
+                 // 0130: one generated call taking tens of milliseconds would explain the ~90 ms the EE loses per
+@@ -427,6 +429,11 @@ void EeScheduler::run()
+                 {
+                     uint64_t eeEquiv = static_cast<uint64_t>(iopNs) *
+                                        static_cast<uint64_t>(EeScheduler::kEeClockHz) / 1000000000ull;
++                    // 0061: accountCycles already advanced the IOP by the EE cycles of this call; only the shortfall
++                    // against the wall time is added here. Adding the whole wall time on top ran the IOP at twice
++                    // real time once the EE clock kept up with the wall clock (movie sound too fast).
++                    const uint64_t accounted = m_eeCycle - callStartCycle;
++                    eeEquiv = eeEquiv > accounted ? eeEquiv - accounted : 0u;
+                     // 0132: the 50 ms cap made the IOP reach only 11.65 MHz against 36.86. Real hardware runs the IOP
+                     // in real time for the whole duration the EE is busy, so allow the full measured interval (capped
+                     // at one second only to keep a debugger stall from handing it a huge burst).
+@@ -531,6 +538,10 @@ void EeScheduler::postEvent(EeEvent event)
+ // Debugging aid: while > 0 (ape2HoldCheckpoints), guest calls run to completion without a checkpoint, so a
+ // logging override sees a hooked function's final results.
+ static int g_ape2CheckpointHold = 0;
++// 0061: the pending vsync (cycle and host deadlines), for the clock catch-up in checkpointDue
++static uint64_t g_ape2VsyncCycle = 0;
++static std::chrono::steady_clock::time_point g_ape2VsyncHost{};
++static bool g_ape2VsyncValid = false;
+ void ape2HoldCheckpoints(int delta)
+ {
+     g_ape2CheckpointHold += delta;
+@@ -555,6 +566,46 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return true;
+     }
+ 
++    // 0061: events (vsync, timers) fire when the EE cycle count reaches them, and the count only advances by what
++    // guest code is charged. Host work charged little or nothing (register accesses, the scheduler, the movie
++    // player's stream demux and thread hand-offs) let it fall behind real time: in the FMVs a "vsync" took 1/16 s
++    // and the movie, its sound and everything else ran at a quarter speed. On the PS2 vsync is real time and a busy
++    // game drops frames instead, so when the pending vsync's host deadline is more than 2 ms past and the count has
++    // not reached it, the cycles up to it are accounted at once. Vsyncs advance by one period of cycles each and
++    // come at real-time host deadlines, so this never runs the clock faster than real time; a vsync held for the
++    // game's frame (0049) is left alone. Gameplay normally runs ahead of real time and never gets here. Checked
++    // every 4096 checkpoints. APE2_EE_CATCHUP=0 disables it.
++    if (g_ape2VsyncValid && m_eeCycle < g_ape2VsyncCycle)
++    {
++        // Only while a movie plays (an IPU command in the last 200 ms): in gameplay the game's logic depends on the
++        // old timing - with the catch-up always on, frames dropped and a stage froze seconds after the New Game
++        // movie. APE2_EE_CATCHUP=always applies it everywhere.
++        static const bool catchUp = [] { const char *e = std::getenv("APE2_EE_CATCHUP"); return !(e && e[0] == '0'); }();
++        static const bool catchUpAlways = [] { const char *e = std::getenv("APE2_EE_CATCHUP"); return e && e[0] == 'a'; }();
++        static uint32_t sampler = 0;
++        if (catchUp && (++sampler & 0xFFFu) == 0u &&
++            std::chrono::steady_clock::now() > g_ape2VsyncHost + std::chrono::milliseconds(2) &&
++            (catchUpAlways || ps2ipu::activeWithin(200)))
++        {
++            uint64_t gap = g_ape2VsyncCycle - m_eeCycle;
++            {
++                static const bool log = std::getenv("APE2_CATCHUP_LOG") != nullptr;
++                static unsigned long long n = 0, total = 0;
++                total += gap;
++                if (log && (++n % 1000u) == 0u)
++                    std::fprintf(stderr, "[ee:catchup] %llu catch-ups, %llu cycles\n", n, total);
++            }
++            while (gap > 0u)
++            {
++                const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(gap, 1000000u));
++                accountCycles(step);
++                gap -= step;
++            }
++            m_checkpointPending.store(true, std::memory_order_release);
++            return true;
++        }
++    }
++
+     if (m_eeCycle < m_sliceEndCycle)
+     {
+         return false;
+@@ -583,6 +634,23 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
++    {
++        // APE2_CATCHUP_LOG: EE clock rate against the wall clock, once a second (0061 diagnostics)
++        static const bool log = std::getenv("APE2_CATCHUP_LOG") != nullptr;
++        static uint64_t calls = 0, lastCycle = 0;
++        static auto lastT = std::chrono::steady_clock::now();
++        if (log && (++calls & 0x3FFFu) == 0u)
++        {
++            const auto now = std::chrono::steady_clock::now();
++            const double sec = std::chrono::duration<double>(now - lastT).count();
++            if (sec >= 1.0)
++            {
++                std::fprintf(stderr, "[ee:clock] %.1f MHz over %.2fs\n", static_cast<double>(m_eeCycle - lastCycle) / sec / 1e6, sec);
++                lastT = now;
++                lastCycle = m_eeCycle;
++            }
++        }
++    }
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+@@ -946,8 +1014,45 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+     }
+ 
+     GuestThread *self = currentThread();
++    {
++        static const bool log = std::getenv("APE2_ROTLOG") != nullptr;
++        static unsigned long long calls = 0, empty = 0, other = 0;
++        static auto t0 = std::chrono::steady_clock::now();
++        ++calls;
++        if (self && self->currentPriority == priority && m_readyQueues[priority].empty())
++            ++empty;
++        if (!self || self->currentPriority != priority)
++            ++other;
++        if (log && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(1))
++        {
++            t0 = std::chrono::steady_clock::now();
++            std::fprintf(stderr, "[rot] 1s: %llu rotates (prio %d): %llu nobody else ready, %llu not self; queue %zu\n", calls, priority, empty, other,
++                         m_readyQueues[priority].size());
++            calls = empty = other = 0;
++        }
++    }
+     if (self && self->currentPriority == priority)
+     {
++        // nobody else ready at this priority: rotating changes nothing (the PS2 returns at once). The movie decode
++        // loop yields like this between IPU commands, and each forced reschedule cost a host thread hand-off
++        // (Ape Escape 2 recomp patch 0061).
++        if (m_readyQueues[priority].empty())
++            return KE_OK;
++        // A yield is a busy-wait hint. The movie player's two priority-11 threads hand the CPU to each other after
++        // every IPU command (~55000 times a second); on the PS2 that switch is cheap, here every one is a host
++        // thread hand-off, which held movies to a fifth of their speed. A thread that yielded less than
++        // APE2_ROT_MIN_US microseconds ago keeps running (default 0, off: measured no gain once the clock catch-up
++        // below was in; e.g. 100 lets the others run up to 10000 times a second).
++        {
++            static const long long minUs = [] { const char *e = std::getenv("APE2_ROT_MIN_US"); return e ? std::atoll(e) : 0LL; }();
++            static thread_local int lastId = -1;
++            static thread_local std::chrono::steady_clock::time_point lastYield{};
++            const auto now = std::chrono::steady_clock::now();
++            if (minUs > 0 && lastId == self->id && now - lastYield < std::chrono::microseconds(minUs))
++                return KE_OK;
++            lastId = self->id;
++            lastYield = now;
++        }
+         enqueueReady(*self);
+         m_currentThreadId = 0;
+         m_rescheduleRequested = true;
+@@ -2070,6 +2175,7 @@ void EeScheduler::processDueDeadlines()
+                 // the game has not finished the frame it started at the last vsync: look again after it has run a
+                 // little further (a cycle deadline, so the EE keeps running rather than waiting here)
+                 scheduleEvent(m_eeCycle + kVBlankPeriodCycles / 64u, std::chrono::steady_clock::now(), scheduled.event);
++                g_ape2VsyncValid = false; // a held vsync (0049) waits on the game's frame, not the clock
+                 continue;
+             }
+             if (scheduled.event.type == EeEventType::VBlankStart)
+@@ -2329,6 +2435,12 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
+                                 std::chrono::steady_clock::time_point hostDeadline,
+                                 EeEvent event)
+ {
++    if (event.type == EeEventType::VBlankStart) // 0061: the next vsync, for the clock catch-up
++    {
++        g_ape2VsyncCycle = deadlineCycle;
++        g_ape2VsyncHost = hostDeadline;
++        g_ape2VsyncValid = true;
++    }
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 56a978e..635c655 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -161,10 +161,21 @@ namespace ps2_stubs
+             return now + ticks;
+         }
+ 
++        // Ape Escape 2 recomp patch 0061: a disc stream does not stop at the end of the file - the drive goes on
++        // returning the sectors that follow, and the game stops on its own data. Bounding the stream to the file
++        // left the game's last read short (the final 32-sector request), so the movie demuxer never got the last
++        // sector with the program end code and the game never ended the movie (a white screen after every FMV).
++        // The stream runs on; sectors past the file read as zeros. APE2_CDST_PASTEND=0 bounds it as before.
++        uint32_t g_cdStreamFileEndLbn = 0xFFFFFFFFu;
++
+         void restartCdStreamAt(uint32_t lbn, PS2Runtime *runtime)
+         {
++            static const bool pastEnd = [] { const char *e = std::getenv("APE2_CDST_PASTEND"); return e && e[0] == '1'; }(); // opt-in: kept the movie thread reading zeros after D2 (fps drop, a freeze)
+             g_cdStreamingLbn = lbn;
+             g_cdStreamingEndLbn = cdStreamingEndLbnForStart(lbn);
++            g_cdStreamFileEndLbn = g_cdStreamingEndLbn;
++            if (pastEnd)
++                g_cdStreamingEndLbn = 0xFFFFFFFFu;
+             resetCdStreamProduction(runtime);
+         }
+     }
+@@ -808,7 +819,9 @@ namespace ps2_stubs
+ 
+                 const uint32_t readLbn = g_cdStreamingLbn;
+                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
+-                if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
++                if (g_cdStreamFileEndLbn != 0xFFFFFFFFu && readLbn >= g_cdStreamFileEndLbn)
++                    std::memset(rdram + offset, 0, readBytes); // past the file's end (see restartCdStreamAt)
++                else if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
+                 {
+                     finishCdStRead(rdram, ctx, state, g_lastCdError);
+                     return;
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 9bdb41a..de0117a 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -2036,10 +2036,21 @@ namespace
+             lod = m.k;
+         else
+         {
+-            float sum = 0.0f;
++            // The finest level any corner wants (the nearest corner), not the average (the PAL port): without the
++            // triangle cut, a big floor polygon reaching from the camera into the distance was drawn whole with the
++            // averaged, blurrier level - smeared grass at your feet and pale level-shaped patches on the floor
++            // tiles that moved as you walked. The PS2 samples that finest level at the nearest pixels, so the game
++            // always has it uploaded; distant surfaces (all corners far) still get their small levels.
++            // APE2_MIPPICK=avg restores the average.
++            static const bool avg = [] { const char *e = std::getenv("APE2_MIPPICK"); return e && e[0] == 'a'; }();
++            float sum = 0.0f, lo = 1e30f;
+             for (int i = 0; i < b.vertexCount; ++i)
+-                sum += -std::log2(std::max(std::fabs(b.vertices[static_cast<size_t>(i)].q), 1e-20f));
+-            lod = sum / static_cast<float>(b.vertexCount) * static_cast<float>(1 << m.l) + m.k;
++            {
++                const float v = -std::log2(std::max(std::fabs(b.vertices[static_cast<size_t>(i)].q), 1e-20f));
++                sum += v;
++                lo = std::min(lo, v);
++            }
++            lod = (avg ? sum / static_cast<float>(b.vertexCount) : lo) * static_cast<float>(1 << m.l) + m.k;
+         }
+         if (lod <= 0.0f)
+             return -1;
+diff --git a/ps2xRuntime/src/lib/ps2_ipu.cpp b/ps2xRuntime/src/lib/ps2_ipu.cpp
+new file mode 100644
+index 0000000..dbb40c7
+--- /dev/null
++++ b/ps2xRuntime/src/lib/ps2_ipu.cpp
+@@ -0,0 +1,1459 @@
++// IPU (the PS2's MPEG-2 decoder) for FMV playback (Ape Escape 2 recomp patch 0061).
++//
++// Ported from the PAL port's port/src/ipu.c (JackyPendrag0n/ae2-recomp), used with the author's permission; the
++// decoder is unchanged, the coroutine is a Windows fiber and the hardware access goes through ps2ipu::Host.
++//
++// The game plays its movies with Sony's libmpeg, which parses the stream headers itself and hands the IPU one
++// command at a time: VDEC/FDEC to read symbols and fields, BDEC to decode a macroblock's DCT blocks, CSC to turn
++// finished YCbCr macroblocks into RGB, plus SETIQ/SETTH/BCLR for setup. Data comes in through an 8-qword input
++// FIFO (fed by DMA channel 4, toIPU) and results leave through an 8-qword output FIFO (drained by channel 3,
++// fromIPU). The decoder is straight-line code running in a coroutine: whenever it needs input that is not there
++// yet, or the output FIFO is full, it yields back to the game, and it is resumed when the game feeds or drains
++// the FIFOs (by DMA or by FIFO register access). The FIFO and DMA bookkeeping follow the hardware closely because
++// libmpeg reads IPU_BP / IPU_CTRL and the DMA registers back to know how much of the stream the IPU has consumed.
++//
++// VLC tables: ISO/IEC 13818-2 Annex B. Colour conversion: the IPU's documented BT.601 integer method (Y bias 16,
++// coefficients in 1/64ths).
++
++#include "runtime/ps2_ipu.h"
++
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++namespace
++{
++    ps2ipu::Host g_host;
++    std::recursive_mutex g_lock;
++
++    uint32_t &hwReg(uint32_t a) { return g_host.reg(g_host.user, a); }
++    uint8_t *hwMem(uint32_t a) { return g_host.mem(g_host.user, a); }
++    void hwDmaDone(int ch)
++    {
++        if (g_host.dmaDone)
++            g_host.dmaDone(g_host.user, ch);
++    }
++    void raiseIntc(int cause)
++    {
++        static const bool off = std::getenv("APE2_IPU_NOINTC") != nullptr; // experiment
++        if (off)
++            return;
++        if (g_host.intc)
++            g_host.intc(g_host.user, cause);
++    }
++    uint64_t hostUsec()
++    {
++        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count());
++    }
++
++    // ------------------------------------------------------------------ registers
++    constexpr uint32_t D3 = 0x1000B000u; // fromIPU
++    constexpr uint32_t D4 = 0x1000B400u; // toIPU
++    uint32_t &CHCR(uint32_t b) { return hwReg(b); }
++    uint32_t &MADR(uint32_t b) { return hwReg(b + 0x10u); }
++    uint32_t &QWC(uint32_t b) { return hwReg(b + 0x20u); }
++    uint32_t &TADR(uint32_t b) { return hwReg(b + 0x30u); }
++    uint32_t &ASR0(uint32_t b) { return hwReg(b + 0x40u); }
++    uint32_t &ASR1(uint32_t b) { return hwReg(b + 0x50u); }
++
++    enum
++    {
++        C_BCLR,
++        C_IDEC,
++        C_BDEC,
++        C_VDEC,
++        C_FDEC,
++        C_SETIQ,
++        C_SETVQ,
++        C_CSC,
++        C_PACK,
++        C_SETTH
++    };
++
++    struct IpuState
++    {
++        uint32_t cmd_data, cmd_busy;
++        uint32_t ctrl; // bits we keep: ECD 14, SCD 15, IDP 16-17, AS 20, IVF 21, QST 22, MP1 23, PCT 24-26, BUSY 31
++        uint32_t top, top_busy;
++        int cbp;
++        // input: FIFO plus the decoder's 2-qword internal buffer
++        uint8_t fifo[8][16];
++        int fr, ifc;
++        uint8_t ib[2][16];
++        int fp, bp; // fp: qwords in ib; bp: bit position in ib (0..255)
++        // output FIFO
++        uint8_t ofifo[8][16];
++        int or_, ofc;
++        // toIPU chain state
++        int d4_tag_end;    // the current tag ends the chain
++        int d4_tag_active; // QWC belongs to a tag already read
++        // tables
++        uint8_t iq[64], niq[64];
++        uint16_t vqclut[16];
++        uint16_t th0, th1;
++        int dc_pred[3];
++        uint32_t cur; // command being executed
++    };
++    IpuState ipu{};
++
++    constexpr uint32_t CTRL_ECD = 1u << 14;
++    constexpr uint32_t CTRL_SCD = 1u << 15;
++    constexpr uint32_t CTRL_BUSY = 1u << 31;
++    int ctrl_idp() { return (ipu.ctrl >> 16) & 3; }
++    int ctrl_as() { return (ipu.ctrl >> 20) & 1; }
++    int ctrl_ivf() { return (ipu.ctrl >> 21) & 1; }
++    int ctrl_qst() { return (ipu.ctrl >> 22) & 1; }
++    int ctrl_mp1() { return (ipu.ctrl >> 23) & 1; }
++    int ctrl_pct() { return (ipu.ctrl >> 24) & 7; }
++
++    // ------------------------------------------------------------------ coroutine (a fiber)
++    LPVOID co_ipu = nullptr; // the decoder fiber
++    LPVOID co_caller = nullptr;
++    int co_running = 0; // a command is in progress inside the coroutine
++    int co_wait = 0;    // 1: waiting for input, 2: waiting for output space
++    void co_entry();
++    void WINAPI coFiberProc(LPVOID) { co_entry(); }
++    void coro_yield() { SwitchToFiber(co_caller); }
++    void coro_resume()
++    {
++        if (!IsThreadAFiber())
++            ConvertThreadToFiber(nullptr);
++        co_caller = GetCurrentFiber();
++        SwitchToFiber(co_ipu);
++    }
++    void yield(int why)
++    {
++        co_wait = why;
++        coro_yield();
++        co_wait = 0;
++    }
++
++    // ------------------------------------------------------------------ DMA
++    int d4_active() { return (CHCR(D4) & 0x100) != 0; }
++    // read the next toIPU tag; returns 0 when the chain is over
++    int d4_next_tag()
++    {
++        if (ipu.d4_tag_end)
++            return 0;
++        uint32_t t = TADR(D4);
++        uint8_t *p = hwMem(t);
++        uint32_t lo, hi;
++        std::memcpy(&lo, p, 4);
++        std::memcpy(&hi, p + 4, 4);
++        uint32_t q = lo & 0xffff, id = (lo >> 28) & 7, irq = lo >> 31, addr = hi & 0x7ffffff0u;
++        uint32_t chcr = CHCR(D4);
++        CHCR(D4) = (chcr & 0xffff) | (lo & 0xffff0000u);
++        QWC(D4) = q;
++        int asp = (chcr >> 4) & 3;
++        switch (id)
++        {
++        case 0: // refe
++            MADR(D4) = addr;
++            TADR(D4) = t + 16;
++            ipu.d4_tag_end = 1;
++            break;
++        case 1: // cnt
++            MADR(D4) = t + 16;
++            TADR(D4) = t + 16 + q * 16;
++            break;
++        case 2: // next
++            MADR(D4) = t + 16;
++            TADR(D4) = addr;
++            break;
++        case 3: // ref, refs
++        case 4:
++            MADR(D4) = addr;
++            TADR(D4) = t + 16;
++            break;
++        case 5: // call
++            MADR(D4) = t + 16;
++            if (asp == 0)
++                ASR0(D4) = t + 16 + q * 16;
++            else
++                ASR1(D4) = t + 16 + q * 16;
++            CHCR(D4) = (CHCR(D4) & ~0x30u) | (static_cast<uint32_t>(asp + 1) << 4);
++            TADR(D4) = addr;
++            break;
++        case 6: // ret
++            MADR(D4) = t + 16;
++            if (asp > 0)
++            {
++                asp--;
++                TADR(D4) = asp ? ASR1(D4) : ASR0(D4);
++                CHCR(D4) = (CHCR(D4) & ~0x30u) | (static_cast<uint32_t>(asp) << 4);
++            }
++            else
++            {
++                TADR(D4) = t + 16 + q * 16;
++                ipu.d4_tag_end = 1;
++            }
++            break;
++        case 7: // end
++            MADR(D4) = t + 16;
++            TADR(D4) = t + 16 + q * 16;
++            ipu.d4_tag_end = 1;
++            break;
++        }
++        if (irq && (chcr & 0x80))
++            ipu.d4_tag_end = 1;
++        ipu.d4_tag_active = 1;
++        return 1;
++    }
++    void d4_finish()
++    {
++        CHCR(D4) &= ~0x100u;
++        ipu.d4_tag_active = 0;
++        hwDmaDone(4);
++    }
++    // move data from the toIPU channel into the input FIFO; returns qwords moved
++    int d4_fill()
++    {
++        int moved = 0;
++        while (ipu.ifc < 8 && d4_active())
++        {
++            int chain = ((CHCR(D4) >> 2) & 3) == 1;
++            if ((QWC(D4) & 0xffff) == 0)
++            {
++                if (!chain)
++                {
++                    d4_finish();
++                    break;
++                }
++                if (ipu.d4_tag_active && ipu.d4_tag_end)
++                {
++                    d4_finish();
++                    break;
++                }
++                if (!d4_next_tag())
++                {
++                    d4_finish();
++                    break;
++                }
++                continue;
++            }
++            std::memcpy(ipu.fifo[(ipu.fr + ipu.ifc) & 7], hwMem(MADR(D4)), 16);
++            ipu.ifc++;
++            moved++;
++            MADR(D4) += 16;
++            QWC(D4) = (QWC(D4) - 1) & 0xffff;
++            if (chain) // cnt/end tags advance TADR along with MADR
++            {
++                uint32_t id = (CHCR(D4) >> 28) & 7;
++                if (id == 1 || id == 7)
++                    TADR(D4) = MADR(D4);
++            }
++            if ((QWC(D4) & 0xffff) == 0 && (!chain || ipu.d4_tag_end))
++            {
++                d4_finish();
++                break;
++            }
++        }
++        return moved;
++    }
++    // drain the output FIFO into the fromIPU channel (normal mode)
++    int d3_drain()
++    {
++        int moved = 0;
++        while (ipu.ofc > 0 && (CHCR(D3) & 0x100) && (QWC(D3) & 0xffff))
++        {
++            std::memcpy(hwMem(MADR(D3)), ipu.ofifo[ipu.or_], 16);
++            ipu.or_ = (ipu.or_ + 1) & 7;
++            ipu.ofc--;
++            moved++;
++            MADR(D3) += 16;
++            QWC(D3) = (QWC(D3) - 1) & 0xffff;
++            if ((QWC(D3) & 0xffff) == 0)
++            {
++                CHCR(D3) &= ~0x100u;
++                hwDmaDone(3);
++            }
++        }
++        return moved;
++    }
++
++    // ------------------------------------------------------------------ bit reader
++    // make sure the internal buffer holds `bits` bits past bp (at most 32 + the current word)
++    void need(int bits)
++    {
++        while (ipu.fp * 128 < ipu.bp + bits)
++        {
++            if (!ipu.ifc)
++                d4_fill();
++            if (!ipu.ifc)
++            {
++                yield(1);
++                continue;
++            }
++            std::memcpy(ipu.ib[ipu.fp], ipu.fifo[ipu.fr], 16);
++            ipu.fr = (ipu.fr + 1) & 7;
++            ipu.ifc--;
++            ipu.fp++;
++            d4_fill();
++        }
++    }
++    // the next n (<= 32) bits, left-aligned in 32, without consuming them; waits only for n bits
++    uint32_t peekn(int n)
++    {
++        need(n);
++        int byte = ipu.bp >> 3, sh = ipu.bp & 7, have = ipu.fp * 16;
++        const uint8_t *b = &ipu.ib[0][0];
++        uint64_t v = 0;
++        for (int i = 0; i < 5; i++)
++            v = (v << 8) | (byte + i < have ? b[byte + i] : 0);
++        return static_cast<uint32_t>(v >> (8 - sh));
++    }
++    uint32_t peek32() { return peekn(32); }
++    uint32_t ubits(int n) { return n ? peekn(n) >> (32 - n) : 0; }
++    int32_t sbits(int n) { return n ? static_cast<int32_t>(peekn(n)) >> (32 - n) : 0; }
++    void dump(int n)
++    {
++        ipu.bp += n;
++        while (ipu.bp >= 128 && ipu.fp > 0)
++        {
++            std::memcpy(ipu.ib[0], ipu.ib[1], 16);
++            ipu.fp--;
++            ipu.bp -= 128;
++        }
++        if (ipu.bp >= 128 && ipu.fp == 0)
++        {
++            // skipping past data that has not arrived: pull it in and drop it
++            while (ipu.bp >= 128)
++            {
++                need(1);
++                std::memcpy(ipu.ib[0], ipu.ib[1], 16);
++                ipu.fp--;
++                ipu.bp -= 128;
++            }
++        }
++    }
++    uint32_t gbits(int n)
++    {
++        uint32_t v = ubits(n);
++        dump(n);
++        return v;
++    }
++
++    // ------------------------------------------------------------------ output
++    void out_qw(const void *q)
++    {
++        while (ipu.ofc == 8)
++        {
++            d3_drain();
++            if (ipu.ofc == 8)
++                yield(2);
++        }
++        std::memcpy(ipu.ofifo[(ipu.or_ + ipu.ofc) & 7], q, 16);
++        ipu.ofc++;
++        d3_drain();
++    }
++    void out_block(const void *p, int qwords)
++    {
++        for (int i = 0; i < qwords; i++)
++            out_qw(static_cast<const uint8_t *>(p) + i * 16);
++    }
++
++    // ------------------------------------------------------------------ VLC tables (ISO 13818-2 Annex B)
++    struct VlcDef
++    {
++        const char *code;
++        int a, b;
++    };
++    struct VlcEnt
++    {
++        int16_t a, b;
++        uint8_t len;
++    };
++    struct Vlc
++    {
++        int bits;
++        VlcEnt *e;
++    };
++    // build a direct lookup on `bits` leading bits; codes may contain spaces
++    void vlc_build(Vlc *v, const VlcDef *d, int n, int bits)
++    {
++        v->bits = bits;
++        v->e = static_cast<VlcEnt *>(std::calloc(static_cast<size_t>(1) << bits, sizeof(VlcEnt)));
++        for (int i = 0; i < n; i++)
++        {
++            uint32_t c = 0;
++            int l = 0;
++            for (const char *s = d[i].code; *s; s++)
++                if (*s == '0' || *s == '1')
++                {
++                    c = (c << 1) | static_cast<uint32_t>(*s - '0');
++                    l++;
++                }
++            if (l > bits)
++            {
++                std::fprintf(stderr, "[ipu] VLC code too long\n");
++                continue;
++            }
++            uint32_t lo = c << (bits - l), hi = lo + (1u << (bits - l));
++            for (uint32_t k = lo; k < hi; k++)
++            {
++                v->e[k].a = static_cast<int16_t>(d[i].a);
++                v->e[k].b = static_cast<int16_t>(d[i].b);
++                v->e[k].len = static_cast<uint8_t>(l);
++            }
++        }
++    }
++    const VlcEnt *vlc_get(const Vlc *v) { return &v->e[ubits(v->bits)]; }
++
++    // macroblock_address_increment: value 1..33, 34 stuffing, 35 escape
++    const VlcDef d_mbai[] = {
++        {"1", 1}, {"011", 2}, {"010", 3}, {"0011", 4}, {"0010", 5}, {"00011", 6}, {"00010", 7},
++        {"0000111", 8}, {"0000110", 9}, {"00001011", 10}, {"00001010", 11}, {"00001001", 12}, {"00001000", 13},
++        {"00000111", 14}, {"00000110", 15}, {"0000010111", 16}, {"0000010110", 17}, {"0000010101", 18},
++        {"0000010100", 19}, {"0000010011", 20}, {"0000010010", 21}, {"00000100011", 22}, {"00000100010", 23},
++        {"00000100001", 24}, {"00000100000", 25}, {"00000011111", 26}, {"00000011110", 27}, {"00000011101", 28},
++        {"00000011100", 29}, {"00000011011", 30}, {"00000011010", 31}, {"00000011001", 32}, {"00000011000", 33},
++        {"00000001111", 34}, {"00000001000", 35},
++    };
++    // macroblock_type: bit0 intra, 1 pattern, 2 backward, 3 forward, 4 quant
++    const VlcDef d_mbt_i[] = {{"1", 0x01}, {"01", 0x11}};
++    const VlcDef d_mbt_p[] = {{"1", 0x0a}, {"01", 0x02}, {"001", 0x08}, {"00011", 0x01}, {"00010", 0x1a}, {"00001", 0x12}, {"000001", 0x11}};
++    const VlcDef d_mbt_b[] = {{"10", 0x0c}, {"11", 0x0e}, {"010", 0x04}, {"011", 0x06}, {"0010", 0x08}, {"0011", 0x0a},
++                              {"00011", 0x01}, {"00010", 0x1e}, {"000011", 0x1a}, {"000010", 0x16}, {"000001", 0x11}};
++    const VlcDef d_cbp[] = {
++        {"111", 60}, {"1101", 4}, {"1100", 8}, {"1011", 16}, {"1010", 32}, {"10011", 12}, {"10010", 48}, {"10001", 20}, {"10000", 40},
++        {"01111", 28}, {"01110", 44}, {"01101", 52}, {"01100", 56}, {"01011", 1}, {"01010", 61}, {"01001", 2}, {"01000", 62},
++        {"001111", 24}, {"001110", 36}, {"001101", 3}, {"001100", 63}, {"0010111", 5}, {"0010110", 9}, {"0010101", 17}, {"0010100", 33},
++        {"0010011", 6}, {"0010010", 10}, {"0010001", 18}, {"0010000", 34}, {"00011111", 7}, {"00011110", 11}, {"00011101", 19},
++        {"00011100", 35}, {"00011011", 13}, {"00011010", 49}, {"00011001", 21}, {"00011000", 41}, {"00010111", 14}, {"00010110", 50},
++        {"00010101", 22}, {"00010100", 42}, {"00010011", 15}, {"00010010", 51}, {"00010001", 23}, {"00010000", 43}, {"00001111", 25},
++        {"00001110", 37}, {"00001101", 26}, {"00001100", 38}, {"00001011", 29}, {"00001010", 45}, {"00001001", 53}, {"00001000", 57},
++        {"00000111", 30}, {"00000110", 46}, {"00000101", 54}, {"00000100", 58}, {"000000111", 31}, {"000000110", 47}, {"000000101", 55},
++        {"000000100", 59}, {"000000011", 27}, {"000000010", 39}, {"000000001", 0},
++    };
++    // motion_code magnitude (the sign bit follows)
++    const VlcDef d_mv[] = {
++        {"1", 0}, {"01", 1}, {"001", 2}, {"0001", 3}, {"000011", 4}, {"0000101", 5}, {"0000100", 6}, {"0000011", 7},
++        {"000001011", 8}, {"000001010", 9}, {"000001001", 10}, {"0000010001", 11}, {"0000010000", 12},
++        {"0000001111", 13}, {"0000001110", 14}, {"0000001101", 15}, {"0000001100", 16},
++    };
++    const VlcDef d_dcl[] = {{"100", 0}, {"00", 1}, {"01", 2}, {"101", 3}, {"110", 4}, {"1110", 5}, {"11110", 6}, {"111110", 7},
++                            {"1111110", 8}, {"11111110", 9}, {"111111110", 10}, {"111111111", 11}};
++    const VlcDef d_dcc[] = {{"00", 0}, {"01", 1}, {"10", 2}, {"110", 3}, {"1110", 4}, {"11110", 5}, {"111110", 6}, {"1111110", 7},
++                            {"11111110", 8}, {"111111110", 9}, {"1111111110", 10}, {"1111111111", 11}};
++    // DCT coefficients: run, level (sign bit follows); run 64 = end of block, 65 = escape
++    constexpr int EOB = 64;
++    constexpr int ESC = 65;
++    const VlcDef d_dct_common[] = { // codes of 12+ bits, shared by both tables
++        {"000000011101", 0, 8}, {"000000011000", 0, 9}, {"000000010011", 0, 10}, {"000000010000", 0, 11}, {"000000011011", 1, 5},
++        {"000000010100", 2, 4}, {"000000011100", 3, 3}, {"000000010010", 4, 3}, {"000000011110", 6, 2}, {"000000010101", 7, 2},
++        {"000000010001", 8, 2}, {"000000011111", 17, 1}, {"000000011010", 18, 1}, {"000000011001", 19, 1}, {"000000010111", 20, 1},
++        {"000000010110", 21, 1}, {"0000000011010", 0, 12}, {"0000000011001", 0, 13}, {"0000000011000", 0, 14}, {"0000000010111", 0, 15},
++        {"0000000010110", 1, 6}, {"0000000010101", 1, 7}, {"0000000010100", 2, 5}, {"0000000010011", 3, 4}, {"0000000010010", 5, 3},
++        {"0000000010001", 9, 2}, {"0000000010000", 10, 2}, {"0000000011111", 22, 1}, {"0000000011110", 23, 1}, {"0000000011101", 24, 1},
++        {"0000000011100", 25, 1}, {"0000000011011", 26, 1},
++        {"00000000011111", 0, 16}, {"00000000011110", 0, 17}, {"00000000011101", 0, 18}, {"00000000011100", 0, 19}, {"00000000011011", 0, 20},
++        {"00000000011010", 0, 21}, {"00000000011001", 0, 22}, {"00000000011000", 0, 23}, {"00000000010111", 0, 24}, {"00000000010110", 0, 25},
++        {"00000000010101", 0, 26}, {"00000000010100", 0, 27}, {"00000000010011", 0, 28}, {"00000000010010", 0, 29}, {"00000000010001", 0, 30},
++        {"00000000010000", 0, 31}, {"000000000011000", 0, 32}, {"000000000010111", 0, 33}, {"000000000010110", 0, 34}, {"000000000010101", 0, 35},
++        {"000000000010100", 0, 36}, {"000000000010011", 0, 37}, {"000000000010010", 0, 38}, {"000000000010001", 0, 39}, {"000000000010000", 0, 40},
++        {"000000000011111", 1, 8}, {"000000000011110", 1, 9}, {"000000000011101", 1, 10}, {"000000000011100", 1, 11}, {"000000000011011", 1, 12},
++        {"000000000011010", 1, 13}, {"000000000011001", 1, 14}, {"0000000000010011", 1, 15}, {"0000000000010010", 1, 16}, {"0000000000010001", 1, 17},
++        {"0000000000010000", 1, 18}, {"0000000000010100", 6, 3}, {"0000000000011010", 11, 2}, {"0000000000011001", 12, 2}, {"0000000000011000", 13, 2},
++        {"0000000000010111", 14, 2}, {"0000000000010110", 15, 2}, {"0000000000010101", 16, 2}, {"0000000000011111", 27, 1}, {"0000000000011110", 28, 1},
++        {"0000000000011101", 29, 1}, {"0000000000011100", 30, 1}, {"0000000000011011", 31, 1},
++    };
++    const VlcDef d_dct0[] = { // table B.14 (short codes); "1" for (0,1) is the first-coefficient form
++        {"10", EOB, 0}, {"11", 0, 1}, {"011", 1, 1}, {"0100", 0, 2}, {"0101", 2, 1}, {"00101", 0, 3}, {"00111", 3, 1}, {"00110", 4, 1},
++        {"000110", 1, 2}, {"000111", 5, 1}, {"000101", 6, 1}, {"000100", 7, 1}, {"0000110", 0, 4}, {"0000100", 2, 2}, {"0000111", 8, 1},
++        {"0000101", 9, 1}, {"000001", ESC, 0}, {"00100110", 0, 5}, {"00100001", 0, 6}, {"00100101", 1, 3}, {"00100100", 3, 2},
++        {"00100111", 10, 1}, {"00100011", 11, 1}, {"00100010", 12, 1}, {"00100000", 13, 1}, {"0000001010", 0, 7}, {"0000001100", 1, 4},
++        {"0000001011", 2, 3}, {"0000001111", 4, 2}, {"0000001001", 5, 2}, {"0000001110", 14, 1}, {"0000001101", 15, 1}, {"0000001000", 16, 1},
++    };
++    const VlcDef d_dct1[] = { // table B.15 (intra_vlc_format = 1)
++        {"0110", EOB, 0}, {"10", 0, 1}, {"010", 1, 1}, {"110", 0, 2}, {"00101", 2, 1}, {"0111", 0, 3}, {"00111", 3, 1}, {"000110", 4, 1},
++        {"00110", 1, 2}, {"000111", 5, 1}, {"0000110", 6, 1}, {"0000100", 7, 1}, {"11100", 0, 4}, {"0000111", 2, 2}, {"0000101", 8, 1},
++        {"1111000", 9, 1}, {"000001", ESC, 0}, {"11101", 0, 5}, {"000101", 0, 6}, {"1111001", 1, 3}, {"00100110", 3, 2}, {"1111010", 10, 1},
++        {"00100001", 11, 1}, {"00100101", 12, 1}, {"00100100", 13, 1}, {"000100", 0, 7}, {"00100111", 1, 4}, {"11111100", 2, 3},
++        {"11111101", 4, 2}, {"000000100", 5, 2}, {"000000101", 14, 1}, {"000000111", 15, 1}, {"0000001101", 16, 1}, {"1111011", 0, 8},
++        {"1111100", 0, 9}, {"00100011", 0, 10}, {"00100010", 0, 11}, {"00100000", 1, 5}, {"0000001100", 2, 4}, {"11111010", 0, 12},
++        {"11111011", 0, 13}, {"11111110", 0, 14}, {"11111111", 0, 15},
++    };
++    Vlc v_mbai, v_mbt[3], v_cbp, v_mv, v_dcl, v_dcc, v_dct0, v_dct0f, v_dct1;
++    template <size_t N>
++    constexpr int countOf(const VlcDef (&)[N]) { return static_cast<int>(N); }
++    void vlc_build_dct(Vlc *v, const VlcDef *a, int na, int first)
++    {
++        VlcDef all[160];
++        int n = 0;
++        for (int i = 0; i < na; i++)
++            all[n++] = a[i];
++        for (int i = 0; i < countOf(d_dct_common); i++)
++        {
++            // table one drops the 12/13-bit codes it gives shorter codes to
++            int dup = 0;
++            for (int k = 0; k < na; k++)
++                if (a[k].a == d_dct_common[i].a && a[k].b == d_dct_common[i].b)
++                    dup = 1;
++            if (!dup)
++                all[n++] = d_dct_common[i];
++        }
++        if (first)
++        {
++            for (int i = 0; i < n; i++)
++                if (all[i].a == EOB)
++                {
++                    all[i] = all[--n];
++                    break;
++                }
++            for (int i = 0; i < n; i++)
++                if (all[i].a == 0 && all[i].b == 1)
++                    all[i].code = "1";
++        }
++        vlc_build(v, all, n, 16);
++    }
++    void tables_init()
++    {
++        static int done;
++        if (done)
++            return;
++        done = 1;
++        vlc_build(&v_mbai, d_mbai, countOf(d_mbai), 11);
++        vlc_build(&v_mbt[0], d_mbt_i, countOf(d_mbt_i), 6);
++        vlc_build(&v_mbt[1], d_mbt_p, countOf(d_mbt_p), 6);
++        vlc_build(&v_mbt[2], d_mbt_b, countOf(d_mbt_b), 6);
++        vlc_build(&v_cbp, d_cbp, countOf(d_cbp), 9);
++        vlc_build(&v_mv, d_mv, countOf(d_mv), 10);
++        vlc_build(&v_dcl, d_dcl, countOf(d_dcl), 9);
++        vlc_build(&v_dcc, d_dcc, countOf(d_dcc), 10);
++        vlc_build_dct(&v_dct0, d_dct0, countOf(d_dct0), 0);
++        vlc_build_dct(&v_dct0f, d_dct0, countOf(d_dct0), 1);
++        vlc_build_dct(&v_dct1, d_dct1, countOf(d_dct1), 0);
++    }
++
++    // ------------------------------------------------------------------ blocks
++    const uint8_t zigzag[64] = {
++        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
++        35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63};
++    const uint8_t altscan[64] = {
++        0, 8, 16, 24, 1, 9, 2, 10, 17, 25, 32, 40, 48, 56, 57, 49, 41, 33, 26, 18, 3, 11, 4, 12, 19, 27, 34, 42, 50, 58, 35, 43,
++        51, 59, 20, 28, 5, 13, 6, 14, 21, 29, 36, 44, 52, 60, 37, 45, 53, 61, 22, 30, 7, 15, 23, 31, 38, 46, 54, 62, 39, 47, 55, 63};
++    const uint8_t nonlinear_q[32] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44, 48, 52,
++                                     56, 64, 72, 80, 88, 96, 104, 112};
++    int quant_scale(int code) { return ctrl_qst() ? nonlinear_q[code & 31] : (code & 31) * 2; }
++
++    int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
++    int dc_diff(int chroma)
++    {
++        const VlcEnt *e = vlc_get(chroma ? &v_dcc : &v_dcl);
++        dump(e->len);
++        int size = e->a;
++        if (!size)
++            return 0;
++        int d = static_cast<int>(gbits(size));
++        if (!(d & (1 << (size - 1))))
++            d -= (1 << size) - 1;
++        return d;
++    }
++    // coefficients of one block into blk (natural order)
++    void read_block(int16_t *blk, int intra, int cc, int qs)
++    {
++        const uint8_t *scan = ctrl_as() ? altscan : zigzag;
++        const uint8_t *qm = intra ? ipu.iq : ipu.niq;
++        int mpeg1 = ctrl_mp1();
++        int i = 0;
++        if (intra)
++        {
++            ipu.dc_pred[cc] += dc_diff(cc != 0);
++            blk[0] = static_cast<int16_t>(ipu.dc_pred[cc] << (3 - ctrl_idp()));
++            i = 1;
++        }
++        const Vlc *tab = intra && ctrl_ivf() && !mpeg1 ? &v_dct1 : &v_dct0;
++        int first = !intra; // a non-intra block's first coefficient has its own short code
++        for (;;)
++        {
++            const VlcEnt *e = vlc_get(first ? &v_dct0f : tab);
++            first = 0;
++            if (!e->len)
++                break; // invalid code: stop the block
++            dump(e->len);
++            if (e->a == EOB)
++                break;
++            int run, val;
++            if (e->a == ESC)
++            {
++                run = static_cast<int>(gbits(6));
++                if (mpeg1)
++                {
++                    int l = sbits(8);
++                    dump(8);
++                    if (l == -128)
++                        l = static_cast<int>(gbits(8)) - 256;
++                    else if (l == 0)
++                        l = static_cast<int>(gbits(8));
++                    val = l;
++                }
++                else
++                {
++                    val = sbits(12);
++                    dump(12);
++                }
++            }
++            else
++            {
++                run = e->a;
++                val = e->b;
++                if (gbits(1))
++                    val = -val;
++            }
++            i += run;
++            if (i > 63)
++                break;
++            int j = scan[i];
++            int v; // the IPU keeps the quantiser matrices in scan order (as transmitted)
++            if (intra)
++                v = (val * qs * qm[i]) / 16; // MPEG-2: (2 * level * qs * W) / 32
++            else
++                v = ((2 * val + (val > 0 ? 1 : val < 0 ? -1 : 0)) * qs * qm[i]) / 32;
++            if (mpeg1 && v)
++                v = (v & 1) ? v : v - (v > 0 ? 1 : -1); // oddification
++            blk[j] = static_cast<int16_t>(clampi(v, -2048, 2047));
++            i++;
++        }
++        if (!mpeg1) // mismatch control
++        {
++            int sum = 0;
++            for (int k = 0; k < 64; k++)
++                sum += blk[k];
++            if (!(sum & 1))
++                blk[63] ^= 1;
++        }
++    }
++    // separable 8x8 inverse DCT (double precision reference form)
++    double idct_c[8][8];
++    void idct(int16_t *blk, int16_t *out)
++    {
++        static int init;
++        if (!init)
++        {
++            init = 1;
++            const double pi = 3.14159265358979323846, sqrt1_2 = 0.70710678118654752440;
++            for (int u = 0; u < 8; u++)
++                for (int x = 0; x < 8; x++)
++                    idct_c[x][u] = (u ? 1.0 : sqrt1_2) * std::cos((2 * x + 1) * u * pi / 16) / 2;
++        }
++        double tmp[64];
++        for (int y = 0; y < 8; y++)
++        {
++            const int16_t *r = blk + y * 8;
++            int nz = 0;
++            for (int u = 0; u < 8; u++)
++                nz |= r[u];
++            for (int x = 0; x < 8; x++)
++            {
++                double s = 0;
++                if (nz)
++                    for (int u = 0; u < 8; u++)
++                        s += idct_c[x][u] * r[u];
++                tmp[y * 8 + x] = s;
++            }
++        }
++        for (int x = 0; x < 8; x++)
++            for (int y = 0; y < 8; y++)
++            {
++                double s = 0;
++                for (int v = 0; v < 8; v++)
++                    s += idct_c[y][v] * tmp[v * 8 + x];
++                out[y * 8 + x] = static_cast<int16_t>(clampi(static_cast<int>(std::floor(s + 0.5)), -256, 255));
++            }
++    }
++
++    // ------------------------------------------------------------------ macroblocks
++    struct MB16
++    {
++        int16_t y[16][16], cb[8][8], cr[8][8];
++    };
++    struct MB8
++    {
++        uint8_t y[16][16], cb[8][8], cr[8][8];
++    };
++    void put_block(MB16 *mb, int b, const int16_t *px, int field)
++    {
++        for (int r = 0; r < 8; r++)
++            for (int c = 0; c < 8; c++)
++            {
++                int16_t v = px[r * 8 + c];
++                if (b < 4)
++                {
++                    int yy = field ? (b >> 1) + r * 2 : (b >> 1) * 8 + r, xx = (b & 1) * 8 + c;
++                    mb->y[yy][xx] = v;
++                }
++                else if (b == 4)
++                    mb->cb[r][c] = v;
++                else
++                    mb->cr[r][c] = v;
++            }
++    }
++    // decode the blocks of one macroblock (after its header) into mb
++    void decode_mb_blocks(MB16 *mb, int intra, int cbp, int field, int qs)
++    {
++        std::memset(mb, 0, sizeof *mb);
++        for (int b = 0; b < 6; b++)
++        {
++            if (!intra && !(cbp & (32 >> b)))
++                continue;
++            int16_t blk[64] = {0}, px[64];
++            read_block(blk, intra, b < 4 ? 0 : b - 3, qs);
++            idct(blk, px);
++            if (intra)
++                for (int k = 0; k < 64; k++)
++                    px[k] = static_cast<int16_t>(clampi(px[k], 0, 255));
++            put_block(mb, b, px, field);
++        }
++    }
++    // YCbCr (8-bit) -> RGB32 with the IPU's integer formula, then thresholds
++    void csc_rgb32(const MB8 *m, uint32_t *rgb)
++    {
++        for (int y = 0; y < 16; y++)
++            for (int x = 0; x < 16; x++)
++            {
++                int lum = (0x95 * (m->y[y][x] > 16 ? m->y[y][x] - 16 : 0)) >> 6;
++                int cb = m->cb[y >> 1][x >> 1] - 128, cr = m->cr[y >> 1][x >> 1] - 128;
++                int r = clampi((lum + ((0xcc * cr) >> 6) + 1) >> 1, 0, 255);
++                int g = clampi((lum + ((-0x68 * cr) >> 6) + ((-0x32 * cb) >> 6) + 1) >> 1, 0, 255);
++                int b = clampi((lum + ((0x102 * cb) >> 6) + 1) >> 1, 0, 255);
++                uint32_t a = 0x80;
++                if (ipu.th0 && r < ipu.th0 && g < ipu.th0 && b < ipu.th0)
++                {
++                    rgb[y * 16 + x] = 0;
++                    continue;
++                }
++                if (ipu.th1 && r < ipu.th1 && g < ipu.th1 && b < ipu.th1)
++                    a = 0x40;
++                rgb[y * 16 + x] = static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8) | (static_cast<uint32_t>(b) << 16) | (a << 24);
++            }
++    }
++    void rgb32_to_16(const uint32_t *rgb, uint16_t *o, int dither)
++    {
++        static const int dm[4][4] = {{-4, 0, -3, 1}, {2, -2, 3, -1}, {-3, 1, -4, 0}, {3, -1, 2, -2}};
++        for (int y = 0; y < 16; y++)
++            for (int x = 0; x < 16; x++)
++            {
++                uint32_t c = rgb[y * 16 + x];
++                int d = dither ? dm[y & 3][x & 3] : 0;
++                int r = clampi(static_cast<int>(c & 255) + d, 0, 255) >> 3, g = clampi(static_cast<int>((c >> 8) & 255) + d, 0, 255) >> 3,
++                    b = clampi(static_cast<int>((c >> 16) & 255) + d, 0, 255) >> 3;
++                int a = (c >> 24) == 0x40 ? 0 : (c >> 24) ? 1 : 0;
++                o[y * 16 + x] = static_cast<uint16_t>(r | (g << 5) | (b << 10) | (a << 15));
++            }
++    }
++    // after a macroblock: look for a start code at the next byte boundary (SCD) or garbage (ECD)
++    void check_start_code()
++    {
++        if (ubits(8) == 0)
++        {
++            ipu.bp = (ipu.bp + 7) & ~7;
++            dump(0);
++            for (;;)
++            {
++                uint32_t s = ubits(24);
++                if (s)
++                {
++                    if (s == 1)
++                        ipu.ctrl |= CTRL_SCD;
++                    else
++                        ipu.ctrl |= CTRL_ECD;
++                    break;
++                }
++                dump(8);
++            }
++        }
++        ipu.top = peek32();
++    }
++
++    // ------------------------------------------------------------------ commands
++    void cmd_bdec(uint32_t v)
++    {
++        int intra = (v >> 27) & 1, dcr = (v >> 26) & 1, field = (v >> 25) & 1, qsc = (v >> 16) & 31;
++        if (dcr)
++            ipu.dc_pred[0] = ipu.dc_pred[1] = ipu.dc_pred[2] = 128 << ctrl_idp();
++        ipu.ctrl &= ~CTRL_ECD;
++        int cbp = 0x3f;
++        if (!intra)
++        {
++            const VlcEnt *e = vlc_get(&v_cbp);
++            dump(e->len);
++            cbp = e->a;
++        }
++        ipu.cbp = cbp;
++        static MB16 mb;
++        decode_mb_blocks(&mb, intra, cbp, field, quant_scale(qsc));
++        ipu.ctrl &= ~CTRL_SCD;
++        out_block(&mb, sizeof mb / 16);
++        check_start_code();
++    }
++    void cmd_idec(uint32_t v)
++    {
++        int qsc = (v >> 16) & 31, dtd = (v >> 24) & 1, sgn = (v >> 25) & 1, dte = (v >> 26) & 1, ofm = (v >> 27) & 1;
++        int qs = quant_scale(qsc);
++        ipu.ctrl = (ipu.ctrl & ~(7u << 24)) | (1u << 24); // PCT = I
++        ipu.dc_pred[0] = ipu.dc_pred[1] = ipu.dc_pred[2] = 128 << ctrl_idp();
++        ipu.ctrl &= ~CTRL_ECD;
++        static MB16 mb;
++        static MB8 m8;
++        static uint32_t rgb[256];
++        static uint16_t rgb16[256];
++        for (;;)
++        {
++            const VlcEnt *e = vlc_get(&v_mbt[0]);
++            dump(e->len);
++            int modes = e->a;
++            if (!e->len)
++            {
++                ipu.ctrl |= CTRL_ECD;
++                break;
++            }
++            int field = dtd ? static_cast<int>(gbits(1)) : 0;
++            if (modes & 0x10)
++                qs = quant_scale(static_cast<int>(gbits(5)));
++            decode_mb_blocks(&mb, 1, 0x3f, field, qs);
++            for (int i = 0; i < 256; i++)
++                (&m8.y[0][0])[i] = static_cast<uint8_t>((&mb.y[0][0])[i]);
++            for (int i = 0; i < 64; i++)
++            {
++                (&m8.cb[0][0])[i] = static_cast<uint8_t>((&mb.cb[0][0])[i]);
++                (&m8.cr[0][0])[i] = static_cast<uint8_t>((&mb.cr[0][0])[i]);
++            }
++            csc_rgb32(&m8, rgb);
++            if (sgn)
++                for (int i = 0; i < 256; i++)
++                    rgb[i] ^= 0x808080u;
++            if (ofm)
++            {
++                rgb32_to_16(rgb, rgb16, dte);
++                out_block(rgb16, 32);
++            }
++            else
++                out_block(rgb, 64);
++            // next macroblock address increment: anything but "1" (no skips in I slices) ends the slice
++            int inc = 0;
++            for (;;)
++            {
++                if (ubits(11) == 8) // escape
++                {
++                    dump(11);
++                    inc += 33;
++                    continue;
++                }
++                if (ubits(11) == 15) // stuffing
++                {
++                    dump(11);
++                    continue;
++                }
++                const VlcEnt *a = vlc_get(&v_mbai);
++                if (!a->len || a->a > 33)
++                {
++                    inc = -1;
++                    break;
++                }
++                dump(a->len);
++                inc += a->a;
++                break;
++            }
++            if (inc < 0)
++                break;
++            if (inc > 1)
++                ipu.dc_pred[0] = ipu.dc_pred[1] = ipu.dc_pred[2] = 128 << ctrl_idp();
++        }
++        ipu.cbp = 0x3f;
++        ipu.ctrl &= ~(CTRL_SCD | CTRL_ECD);
++        check_start_code();
++    }
++    void cmd_vdec(uint32_t v)
++    {
++        int tbl = (v >> 26) & 3;
++        uint32_t data = 0;
++        switch (tbl)
++        {
++        case 0: // macroblock address increment
++        {
++            const VlcEnt *e = vlc_get(&v_mbai);
++            if (e->len)
++            {
++                dump(e->len);
++                data = static_cast<uint32_t>(e->a) | (static_cast<uint32_t>(e->len) << 16);
++            }
++            break;
++        }
++        case 1: // macroblock type for the picture type in IPU_CTRL
++        {
++            int pct = ctrl_pct();
++            if (pct < 1 || pct > 3)
++                pct = 1;
++            const VlcEnt *e = vlc_get(&v_mbt[pct - 1]);
++            if (e->len)
++            {
++                dump(e->len);
++                data = static_cast<uint32_t>(e->a);
++                if (pct == 2 && (e->a & 0x08))
++                    data |= 0x80; // frame motion type
++                if (pct == 3)
++                    data |= 0x80 | (static_cast<uint32_t>(e->len) << 16);
++            }
++            break;
++        }
++        case 2: // motion code
++        {
++            const VlcEnt *e = vlc_get(&v_mv);
++            if (e->len)
++            {
++                dump(e->len);
++                if (e->a == 0)
++                    data = 0x00010000;
++                else
++                {
++                    int neg = static_cast<int>(gbits(1));
++                    int d = neg ? -e->a : e->a;
++                    data = static_cast<uint32_t>(d) | (static_cast<uint32_t>(e->len) << 16);
++                }
++            }
++            break;
++        }
++        case 3: // dual-prime vector
++        {
++            uint32_t b = ubits(2);
++            if (b < 2)
++            {
++                dump(1);
++                data = 0x00010000;
++            }
++            else
++            {
++                dump(2);
++                data = (b == 2 ? 1u : 0xffffffffu) | (2u << 16);
++            }
++            break;
++        }
++        }
++        ipu.cmd_data = data;
++        if (data == 0)
++            ipu.ctrl |= CTRL_ECD;
++        else
++            ipu.ctrl &= ~CTRL_ECD;
++        ipu.top = peek32();
++    }
++    void cmd_setiq(uint32_t v)
++    {
++        uint8_t *m = (v >> 27) & 1 ? ipu.niq : ipu.iq;
++        for (int i = 0; i < 64; i++)
++            m[i] = static_cast<uint8_t>(gbits(8));
++    }
++    void cmd_setvq()
++    {
++        for (int i = 0; i < 16; i++)
++        {
++            uint16_t lo = static_cast<uint16_t>(gbits(8)), hi = static_cast<uint16_t>(gbits(8));
++            ipu.vqclut[i] = static_cast<uint16_t>(lo | (hi << 8));
++        }
++    }
++    void cmd_csc(uint32_t v)
++    {
++        int mbc = v & 0x7ff, dte = (v >> 26) & 1, ofm = (v >> 27) & 1;
++        static MB8 m;
++        static uint32_t rgb[256];
++        static uint16_t rgb16[256];
++        for (int n = 0; n < mbc; n++)
++        {
++            uint8_t *p = &m.y[0][0];
++            for (int i = 0; i < 384; i++)
++                p[i] = static_cast<uint8_t>(gbits(8));
++            csc_rgb32(&m, rgb);
++            if (ofm)
++            {
++                rgb32_to_16(rgb, rgb16, dte);
++                out_block(rgb16, 32);
++            }
++            else
++                out_block(rgb, 64);
++        }
++    }
++    void cmd_pack(uint32_t v)
++    {
++        int mbc = v & 0x7ff, dte = (v >> 26) & 1, ofm = (v >> 27) & 1;
++        static uint32_t rgb[256];
++        static uint16_t rgb16[256];
++        static uint8_t idx[128];
++        for (int n = 0; n < mbc; n++)
++        {
++            for (int i = 0; i < 256; i++)
++            {
++                uint32_t c = 0;
++                for (int k = 0; k < 4; k++)
++                    c |= gbits(8) << (8 * k);
++                rgb[i] = c;
++            }
++            rgb32_to_16(rgb, rgb16, dte);
++            if (ofm)
++            {
++                out_block(rgb16, 32);
++                continue;
++            }
++            for (int i = 0; i < 256; i += 2) // nearest VQ CLUT entry for each pixel, two per byte
++            {
++                int best[2] = {0, 0};
++                for (int h = 0; h < 2; h++)
++                {
++                    int bd = 1 << 30;
++                    uint16_t c = rgb16[i + h];
++                    for (int k = 0; k < 16; k++)
++                    {
++                        uint16_t q = ipu.vqclut[k];
++                        int dr = (c & 31) - (q & 31), dg = ((c >> 5) & 31) - ((q >> 5) & 31), db = ((c >> 10) & 31) - ((q >> 10) & 31);
++                        int d = dr * dr + dg * dg + db * db;
++                        if (d < bd)
++                        {
++                            bd = d;
++                            best[h] = k;
++                        }
++                    }
++                }
++                idx[i / 2] = static_cast<uint8_t>(best[0] | (best[1] << 4));
++            }
++            out_block(idx, 8);
++        }
++    }
++
++    int pending_skip;
++    void co_entry()
++    {
++        for (;;)
++        {
++            uint32_t v = ipu.cur;
++            if (pending_skip)
++            {
++                need(pending_skip);
++                dump(pending_skip);
++                pending_skip = 0;
++            }
++            switch (v >> 28)
++            {
++            case C_IDEC:
++                cmd_idec(v);
++                break;
++            case C_BDEC:
++                cmd_bdec(v);
++                break;
++            case C_VDEC:
++                cmd_vdec(v);
++                break;
++            case C_FDEC:
++                ipu.cmd_data = peek32();
++                ipu.top = ipu.cmd_data;
++                break;
++            case C_SETIQ:
++                cmd_setiq(v);
++                break;
++            case C_SETVQ:
++                cmd_setvq();
++                break;
++            case C_CSC:
++                cmd_csc(v);
++                break;
++            case C_PACK:
++                cmd_pack(v);
++                break;
++            }
++            co_running = 0;
++            coro_yield(); // finished; the next command restarts the loop
++        }
++    }
++
++    // ------------------------------------------------------------------ driving
++    int ipulog = -1;
++    // the last commands, dumped when a movie's stream runs out (debugging aid)
++    struct HistEntry
++    {
++        uint32_t cmd, data, top;
++        int bp, fp, ifc;
++        uint32_t ctrl;
++    };
++    HistEntry g_hist[32];
++    unsigned g_histN = 0;
++    void finish_cmd()
++    {
++        {
++            static int n;
++            if (ipulog > 1 && n++ < 400000)
++                std::fprintf(stderr, "[ipu]   done %08x -> data %08x top %08x ctrl %08x bp %d fp %d ifc %d\n", ipu.cur, ipu.cmd_data, ipu.top, ipu.ctrl,
++                             ipu.bp, ipu.fp, ipu.ifc);
++        }
++        {
++            g_hist[g_histN % 32] = HistEntry{ipu.cur, ipu.cmd_data, ipu.top, ipu.bp, ipu.fp, ipu.ifc, ipu.ctrl};
++            ++g_histN;
++        }
++        ipu.ctrl &= ~CTRL_BUSY;
++        ipu.cmd_busy = 0;
++        ipu.top_busy = 0;
++        raiseIntc(8);
++    }
++    void (*g_chargeHook)(uint64_t) = nullptr;
++    void pumpImpl();
++    // run until nothing moves: DMA in, coroutine, DMA out; the host time it took is charged to the EE clock
++    void pump()
++    {
++        if (!g_chargeHook || !co_running)
++        {
++            pumpImpl();
++            return;
++        }
++        const auto t0 = std::chrono::steady_clock::now();
++        pumpImpl();
++        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++        if (ns > 0)
++            g_chargeHook(static_cast<uint64_t>(ns));
++    }
++    void pumpImpl()
++    {
++        if (ipulog > 0)
++        {
++            static uint64_t t0;
++            uint64_t now = hostUsec();
++            if (now - t0 > 1000000)
++            {
++                t0 = now;
++                std::fprintf(stderr,
++                             "[ipu] state: cmd %08x running %d wait %d ifc %d fp %d bp %d ofc %d ctrl %08x | d3 chcr %08x madr %08x qwc %x | d4 chcr %08x madr %08x qwc %x tadr %08x end %d\n",
++                             ipu.cur, co_running, co_wait, ipu.ifc, ipu.fp, ipu.bp, ipu.ofc, ipu.ctrl, CHCR(D3), MADR(D3), QWC(D3), CHCR(D4), MADR(D4), QWC(D4),
++                             TADR(D4), ipu.d4_tag_end);
++            }
++        }
++        for (int guard = 0; guard < 100000; guard++)
++        {
++            int progress = d4_fill() + d3_drain();
++            if (co_running)
++            {
++                int can = co_wait == 1 ? (ipu.ifc > 0 || d4_active()) : co_wait == 2 ? (ipu.ofc < 8) : 1;
++                if (can)
++                {
++                    int ifc0 = ipu.ifc, ofc0 = ipu.ofc, fp0 = ipu.fp, bp0 = ipu.bp;
++                    coro_resume();
++                    if (!co_running)
++                        finish_cmd();
++                    progress += !co_running || ipu.ifc != ifc0 || ipu.ofc != ofc0 || ipu.fp != fp0 || ipu.bp != bp0;
++                }
++            }
++            if (!progress)
++                break;
++        }
++    }
++    void co_reset()
++    {
++        if (co_ipu)
++            DeleteFiber(co_ipu); // suspended (never the running fiber here): an unfinished command is abandoned
++        co_ipu = CreateFiber(1u << 18, coFiberProc, nullptr);
++        co_running = 0;
++        co_wait = 0;
++    }
++    std::atomic<int64_t> g_lastCmdNs{0};
++    void start_cmd(uint32_t v)
++    {
++        g_lastCmdNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
++                          std::memory_order_relaxed);
++        tables_init();
++        if (!co_ipu || co_running)
++            co_reset(); // a new command abandons an unfinished one
++        if (ipulog < 0)
++            ipulog = std::getenv("APE2_IPULOG") ? std::atoi(std::getenv("APE2_IPULOG")) : 0;
++        {
++            static int n;
++            if (ipulog > 1 && n++ < 400000)
++                std::fprintf(stderr, "[ipu] cmd %x (%08x) ifc %d fp %d bp %d\n", v >> 28, v, ipu.ifc, ipu.fp, ipu.bp);
++        }
++        {
++            static uint32_t cnt[16], tot;
++            static uint64_t t0;
++            cnt[v >> 28]++;
++            tot++;
++            uint64_t now = hostUsec();
++            if (!t0)
++                t0 = now;
++            if (ipulog && now - t0 > 1000000)
++            {
++                t0 = now;
++                std::fprintf(stderr, "[ipu] 1s: %u cmds: bclr %u idec %u bdec %u vdec %u fdec %u setiq %u csc %u; d3 chcr %x qwc %x d4 chcr %x qwc %x\n", tot, cnt[0],
++                             cnt[1], cnt[2], cnt[3], cnt[4], cnt[5], cnt[7], CHCR(D3), QWC(D3), CHCR(D4), QWC(D4));
++                std::memset(cnt, 0, sizeof cnt);
++                tot = 0;
++            }
++        }
++        ipu.ctrl &= ~(CTRL_ECD | CTRL_SCD);
++        ipu.cur = v;
++        int c = v >> 28;
++        if (c == C_BCLR)
++        {
++            ipu.ifc = ipu.fr = 0;
++            ipu.fp = 0;
++            ipu.bp = v & 0x7f;
++            ipu.ctrl &= ~CTRL_BUSY;
++            ipu.cmd_busy = 0;
++            raiseIntc(8);
++            pump();
++            return;
++        }
++        if (c == C_SETTH)
++        {
++            ipu.th0 = v & 0x1ff;
++            ipu.th1 = (v >> 16) & 0x1ff;
++            ipu.ctrl &= ~CTRL_BUSY;
++            raiseIntc(8);
++            return;
++        }
++        ipu.ctrl |= CTRL_BUSY;
++        if (c == C_VDEC || c == C_FDEC)
++        {
++            ipu.cmd_busy = 0x80000000u;
++            ipu.top_busy = 0x80000000u;
++        }
++        if (c == C_IDEC || c == C_BDEC)
++            ipu.top_busy = 0x80000000u;
++        pending_skip = (c == C_IDEC || c == C_BDEC || c == C_VDEC || c == C_FDEC || c == C_SETIQ) ? static_cast<int>(v & 0x3f) : 0;
++        co_running = 1;
++        co_wait = 0;
++        pump();
++    }
++
++    // the next 32 bits for a register read, without waiting: 0 if not enough data yet
++    int peek32_nb(uint32_t *out)
++    {
++        while (ipu.fp * 128 < ipu.bp + 32)
++        {
++            if (!ipu.ifc)
++                d4_fill();
++            if (!ipu.ifc || ipu.fp >= 2)
++                return 0;
++            std::memcpy(ipu.ib[ipu.fp], ipu.fifo[ipu.fr], 16);
++            ipu.fr = (ipu.fr + 1) & 7;
++            ipu.ifc--;
++            ipu.fp++;
++        }
++        int byte = ipu.bp >> 3, sh = ipu.bp & 7;
++        uint64_t v = 0;
++        for (int i = 0; i < 5; i++)
++            v = (v << 8) | (byte + i < 32 ? (&ipu.ib[0][0])[byte + i] : 0);
++        *out = static_cast<uint32_t>(v >> (8 - sh));
++        return 1;
++    }
++    void soft_reset()
++    {
++        ipu.ifc = ipu.fr = ipu.fp = ipu.bp = 0;
++        ipu.ofc = ipu.or_ = 0;
++        ipu.cbp = 0;
++        ipu.th0 = ipu.th1 = 0;
++        ipu.ctrl &= 0x7f33f00u;
++        ipu.top = 0;
++        ipu.top_busy = 0;
++        ipu.cmd_data = 0;
++        ipu.cmd_busy = 0;
++        if (co_ipu)
++            co_reset();
++        raiseIntc(8);
++    }
++}
++
++namespace ps2ipu
++{
++    void setHost(const Host &host)
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        g_host = host;
++    }
++
++    bool handles(uint32_t a) { return (a & 0xffffff00u) == 0x10002000u; }
++
++    uint64_t read64(uint32_t a)
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        pump();
++        // End of a movie. libmpeg feeds the IPU whole qwords from its ring, so the last bytes of the video
++        // stream - the sequence end code 00 00 01 B7 after the zero padding - wait there for more data that never
++        // comes, and libmpeg scans the padding for the next start code forever (a white screen after every
++        // movie). The game's own end path sends exactly one qword "00 00 01 B7" to the IPU (its background
++        // callback, 0x1A9248, once its error callback 0x1A9238 has flagged the end). When a command has waited
++        // for input for APE2_IPU_EOS_MS (default 500) with the toIPU DMA idle, that qword is put into the input
++        // FIFO, once per stall (0 disables).
++        {
++            static const long long eosMs = [] { const char *e = std::getenv("APE2_IPU_EOS_MS"); return e ? std::atoll(e) : 500LL; }();
++            static bool starving = false, fed = false;
++            static std::chrono::steady_clock::time_point since{};
++            if (eosMs > 0 && co_running && co_wait == 1 && !ipu.ifc && !d4_active())
++            {
++                const auto now = std::chrono::steady_clock::now();
++                if (!starving)
++                {
++                    starving = true;
++                    fed = false;
++                    since = now;
++                }
++                else if (!fed && now - since > std::chrono::milliseconds(eosMs))
++                {
++                    fed = true;
++                    static const uint8_t seqEnd[16] = {0x00, 0x00, 0x01, 0xB7};
++                    std::memcpy(ipu.fifo[(ipu.fr + ipu.ifc) & 7], seqEnd, 16);
++                    ipu.ifc++;
++                    static int reports = 0;
++                    if (reports++ < 8)
++                        std::fprintf(stderr, "[ipu] stream ran out mid-scan (cmd %08x): sequence end code fed\n", ipu.cur);
++                    pump();
++                }
++            }
++            else
++                starving = false;
++        }
++        switch (a & 0xf0)
++        {
++        case 0x00:
++        {
++            int c = ipu.cur >> 28;
++            if (!(ipu.ctrl & CTRL_BUSY) && c != C_VDEC && c != C_FDEC)
++            {
++                uint32_t t;
++                if (peek32_nb(&t))
++                    ipu.cmd_data = t;
++            }
++            {
++                static unsigned long long reads = 0;
++                if (ipulog > 1 && ((++reads & 0xFFFFFu) == 0u || reads < 4u))
++                    std::fprintf(stderr, "[ipu] read cmd #%llu: data %08x busy %08x cur %08x running %d wait %d ifc %d fp %d d4 chcr %08x qwc %x\n", reads, ipu.cmd_data,
++                                 ipu.cmd_busy, ipu.cur, co_running, co_wait, ipu.ifc, ipu.fp, CHCR(D4), QWC(D4));
++            }
++            return ipu.cmd_data | (static_cast<uint64_t>(ipu.cmd_busy) << 32);
++        }
++        case 0x10:
++            return (ipu.ctrl & ~0x3fffu) | static_cast<uint32_t>(ipu.ifc) | (static_cast<uint32_t>(ipu.ofc) << 4) |
++                   (static_cast<uint32_t>(ipu.cbp & 63) << 8);
++        case 0x20:
++            return static_cast<uint32_t>(ipu.bp & 0x7f) | (static_cast<uint32_t>(ipu.ifc) << 8) | (static_cast<uint32_t>(ipu.fp) << 16);
++        case 0x30:
++        {
++            if (!(ipu.ctrl & CTRL_BUSY))
++            {
++                uint32_t t;
++                if (peek32_nb(&t))
++                {
++                    ipu.top = t;
++                    ipu.top_busy = 0;
++                }
++                else
++                    ipu.top_busy = 0x80000000u;
++            }
++            return ipu.top | (static_cast<uint64_t>(ipu.top_busy) << 32);
++        }
++        }
++        return 0;
++    }
++
++    uint32_t read32(uint32_t a)
++    {
++        uint64_t v = read64(a & ~7u);
++        return (a & 4) ? static_cast<uint32_t>(v >> 32) : static_cast<uint32_t>(v);
++    }
++
++    void write32(uint32_t a, uint32_t v)
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        switch (a & 0xf4)
++        {
++        case 0x00:
++            start_cmd(v);
++            break;
++        case 0x10:
++            ipu.ctrl = (v & 0x47f30000u) | (ipu.ctrl & 0x8000ffffu);
++            if (((ipu.ctrl >> 16) & 3) == 3)
++                ipu.ctrl = (ipu.ctrl & ~(3u << 16)) | (1u << 16);
++            if (v & (1u << 30))
++                soft_reset();
++            ipu.ctrl &= ~(1u << 30);
++            break;
++        }
++    }
++
++    // FIFO registers: 0x10007000 output (read), 0x10007010 input (write)
++    void fifoRead(uint8_t out[16])
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        pump();
++        if (ipu.ofc)
++        {
++            std::memcpy(out, ipu.ofifo[ipu.or_], 16);
++            ipu.or_ = (ipu.or_ + 1) & 7;
++            ipu.ofc--;
++        }
++        else
++            std::memset(out, 0, 16);
++        pump();
++    }
++
++    void fifoWrite(const uint8_t in[16])
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        if (ipu.ifc < 8)
++        {
++            std::memcpy(ipu.fifo[(ipu.fr + ipu.ifc) & 7], in, 16);
++            ipu.ifc++;
++        }
++        pump();
++    }
++
++    void dmaStart(int ch)
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        if (ch == 4)
++        {
++            uint32_t chcr = CHCR(D4);
++            int chain = ((chcr >> 2) & 3) == 1;
++            if (!chain)
++            {
++                ipu.d4_tag_active = 1;
++                ipu.d4_tag_end = 1;
++            }
++            else if ((QWC(D4) & 0xffff) == 0)
++            {
++                ipu.d4_tag_active = 0;
++                ipu.d4_tag_end = 0;
++            }
++            else // resuming inside a tag: does it end the chain?
++            {
++                uint32_t id = (chcr >> 28) & 7, irq = chcr >> 31;
++                ipu.d4_tag_active = 1;
++                ipu.d4_tag_end = id == 0 || id == 7 || (irq && (chcr & 0x80));
++            }
++        }
++        pump();
++    }
++
++    bool activeWithin(int ms)
++    {
++        const int64_t last = g_lastCmdNs.load(std::memory_order_relaxed);
++        if (last == 0)
++            return false;
++        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        return now - last < static_cast<int64_t>(ms) * 1000000;
++    }
++
++    void setChargeHook(void (*hook)(uint64_t hostNs))
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        g_chargeHook = hook;
++    }
++
++    void poll()
++    {
++        std::lock_guard<std::recursive_mutex> lock(g_lock);
++        if (co_running || ipu.ofc || ipu.ifc)
++            pump();
++    }
++}
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index f47177c..49854bd 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "ps2_log.h"
+ #include "ps2_perf.h"
++#include "runtime/ps2_ipu.h"
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -323,6 +324,31 @@ PS2Memory::~PS2Memory()
+     }
+ }
+ 
++// 0061: the IPU (ps2_ipu.cpp) reaches DMA channels 3/4, memory and the interrupt queues through these
++static void ape2EnsureIpuHost(PS2Memory *m)
++{
++    static bool done = false;
++    if (done)
++        return;
++    done = true;
++    for (uint32_t base : {0x1000B000u, 0x1000B400u})
++        for (uint32_t off = 0; off <= 0x50u; off += 0x10u)
++            (void)m->m_ioRegisters[base + off]; // the IPU keeps references to these
++    ps2ipu::Host h;
++    h.user = m;
++    h.reg = [](void *u, uint32_t a) -> uint32_t & { return static_cast<PS2Memory *>(u)->m_ioRegisters[a]; };
++    h.mem = [](void *u, uint32_t a) -> uint8_t *
++    {
++        PS2Memory *mm = static_cast<PS2Memory *>(u);
++        if (a & 0x80000000u)
++            return mm->getScratchpad() + (a & 0x3FF0u);
++        return mm->getRDRAM() + (a & (PS2_RAM_SIZE - 16u));
++    };
++    h.dmaDone = [](void *u, int ch) { static_cast<PS2Memory *>(u)->completeDmacChannel(ch == 3 ? 0x1000B000u : 0x1000B400u, static_cast<uint32_t>(ch)); };
++    h.intc = [](void *u, int cause) { static_cast<PS2Memory *>(u)->queueCompletedDmacCause(0x100u | static_cast<uint32_t>(cause)); };
++    ps2ipu::setHost(h);
++}
++
+ bool PS2Memory::initialize(size_t ramSize)
+ {
+     auto cleanup = [this]()
+@@ -864,6 +890,11 @@ uint64_t PS2Memory::read64(uint32_t address)
+         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
+     }
+ 
++    if (ps2ipu::handles(address)) // 0061: IPU_CMD / IPU_TOP carry their BUSY bit in the upper word
++    {
++        ape2EnsureIpuHost(this);
++        return ps2ipu::read64(address);
++    }
+     // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
+     // to avoid any side-effects from read32 handlers.
+     if (isIoRegister(address))
+@@ -903,6 +934,13 @@ __m128i PS2Memory::read128(uint32_t address)
+         return _mm_loadu_si128(reinterpret_cast<const __m128i *>(vuMem + vuOffset));
+     }
+ 
++    if (physAddr == 0x10007000u) // 0061: IPU output FIFO
++    {
++        ape2EnsureIpuHost(this);
++        alignas(16) uint8_t fifoData[16];
++        ps2ipu::fifoRead(fifoData);
++        return _mm_loadu_si128(reinterpret_cast<const __m128i *>(fifoData));
++    }
+     // 128-bit reads are primarily for quad-word loads in the EE, which are only valid for RAM areas
+     // Return zeroes for unsupported areas
+     return _mm_setzero_si128();
+@@ -1124,6 +1162,14 @@ void PS2Memory::write128(uint32_t address, __m128i value)
+         processVIF0Data(fifoData, sizeof(fifoData));
+         return;
+     }
++    if (!scratch && physAddr == 0x10007010u) // 0061: IPU input FIFO
++    {
++        ape2EnsureIpuHost(this);
++        alignas(16) uint8_t fifoData[16];
++        _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
++        ps2ipu::fifoWrite(fifoData);
++        return;
++    }
+     if (!scratch && physAddr == 0x10005000u) // VIF1_FIFO
+     {
+         syncGsWorker(2);
+@@ -1254,22 +1300,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+         return true;
+     }
+ 
+-    if (address >= 0x10002000 && address <= 0x10002030)
++    if (ps2ipu::handles(address)) // 0061: the IPU
+     {
+-        if (address == 0x10002010)
+-        {
+-            m_ioRegisters[address] = value & ~(1u << 31);
+-            if (value & (1u << 30))
+-            {
+-                m_ioRegisters[0x10002000] = 0;
+-                m_ioRegisters[0x10002020] = 0;
+-                m_ioRegisters[0x10002030] = 0;
+-            }
+-        }
+-        else
+-        {
+-            m_ioRegisters[address] = value;
+-        }
++        ape2EnsureIpuHost(this);
++        ps2ipu::write32(address, value);
+         return true;
+     }
+ 
+@@ -1378,6 +1412,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             }
+ 
+             const uint32_t channelBase = address & 0xFFFFFF00;
++            if (channelBase == 0x1000B000u || channelBase == 0x1000B400u) // 0061: fromIPU / toIPU
++            {
++                ape2EnsureIpuHost(this);
++                ps2ipu::dmaStart(channelBase == 0x1000B000u ? 3 : 4);
++                return true;
++            }
+             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+@@ -2959,26 +2999,15 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
+         return 0u;
+     }
+ 
+-    if (address >= 0x10002000 && address <= 0x10002030)
++    if (ps2ipu::handles(address)) // 0061: the IPU
+     {
+-        uint32_t val = 0;
+-        switch (address)
+-        {
+-        case 0x10002000:
+-            val = m_ioRegisters[address];
+-            break;
+-        case 0x10002010:
+-            val = m_ioRegisters[address] & ~(1u << 31);
+-            break;
+-        case 0x10002020:
+-        case 0x10002030:
+-            val = m_ioRegisters[address];
+-            break;
+-        default:
+-            val = 0;
+-            break;
+-        }
+-        return val;
++        ape2EnsureIpuHost(this);
++        return ps2ipu::read32(address);
++    }
++    if (address == 0x1000B000u || address == 0x1000B400u) // IPU DMA CHCR, polled for completion
++    {
++        ape2EnsureIpuHost(this);
++        ps2ipu::poll();
+     }
+ 
+     if (address == 0x10003020u) // GIF_STAT
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 16da898..970b44e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1653,7 +1653,10 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+ {
+     for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+     {
+-        ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
++        if (cause & 0x100u) // 0061: an INTC cause (the IPU's), queued with the DMAC ones
++            eeScheduler().dispatchIrq(false, cause & 0xFFu);
++        else
++            ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+     }
+ }
+ 

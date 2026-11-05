@@ -3957,3 +3957,51 @@ With working A/Bs (title burst at frame 2400, `scratchpad/runtburst.cmd`):
 Title burst after 0060: clean in every sampled frame. Also kept for later: `APE2_PIXPROBE=x,y/x,y` (software
 renderer, during a burst: every write reaching the depth test at those pixels) - note the display is a copy of
 another buffer, so screen and frame-buffer coordinates need not match.
+### 0228 - FMVs play: the IPU, a recompiler branch fix, the movie clock and the end of a movie (0061)
+
+Movies were skipped at start since 0024. Now they play, with sound, and end into the game. Steps, in order:
+
+- IPU: `ps2_ipu.cpp`, a port of the PAL port's `port/src/ipu.c` (JackyPendrag0n/ae2-recomp; the decoder unchanged,
+  the coroutine a Windows fiber), behind the IPU registers, the 0x10007000/0x10007010 FIFOs and DMA channels 3/4
+  (`ps2_memory.cpp`); its interrupt (INTC 8) is queued with the DMAC causes and dispatched in
+  `drainCompletedDmacHandlers`. The 17 libmpeg/libipu stubs are gone from `config/ape2.toml`, so the game's own
+  libmpeg runs. Movie skips are opt-in (`APE2_MOVIES=0`; `APE2_MOVIES=firstframe` for the old skipfmv).
+- Recompiler bug, all game code: BLEZ/BGTZ/BLTZ/BGEZ(+L/AL) were emitted as 32-bit tests (`GPR_S32`); the R5900
+  tests the whole 64-bit register (the PAL port's recompiler uses 64-bit `RS()`). libmpeg's IPU wait loop
+  (0x374558) reads IPU_CMD with `ld` and branches `bgez`: whenever the data word had bit 31 set it read as busy
+  forever (first movie stuck at its 4th FDEC). `control_flow_emitter.cpp` now emits `GPR_S64`. 1589 generated
+  files changed; 32-bit writes sign-extend (`SET_GPR_U32`), so ordinary code is unaffected; player-tested.
+- Colour conversion on the host (`overrides/zz_ape2_mvconv.cpp`, the PAL port's hle_mvconv, NTSC 0x1A6D18, frame
+  ring 0x3DF5C0, size getters 0x1A4350/0x1A4370): the game's VU1 program drew 262144 points per vsync (VU1 99%,
+  1.5 fps).
+- libmpeg's IPU wait without its 5000 idle polls (`overrides/zz_ape2_mpegwait.cpp`: a copy of the generated
+  0x374558 with the limit 1, the PAL port's hle_mpeg_wait idea; a C++ loop could not yield to the threads that
+  feed it, and stalled). 125 -> 425 movie frames in the same time.
+- The movie clock. Events (vsync, timers) fire when the EE cycle count reaches them, and host work the guest is
+  not charged for (the IPU's decoding, register accesses, the scheduler) left it at a quarter of real time in the
+  FMVs: everything, sound included, played slow - and every run converted the same number of frames, the tell
+  that progress was paced by emulated time, not the CPU. Now: the IPU's host time is charged to the EE clock
+  (`ps2ipu::setChargeHook`), and while a movie plays (an IPU command in the last 200 ms) a pending vsync whose
+  real-time deadline is 2 ms past brings the cycle count up to it (`EeScheduler::checkpointDue`). Measured on
+  the way: a wall-clock version overflowed after a minute and ratcheted on re-anchors (EE 11x real time), and an
+  always-on version froze a stage seconds after the New Game movie and cost gameplay fps (player) - hence
+  movie-only. `APE2_EE_CATCHUP=0/always`, `APE2_IPU_CHARGE=0`, `APE2_CATCHUP_LOG=1` ([ee:clock] MHz).
+- The IOP ran at twice real time once the EE clock kept up: 0131 advances it by the wall time of each guest
+  dispatch on top of the EE cycles' share; now only by the shortfall (movie sound too fast; iop:rate 65 -> 40).
+- The end of a movie: a white screen. libmpeg feeds the IPU whole qwords, so the video stream's last bytes (the
+  sequence end code 00 00 01 B7 after zero padding) never arrive and libmpeg scans the padding forever. The game
+  ends a movie by sending one qword "00 00 01 B7" itself (background callback 0x1A9248, once its error callback
+  0x1A9238 has flagged the end). The IPU now feeds that qword when a command has waited 500 ms for input with the
+  toIPU DMA idle (`APE2_IPU_EOS_MS`). Tried first: ECD (libmpeg cleared it and scanned on), and letting the disc
+  stream run past the file's end (`APE2_CDST_PASTEND=1`, now opt-in: it kept the movie thread reading zeros
+  after D2, a freeze and lower fps).
+- Smaller: RotateThreadReadyQueue returns at once when nobody else is ready at that priority;
+  `APE2_ROT_MIN_US` yield throttle (default off, no gain measured).
+- Mip level per triangle is now the nearest corner's (not the average): less blur near the camera
+  (`APE2_MIPPICK=avg`).
+
+Player: the intro ends into the title, New Game's movie into the stage, START skips, no freeze; movies "still a
+tad slow but better", some slowdowns in movies and gameplay. Open: frame rate (gameplay ~48 fps, the GS thread
+74% busy: ~56 destination reads and ~35 texture uploads per frame), and light green bands where the mip level
+changes on the floors (the game asks for trilinear filtering; we pick one level per triangle - the PAL port
+does the same).
