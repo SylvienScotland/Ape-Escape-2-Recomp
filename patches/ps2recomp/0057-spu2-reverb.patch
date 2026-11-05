@@ -1,0 +1,230 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index f52ed43..ccf7b47 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -21,6 +21,38 @@ namespace ps2x::iop::detail
+         constexpr uint32_t kPmon = 0x180u, kNon = 0x184u, kVmixl = 0x188u, kVmixel = 0x18Cu, kVmixr = 0x190u,
+                            kVmixer = 0x194u, kMmix = 0x198u, kAttr = 0x19Au, kIrqa = 0x19Cu, kKon = 0x1A0u,
+                            kKoff = 0x1A4u, kTsa = 0x1A8u, kData = 0x1ACu, kEndx = 0x340u;
++        constexpr uint32_t kEsa = 0x2E0u, kFxAddr = 0x2E4u, kEea = 0x33Cu;
++        // fxAddr[] order (0x2E4 + 4*i), named as the PAL port's PS1-order registers
++        enum
++        {
++            F_dAPF1, F_dAPF2, F_mLSAME, F_mRSAME, F_mLCOMB1, F_mRCOMB1, F_mLCOMB2, F_mRCOMB2, F_dLSAME, F_dRSAME,
++            F_mLDIFF, F_mRDIFF, F_mLCOMB3, F_mRCOMB3, F_mLCOMB4, F_mRCOMB4, F_dLDIFF, F_dRDIFF, F_mLAPF1, F_mRAPF1,
++            F_mLAPF2, F_mRAPF2
++        };
++        enum
++        {
++            V_vIIR, V_vCOMB1, V_vCOMB2, V_vCOMB3, V_vCOMB4, V_vWALL, V_vAPF1, V_vAPF2, V_vLIN, V_vRIN
++        };
++        // the half-band filter (symmetric, 39 taps; the odd taps are zero but the centre's)
++        constexpr int16_t kRvFir[20] = {-0x0001, 0, 0x0002, 0, -0x000A, 0, 0x0023, 0, -0x0067, 0,
++                                        0x010A,  0, -0x0268, 0, 0x0534, 0, -0x0B90, 0, 0x2806, 0x4000};
++        inline int32_t clamp16(int32_t v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
++        inline int32_t rvFirAt(const int32_t *h, uint32_t pos) // h: 64-entry ring, newest at pos
++        {
++            int64_t a = static_cast<int64_t>(kRvFir[19]) * h[(pos - 19) & 63];
++            for (int k = 0; k < 19; ++k)
++                a += static_cast<int64_t>(kRvFir[k]) * (h[(pos - k) & 63] + h[(pos - 38 + k) & 63]);
++            return static_cast<int32_t>(a >> 15);
++        }
++        bool reverbDisabled()
++        {
++            static const bool off = [] {
++                const char *e = std::getenv("APE2_REVERB");
++                return e != nullptr && std::strcmp(e, "0") == 0;
++            }();
++            return off;
++        }
++
+         constexpr uint32_t kVoiceAddrBase = 0x1C0u; // 24 voices x 0xC: SSA hi/lo, LSAX hi/lo, NAX hi/lo
+         constexpr uint32_t kVoiceAddrEnd = kVoiceAddrBase + 24u * 0xCu;
+         // Volume block, 0x28 per core from 0x760: MVOL L/R, EVOL L/R, AVOL L/R, BVOL L/R, MVOLX L/R.
+@@ -102,7 +134,13 @@ namespace ps2x::iop::detail
+             case 5: c.avolr = value; break;
+             case 6: c.bvoll = value; break;
+             case 7: c.bvolr = value; break;
+-            default: break;
++            default:
++            {
++                const int idx = static_cast<int>(((off - kVolBase) % kVolStride) >> 1) - 10; // 0x774..: effect volumes
++                if (idx >= 0 && idx < 10)
++                    c.fxVol[idx] = static_cast<int16_t>(value);
++                break;
++            }
+             }
+             return;
+         }
+@@ -144,6 +182,22 @@ namespace ps2x::iop::detail
+                 v.nax = addr;
+             return;
+         }
++        if (r >= kEsa && r < kEea + 2u) // effect work area and delay addresses (halfword units)
++        {
++            if (r < kEsa + 4u)
++                c.esa = pairAddress(base + kEsa) >> 1;
++            else if (r < kEea)
++            {
++                const uint32_t idx = (r - kFxAddr) >> 2;
++                c.fxAddr[idx] = pairAddress(base + kFxAddr + idx * 4u) >> 1;
++            }
++            else if (r == kEea)
++                c.eea = (static_cast<uint32_t>(value & 0xFu) << 16) | 0xFFFFu;
++            static unsigned logged = 0u;
++            if (std::getenv("APE2_SPU2_FXLOG") != nullptr && logged++ < 120u)
++                std::fprintf(stderr, "[spu2:fx] core%d reg 0x%03x = 0x%04x%c", ci, r, value, 10);
++            return;
++        }
+         switch (r)
+         {
+         case kPmon: c.pmon = (c.pmon & 0xFF0000u) | value; break;
+@@ -417,6 +471,64 @@ namespace ps2x::iop::detail
+         return static_cast<int16_t>((out * v.env) >> 15);
+     }
+ 
++    // ------------------------------------------------------------------ reverb (PAL spu2.c)
++    // The PS1/PS2 effect unit. It runs at half the output rate, one channel per output sample (left on even
++    // samples, right on odd ones), through a 39-tap half-band filter each way, with all of its delay lines in the
++    // core's work area of sound memory (ESA..EEA), which moves on by one halfword every two samples.
++    int32_t IopSpu2::reverbStep(Core &c, int R, int32_t in)
++    {
++        if (c.eea <= c.esa)
++            return 0;
++        const uint32_t span = c.eea - c.esa + 1u;
++        int16_t *m = reinterpret_cast<int16_t *>(m_ram.data());
++        const auto RA = [&](int64_t off) {
++            int64_t x = (static_cast<int64_t>(c.rvPos) + off) % static_cast<int64_t>(span);
++            if (x < 0)
++                x += span;
++            return (c.esa + static_cast<uint32_t>(x)) & (kRamSize / 2u - 1u);
++        };
++        const auto REG = [&](int n) { return static_cast<int32_t>(c.fxAddr[n]); };
++        const auto MUL = [](int32_t a, int32_t b) { return (a * b) >> 15; };
++        const int16_t *v = c.fxVol;
++        const int32_t same_dst = REG(R ? F_mRSAME : F_mLSAME), same_src = REG(R ? F_dRSAME : F_dLSAME);
++        const int32_t diff_dst = REG(R ? F_mRDIFF : F_mLDIFF), diff_src = REG(R ? F_dLDIFF : F_dRDIFF);
++        const int32_t apf1_dst = REG(R ? F_mRAPF1 : F_mLAPF1), apf2_dst = REG(R ? F_mRAPF2 : F_mLAPF2);
++        const int32_t apf1_src = apf1_dst - REG(F_dAPF1), apf2_src = apf2_dst - REG(F_dAPF2);
++        const int32_t x = MUL(v[R ? V_vRIN : V_vLIN], in);
++        const int32_t sp = m[RA(same_dst - 1)], dp = m[RA(diff_dst - 1)];
++        const int32_t same = MUL(v[V_vIIR], x + MUL(v[V_vWALL], m[RA(same_src)]) - sp) + sp;
++        const int32_t diff = MUL(v[V_vIIR], x + MUL(v[V_vWALL], m[RA(diff_src)]) - dp) + dp;
++        int32_t out = MUL(v[V_vCOMB1], m[RA(REG(R ? F_mRCOMB1 : F_mLCOMB1))]) +
++                      MUL(v[V_vCOMB2], m[RA(REG(R ? F_mRCOMB2 : F_mLCOMB2))]) +
++                      MUL(v[V_vCOMB3], m[RA(REG(R ? F_mRCOMB3 : F_mLCOMB3))]) +
++                      MUL(v[V_vCOMB4], m[RA(REG(R ? F_mRCOMB4 : F_mLCOMB4))]);
++        const int32_t a1s = m[RA(apf1_src)], a1 = out - MUL(v[V_vAPF1], a1s);
++        out = a1s + MUL(v[V_vAPF1], a1);
++        const int32_t a2s = m[RA(apf2_src)], a2 = out - MUL(v[V_vAPF2], a2s);
++        out = a2s + MUL(v[V_vAPF2], a2);
++        m[RA(same_dst)] = static_cast<int16_t>(clamp16(same));
++        m[RA(diff_dst)] = static_cast<int16_t>(clamp16(diff));
++        m[RA(apf1_dst)] = static_cast<int16_t>(clamp16(a1));
++        m[RA(apf2_dst)] = static_cast<int16_t>(clamp16(a2));
++        return clamp16(out);
++    }
++
++    // the core's effect output for this 48 kHz sample, from its wet input
++    void IopSpu2::reverb(Core &c, int32_t wl, int32_t wr, int32_t &ol, int32_t &orr)
++    {
++        const uint32_t p = ++c.rvHp & 63;
++        c.rvIn[0][p] = clamp16(wl);
++        c.rvIn[1][p] = clamp16(wr);
++        const int R = c.rvPhase & 1;
++        const int32_t y = reverbStep(c, R, rvFirAt(c.rvIn[R], p));
++        c.rvOut[R][p] = y;
++        c.rvOut[!R][p] = 0;
++        if (!(++c.rvPhase & 1) && ++c.rvPos > c.eea - c.esa)
++            c.rvPos = 0; // one halfword on every two samples
++        ol = clamp16(rvFirAt(c.rvOut[0], p) * 2);
++        orr = clamp16(rvFirAt(c.rvOut[1], p) * 2);
++    }
++
+     int IopSpu2::activeVoices() const noexcept
+     {
+         int count = 0;
+@@ -433,10 +545,11 @@ namespace ps2x::iop::detail
+         for (size_t f = 0; f < frames; ++f)
+         {
+             int32_t ol = 0, orr = 0;
++            int32_t extL = 0, extR = 0; // core 0's output, core 1's external input
+             for (int ci = 0; ci < kCores; ++ci)
+             {
+                 Core &c = m_cores[ci];
+-                int32_t dl = 0, dr = 0;
++                int32_t dl = 0, dr = 0, wl = 0, wr = 0;
+                 for (int vi = 0; vi < kVoices; ++vi)
+                 {
+                     Voice &v = c.v[vi];
+@@ -445,13 +558,42 @@ namespace ps2x::iop::detail
+                     const int32_t s = voiceSample(c, vi);
+                     v.volxl = volStep(v.voll, v.volxl);
+                     v.volxr = volStep(v.volr, v.volxr);
++                    const int32_t sl = (s * v.volxl) >> 15, sr = (s * v.volxr) >> 15;
+                     if (c.vmixl & (1u << vi))
+-                        dl += (s * v.volxl) >> 15;
++                        dl += sl;
+                     if (c.vmixr & (1u << vi))
+-                        dr += (s * v.volxr) >> 15;
++                        dr += sr;
++                    if (c.vmixel & (1u << vi))
++                        wl += sl;
++                    if (c.vmixer & (1u << vi))
++                        wr += sr;
++                }
++                // MMIX gates for the effect input: voices (0x200/0x100), core 0 into core 1 (2/1)
++                if (!(c.mmix & 0x200u))
++                    wl = 0;
++                if (!(c.mmix & 0x100u))
++                    wr = 0;
++                if (ci == 1)
++                {
++                    if (c.mmix & 2u)
++                        wl += extL;
++                    if (c.mmix & 1u)
++                        wr += extR;
++                }
++                if ((c.attr & 0x80u) && !reverbDisabled()) // ATTR bit 7: effects enabled
++                {
++                    int32_t el, er;
++                    reverb(c, wl, wr, el, er);
++                    dl += (el * static_cast<int16_t>(c.evoll)) >> 15;
++                    dr += (er * static_cast<int16_t>(c.evolr)) >> 15;
+                 }
+                 const int32_t mvl = m_mvolWritten ? fixedVol(c.mvoll) : 0x7fff;
+                 const int32_t mvr = m_mvolWritten ? fixedVol(c.mvolr) : 0x7fff;
++                if (ci == 0)
++                {
++                    extL = (dl * mvl) >> 15;
++                    extR = (dr * mvr) >> 15;
++                }
+                 ol += (dl * mvl) >> 15;
+                 orr += (dr * mvr) >> 15;
+             }
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index 1760cca..13b6392 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -83,6 +83,12 @@ namespace ps2x::iop::detail
+             uint16_t mmix = 0, attr = 0;
+             uint16_t mvoll = 0, mvolr = 0, evoll = 0, evolr = 0, avoll = 0, avolr = 0, bvoll = 0, bvolr = 0;
+             uint32_t tsa = 0; // byte address
++            // effect unit (reverb): the registers as the hardware holds them, plus the PAL port's filter state
++            uint32_t fxAddr[22]{}; // 0x2E4..0x338: APF sizes and delay addresses, in halfwords from ESA
++            int16_t fxVol[10]{};   // 0x774..: vIIR, vCOMB1-4, vWALL, vAPF1, vAPF2, vLIN, vRIN
++            uint32_t esa = 0, eea = 0; // work area, halfword addresses (inclusive)
++            uint32_t rvPos = 0, rvHp = 0, rvPhase = 0;
++            int32_t rvIn[2][64]{}, rvOut[2][64]{};
+         };
+ 
+         void decodeBlock(Voice &v);
+@@ -90,6 +96,8 @@ namespace ps2x::iop::detail
+         void keyOn(int core, uint32_t bits);
+         void keyOff(int core, uint32_t bits);
+         int16_t voiceSample(Core &c, int vi);
++        int32_t reverbStep(Core &c, int right, int32_t in);
++        void reverb(Core &c, int32_t wl, int32_t wr, int32_t &ol, int32_t &orr);
+         [[nodiscard]] uint32_t pairAddress(uint32_t hiOffset) const; // hi/lo halfword pair -> byte address
+ 
+         std::vector<uint8_t> m_ram;

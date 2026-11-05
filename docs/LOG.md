@@ -3857,3 +3857,17 @@ Not yet emulated: the effect unit (reverb; the game sets Studio C at ~20%, which
 Patch 0056 also carries the clone's other changes that no earlier patch had recorded (the IOP-side sound work
 of 0071-0221: `iop_spu2` in CMake, intrman/RPC/cdvd/kernel/emulator changes, `EeScheduler`, `SIF`, the GS
 debugging in `zz_ape2_gs_gl.cpp`, `zz_ape2_hangdump.cpp`), so the patch set rebuilds the working tree.
+
+### 0224 - Reverb: the SPU2 effect unit (0057)
+
+LIBSD sets the effect unit up through the hardware registers, so they are decoded as the SPU2 holds them: the
+work area ESA (0x2E0, hi/lo) to EEA (0x33C, hi only, `(hi << 16) | 0xFFFF` halfwords), the 22 APF-size/delay
+address registers 0x2E4-0x338 (halfword offsets from ESA) and the 10 effect volumes at 0x774 + core*0x28
+(vIIR, vCOMB1-4, vWALL, vAPF1, vAPF2, vLIN, vRIN). The algorithm is the PAL port's (`port/src/spu2.c`): the
+PS1 reverb at half rate in the work area with its 39-tap half-band filters, fed from VMIXEL/VMIXER under the
+MMIX gates, core 0's output into core 1, gated by ATTR bit 7 and scaled by EVOL.
+
+Verified against PAL's Studio C preset: the game writes exactly its values x4 (e.g. 0x2EE = 0x37EC = mLSAME
+0x0DFB), and the work area 0xFC810-0xFFFFF is exactly that preset's size, so the register units are halfwords.
+Same hub run with and without reverb: rms 3,155 vs 1,858, L/R correlation 0.857 vs 0.877, no clipping.
+`APE2_REVERB=0` turns it off; `APE2_SPU2_FXLOG=1` logs the effect register writes. Player: "it's perfect".
