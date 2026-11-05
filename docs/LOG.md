@@ -3892,3 +3892,39 @@ Two faults, in `iop_memory.cpp`:
    into the 1 KB planar blocks the SPU2 consumes.
 
 Intro verified unattended after each step (24.4 s of stream audio, clean). Player: "fixed".
+
+### 0226 - Flickering and garbage textures everywhere: the GS never sampled mip levels (0059)
+
+The long-standing texture garbage (hub keyboards, the level 1 floor, walls; both renderers; fine in first
+person) is solved. The decisive trace, from a single-threaded hub run (`APE2_MTGS=0`, so the log is in stream
+order), with `scratchpad/kbseq.py`: in every bad frame the left keyboard is drawn from a ring slot whose
+level-0 image (the 64 KB atlas, datahash `6fc5944f`) is uploaded about 4,400 lines *after* the draw - for
+the right-hand keyboard, which is closer. Right before the left keyboard's draw the game uploads only its
+smaller levels and palette (`0x2e40` 64x64, `0x2e80` 32x32, palette `0x2e90`), the addresses in MIPTBP1/2.
+
+So the game streams only the mip levels the PS2 will sample: for a distant surface level 0 is never read and
+never uploaded. Our GS decoded MIPTBP1/2 and ignored them (0054 noted it), always sampling level 0 - whatever
+texture last used that slot. That is why first person (close, level 0) was clean, why it moved with the
+FPU rounding mode (the LOD thresholds), and why 0060's mipmaps did not help: they were generated from level 0
+with glGenerateMipmap, the one level that is missing. The PAL port's README states it outright ("the game
+streams only the smaller texture levels for distant surfaces").
+
+Fix, in `gs_frontend.cpp` (`mipSubmit`), ported from the PAL port's `port/src/gs.c` (mip_pick, setup_draw,
+mip_split; JackyPendrag0n/ae2-recomp), so both renderers get it: the level comes from the GS formula
+LOD = log2(1/|Q|) * 2^L + K (K with LCM), per primitive from its vertices' Q; the primitive then samples
+that level's own TBP/TBW (MIPTBP1/2, or packed with MTBA), size and CLAMP, UVs shifted for FST, MMAG/MMIN
+filter by LOD; a triangle whose corners want different levels is cut along the lines where the level
+changes. `APE2_GS_MIPMAP=0` turns it off, `APE2_GS_MIPSPLIT=0` disables the cut, `APE2_MIPLOG=1` logs level
+picks and filter changes.
+
+Measured on the unattended hub burst (`scratchpad/runab.cmd`, keyboard crop grids): before, 3-4 of 20
+sampled frames showed the keyboard; VU1 MSCAL deferral off (PAL's synchronous model) and single-threaded GS
+were no better (3/20, 10/20). Player, after the fix: "all the glitchy textures on the maps, hub and
+everywhere are gone".
+
+Also in 0059, found on the way and kept because it matches the PAL port's `rt_hw.c` dma_run: scratchpad DMA
+interleave mode and the toSPR source chain (were silently dropped, channel never finished). This game never
+uses scratchpad DMA (`APE2_SPR_LOG=1` saw none), so it changes nothing here.
+
+Not caused by this: blue patches on the title screen's distant hill (sky showing through) appear with
+`APE2_GS_MIPMAP=0` too; the earlier "clean" title frames caught the camera elsewhere in its flyover. Next.

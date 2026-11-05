@@ -1,0 +1,419 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 0e6de71..b53e19f 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -15,6 +15,11 @@
+ #include <vector>
+ #include <sstream>
+ 
++namespace
++{
++    void mipSubmit(GSRasterBackend &be, const GSPrimitiveBatch &in, int force = -100); // 0226, below
++}
++
+ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
+@@ -1866,7 +1871,7 @@ void GS::vertexKick(bool drawing)
+         updatePreferredDisplaySourceForDraw(batch);
+         {
+             ps2perf::Scope perfRaster(ps2perf::GsRaster);
+-            m_backend->Submit(batch);
++            mipSubmit(*m_backend, batch);
+         }
+         recordDrawDebugEventUnlocked(needed);
+     }
+@@ -1965,6 +1970,265 @@ void GS::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_
+         m_backend->WriteVram(psm, base, bw, x, y, value);
+ }
+ 
++// 0226: mipmapping. The PS2 picks a texture level per pixel from Q: LOD = log2(1/|Q|) * 2^L + K (K alone
++// with LCM), and samples that level at its own address (MIPTBP1/MIPTBP2). For distant surfaces Ape Escape 2
++// uploads only the smaller levels, so sampling level 0 read whatever texture last used that slot: the
++// flickering keyboards, floors and walls in the hub and the stages (fine in first person, which is close).
++// Ported from the PAL port's port/src/gs.c (mip_pick, setup_draw, mip_split; JackyPendrag0n/ae2-recomp): the
++// level is chosen per primitive from its vertices' Q, and a triangle whose corners want different levels is
++// cut along the lines where the level changes, each piece drawn with its own level. APE2_GS_MIPMAP=0 turns
++// it off (level 0 always, as before).
++namespace
++{
++    struct MipParams
++    {
++        bool lcm = false, mmag = false, mtba = false;
++        int mxl = 0, mmin = 0, l = 0;
++        float k = 0.0f;
++    };
++
++    MipParams mipParams(uint64_t tex1)
++    {
++        MipParams m;
++        m.lcm = (tex1 & 1u) != 0u;
++        m.mxl = std::min(static_cast<int>((tex1 >> 2u) & 7u), 6);
++        m.mmag = ((tex1 >> 5u) & 1u) != 0u;
++        m.mmin = static_cast<int>((tex1 >> 6u) & 7u);
++        m.mtba = ((tex1 >> 9u) & 1u) != 0u;
++        m.l = static_cast<int>((tex1 >> 19u) & 3u);
++        int k = static_cast<int>((tex1 >> 32u) & 0xFFFu);
++        if (k & 0x800)
++            k -= 0x1000;
++        m.k = static_cast<float>(k) / 16.0f;
++        return m;
++    }
++
++    bool mipBilinearMin(const MipParams &m) { return m.mmin == 1 || m.mmin == 4 || m.mmin == 5; }
++
++    // -1: magnified (MMAG filter on level 0)
++    int mipEffective(const MipParams &m, int req)
++    {
++        if (req < 0)
++            return -1;
++        if (m.mmin < 2 || m.mxl == 0)
++            return 0;
++        return std::min(req, m.mxl);
++    }
++
++    int mipPick(const MipParams &m, const GSPrimitiveBatch &b)
++    {
++        float lod;
++        if (m.lcm)
++            lod = m.k;
++        else
++        {
++            float sum = 0.0f;
++            for (int i = 0; i < b.vertexCount; ++i)
++                sum += -std::log2(std::max(std::fabs(b.vertices[static_cast<size_t>(i)].q), 1e-20f));
++            lod = sum / static_cast<float>(b.vertexCount) * static_cast<float>(1 << m.l) + m.k;
++        }
++        if (lod <= 0.0f)
++            return -1;
++        return std::min(static_cast<int>(lod + 0.5f), 6);
++    }
++
++    void mipApply(GSPrimitiveBatch &b, const MipParams &m, int lv)
++    {
++        GSDrawState &st = b.state;
++        {
++            static const bool log = std::getenv("APE2_MIPLOG") != nullptr;
++            static std::map<uint64_t, int> seen;
++            const bool lf = lv >= 0 ? mipBilinearMin(m) : m.mmag;
++            if (log && lf != st.linearFilter && seen[st.context.tex1 ^ (static_cast<uint64_t>(lv + 1) << 60)]++ == 0 && seen.size() < 200)
++                std::fprintf(stderr, "[mipf] tbp0=0x%x %dx%d tex1=%016llx lv=%d q=%g,%g,%g filter %d->%d\n", st.context.tex0.tbp0,
++                             st.textureWidth, st.textureHeight, static_cast<unsigned long long>(st.context.tex1), lv,
++                             b.vertices[0].q, b.vertices[1].q, b.vertices[2].q, st.linearFilter, lf);
++        }
++        st.linearFilter = lv >= 0 ? mipBilinearMin(m) : m.mmag;
++        if (lv <= 0)
++            return;
++        GSTex0Reg &t = st.context.tex0;
++        const uint8_t psm = t.psm;
++        const uint32_t bpp = psm == GS_PSM_T4 ? 4u : (psm == GS_PSM_T8 || psm == GS_PSM_T8H) ? 8u
++                             : (psm == 0x02u || psm == 0x0Au || psm == 0x32u || psm == 0x3Au) ? 16u : 32u;
++        uint32_t bp = t.tbp0, bw = t.tbw;
++        for (int n = 1; n <= lv; ++n)
++        {
++            if (m.mtba && n <= 3)
++            {
++                const uint32_t w = std::max(1u, (1u << std::min<uint32_t>(t.tw, 10u)) >> (n - 1));
++                const uint32_t h = std::max(1u, (1u << std::min<uint32_t>(t.th, 10u)) >> (n - 1));
++                bp = bp + w * h * bpp / 8u / 256u;
++                bw = bw > 1u ? bw / 2u : 1u;
++            }
++            else
++            {
++                const uint64_t reg = n <= 3 ? st.context.miptbp1 : st.context.miptbp2;
++                const int sh = ((n - 1) % 3) * 20;
++                bp = static_cast<uint32_t>((reg >> sh) & 0x3FFFu);
++                bw = static_cast<uint32_t>((reg >> (sh + 14)) & 0x3Fu);
++            }
++        }
++        {
++            static const bool log = std::getenv("APE2_MIPLOG") != nullptr;
++            static std::map<uint64_t, int> seen;
++            const uint64_t key = (static_cast<uint64_t>(t.tbp0) << 32) | (static_cast<uint64_t>(lv) << 24) | (static_cast<uint64_t>(t.psm) << 16) | (t.tw << 8) | t.th;
++            if (log && seen[key]++ == 0 && seen.size() < 400)
++                std::fprintf(stderr, "[mip] tbp0=0x%x psm=0x%x %dx%d tbw=%u lv=%d -> bp=0x%x bw=%u tex1=%016llx mip1=%016llx mip2=%016llx\n", t.tbp0, t.psm,
++                             1 << t.tw, 1 << t.th, t.tbw, lv, bp, bw, static_cast<unsigned long long>(st.context.tex1),
++                             static_cast<unsigned long long>(st.context.miptbp1), static_cast<unsigned long long>(st.context.miptbp2));
++        }
++        t.tbp0 = bp;
++        t.tbw = static_cast<uint8_t>(bw ? bw : 1u);
++        t.tw = static_cast<uint8_t>(t.tw > lv ? t.tw - lv : 0);
++        t.th = static_cast<uint8_t>(t.th > lv ? t.th - lv : 0);
++        st.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(t.tw, 10u));
++        st.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(t.th, 10u));
++        // CLAMP: region bounds are level-0 texels
++        const uint64_t c = st.context.clamp;
++        const uint64_t minu = ((c >> 4u) & 0x3FFu) >> lv, maxu = ((c >> 14u) & 0x3FFu) >> lv;
++        const uint64_t minv = ((c >> 24u) & 0x3FFu) >> lv, maxv = ((c >> 34u) & 0x3FFu) >> lv;
++        st.context.clamp = (c & 0xFu) | (minu << 4u) | (maxu << 14u) | (minv << 24u) | (maxv << 34u);
++        if (st.prim.fst) // UV coordinates are level-0 texels
++            for (int i = 0; i < b.vertexCount; ++i)
++            {
++                b.vertices[static_cast<size_t>(i)].u = static_cast<uint16_t>(b.vertices[static_cast<size_t>(i)].u >> lv);
++                b.vertices[static_cast<size_t>(i)].v = static_cast<uint16_t>(b.vertices[static_cast<size_t>(i)].v >> lv);
++            }
++    }
++
++    GSVertex mipLerp(const GSVertex &p, const GSVertex &q, double t)
++    {
++        auto li = [t](double a, double b) { return a + (b - a) * t; };
++        GSVertex o = p;
++        o.x = static_cast<float>(li(p.x, q.x));
++        o.y = static_cast<float>(li(p.y, q.y));
++        o.z = li(p.z, q.z);
++        o.r = static_cast<uint8_t>(std::lrint(li(p.r, q.r)));
++        o.g = static_cast<uint8_t>(std::lrint(li(p.g, q.g)));
++        o.b = static_cast<uint8_t>(std::lrint(li(p.b, q.b)));
++        o.a = static_cast<uint8_t>(std::lrint(li(p.a, q.a)));
++        o.s = static_cast<float>(li(p.s, q.s));
++        o.t = static_cast<float>(li(p.t, q.t));
++        o.q = static_cast<float>(li(p.q, q.q));
++        o.u = static_cast<uint16_t>(std::lrint(li(p.u, q.u)));
++        o.v = static_cast<uint16_t>(std::lrint(li(p.v, q.v)));
++        o.fog = static_cast<uint8_t>(std::lrint(li(p.fog, q.fog)));
++        return o;
++    }
++
++    void mipSubmit(GSRasterBackend &be, const GSPrimitiveBatch &in, int force);
++
++    // a triangle whose corners want different levels, drawn in pieces, one per level; the cut points are worked
++    // out on the triangle's own edges from the edge's ends in a fixed order, so neighbours share them (no cracks)
++    bool mipSplit(GSRasterBackend &be, const GSPrimitiveBatch &in, const MipParams &m)
++    {
++        const GSVertex *v[3] = {&in.vertices[0], &in.vertices[1], &in.vertices[2]};
++        const float sc = static_cast<float>(1 << m.l);
++        int lo = 99, hi = -99;
++        for (int i = 0; i < 3; ++i)
++        {
++            if (!(v[i]->q > 1e-20f))
++                return false;
++            const float lod = -std::log2(v[i]->q) * sc + m.k;
++            int l = lod <= 0.0f ? -1 : static_cast<int>(lod + 0.5f);
++            l = std::min(l, m.mxl);
++            lo = std::min(lo, l);
++            hi = std::max(hi, l);
++        }
++        if (lo == hi)
++            return false;
++        // boundary k (between level k-1 and k) sits at LOD 0 for k = 0, else k - 0.5
++        double qb[10];
++        int nb = 0;
++        for (int k = lo + 1; k <= hi && nb < 10; ++k)
++            qb[nb++] = std::exp2(-((k == 0 ? 0.0 : k - 0.5) - m.k) / sc);
++        GSVertex pt[3 + 3 * 10];
++        double pq[3 + 3 * 10];
++        int np = 0;
++        for (int i = 0; i < 3; ++i)
++        {
++            const GSVertex *p = v[i], *q = v[(i + 1) % 3];
++            pt[np] = *p;
++            pq[np] = p->q;
++            ++np;
++            const bool sw = p->x > q->x || (p->x == q->x && p->y > q->y);
++            const GSVertex *e0 = sw ? q : p, *e1 = sw ? p : q;
++            const double dq = static_cast<double>(e1->q) - static_cast<double>(e0->q);
++            if (dq == 0.0)
++                continue;
++            double ts[10];
++            int tk[10], nt = 0;
++            for (int k = 0; k < nb; ++k)
++            {
++                const double t = (qb[k] - e0->q) / dq;
++                if (t > 0.0 && t < 1.0)
++                {
++                    ts[nt] = sw ? 1.0 - t : t;
++                    tk[nt++] = k;
++                }
++            }
++            for (int x = 1; x < nt; ++x)
++                for (int y = x; y > 0 && ts[y] < ts[y - 1]; --y)
++                {
++                    std::swap(ts[y], ts[y - 1]);
++                    std::swap(tk[y], tk[y - 1]);
++                }
++            for (int x = 0; x < nt; ++x) // in order from p to q
++            {
++                pt[np] = mipLerp(*e0, *e1, sw ? 1.0 - ts[x] : ts[x]);
++                pq[np] = qb[tk[x]];
++                ++np;
++            }
++        }
++        // each level's piece: the outline points with Q in its range (Q falls as LOD rises)
++        for (int l = lo; l <= hi; ++l)
++        {
++            const double qmax = l == lo ? 1e300 : qb[l - lo - 1], qmin = l == hi ? -1e300 : qb[l - lo];
++            const GSVertex *poly[3 + 3 * 10];
++            int n = 0;
++            for (int i = 0; i < np; ++i)
++                if (pq[i] <= qmax && pq[i] >= qmin)
++                    poly[n++] = &pt[i];
++            if (n < 3)
++                continue;
++            GSPrimitiveBatch piece = in;
++            for (int i = 1; i + 1 < n; ++i)
++            {
++                piece.vertices[0] = *poly[0];
++                piece.vertices[1] = *poly[i];
++                piece.vertices[2] = *poly[i + 1];
++                mipSubmit(be, piece, l);
++            }
++        }
++        return true;
++    }
++
++    void mipSubmit(GSRasterBackend &be, const GSPrimitiveBatch &in, int force)
++    {
++        static const bool off = [] { const char *e = std::getenv("APE2_GS_MIPMAP"); return e && e[0] == '0'; }();
++        if (off || !in.state.prim.tme)
++        {
++            be.Submit(in);
++            return;
++        }
++        const MipParams m = mipParams(in.state.context.tex1);
++        if (!(m.mxl > 0 || m.mmag != mipBilinearMin(m)))
++        {
++            be.Submit(in);
++            return;
++        }
++        const GSPrimType type = in.state.prim.type;
++        const bool tri = in.vertexCount == 3 && (type == GS_PRIM_TRIANGLE || type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN);
++        static const bool noSplit = std::getenv("APE2_GS_MIPSPLIT") && std::getenv("APE2_GS_MIPSPLIT")[0] == '0';
++        if (tri && !noSplit && force == -100 && !in.state.prim.fst && !m.lcm && m.mmin >= 2 && m.mxl > 0 && mipSplit(be, in, m))
++            return;
++        GSPrimitiveBatch b = in;
++        mipApply(b, m, mipEffective(m, force != -100 ? force : mipPick(m, in)));
++        be.Submit(b);
++    }
++}
++
+ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
+ {
+     GSPrimitiveBatch batch{};
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 806823e..f47177c 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1685,7 +1685,122 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
+ 
+     const uint32_t mode = (chcr >> 2u) & 0x3u;
+     if (mode != 0u)
+-        return false;
++    {
++        // 0226: interleave (mode 2) and the toSPR source chain, as the PAL port's rt_hw.c dma_run does them
++        // (JackyPendrag0n/ae2-recomp). Before, these were dropped: nothing moved and the channel never finished.
++        static const bool log = std::getenv("APE2_SPR_LOG") != nullptr;
++        const bool toSpr = channelBase == kSprToChannel;
++        uint32_t sadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
++        auto ramPtr = [&](uint32_t addr) -> uint8_t *
++        {
++            if (addr & 0x80000000u)
++                return m_scratchpad + (addr & 0x3FF0u);
++            try
++            {
++                const uint32_t phys = translateAddress(addr & 0x7FFFFFF0u);
++                return phys + 16u <= PS2_RAM_SIZE ? m_rdram + phys : nullptr;
++            }
++            catch (const std::exception &)
++            {
++                return nullptr;
++            }
++        };
++        if (mode == 2u)
++        {
++            const uint32_t qwcI = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
++            const uint32_t sq = m_ioRegisters[0x1000E030u];
++            uint32_t skip = sq & 0xFFu, take = (sq >> 16u) & 0xFFu;
++            if (!take)
++            {
++                take = qwcI ? qwcI : 1u;
++                skip = 0u;
++            }
++            uint32_t m = m_ioRegisters[channelBase + 0x10u];
++            for (uint32_t i = 0, run = 0; i < qwcI; ++i)
++            {
++                if (uint8_t *ram = ramPtr(m))
++                {
++                    uint8_t *spr = m_scratchpad + ((sadr + i * 16u) & 0x3FF0u);
++                    if (toSpr)
++                        std::memcpy(spr, ram, 16u);
++                    else
++                    {
++                        std::memcpy(ram, spr, 16u);
++                        if (!(m & 0x80000000u))
++                            markModified(static_cast<uint32_t>(ram - m_rdram), 16u);
++                    }
++                }
++                m += 16u;
++                if (++run == take)
++                {
++                    run = 0;
++                    m += skip * 16u;
++                }
++            }
++            if (log)
++                std::fprintf(stderr, "[spr] interleave %s qwc %u take %u skip %u\n", toSpr ? "to" : "from", qwcI, take, skip);
++            m_ioRegisters[channelBase + 0x10u] = m;
++            m_ioRegisters[channelBase + 0x80u] = (sadr + qwcI * 16u) & 0x3FF0u;
++            m_ioRegisters[channelBase + 0x20u] = 0u;
++        }
++        else if (mode == 1u && toSpr)
++        {
++            const bool tte = (chcr >> 6u) & 1u;
++            uint32_t tadr = m_ioRegisters[channelBase + 0x30u];
++            uint32_t total = 0u;
++            for (int guard = 0; guard < 100000; ++guard)
++            {
++                const uint8_t *tp = ramPtr(tadr);
++                if (!tp)
++                    break;
++                uint64_t tag;
++                std::memcpy(&tag, tp, 8u);
++                const uint32_t q = static_cast<uint32_t>(tag & 0xFFFFu), id = static_cast<uint32_t>((tag >> 28u) & 7u);
++                const uint32_t addr = static_cast<uint32_t>(tag >> 32u) & 0x7FFFFFF0u;
++                if (tte)
++                {
++                    std::memcpy(m_scratchpad + sadr, tp, 16u);
++                    sadr = (sadr + 16u) & 0x3FF0u;
++                }
++                for (uint32_t i = 0; i < q; ++i)
++                {
++                    const uint8_t *src = (id == 1u) ? tp + 16u + i * 16u : ramPtr(addr + i * 16u);
++                    if (src)
++                        std::memcpy(m_scratchpad + sadr, src, 16u);
++                    sadr = (sadr + 16u) & 0x3FF0u;
++                }
++                total += q;
++                if (id == 1u)
++                    tadr = tadr + 16u + q * 16u;
++                else if (id == 2u)
++                    tadr = addr;
++                else
++                    tadr += 16u;
++                if (id == 7u || id == 0u || (((tag >> 31u) & 1u) && (chcr & 0x80u)))
++                    break;
++            }
++            if (log)
++                std::fprintf(stderr, "[spr] toSPR chain %u qw\n", total);
++            m_ioRegisters[channelBase + 0x30u] = tadr;
++            m_ioRegisters[channelBase + 0x80u] = sadr;
++            m_ioRegisters[channelBase + 0x20u] = 0u;
++        }
++        else
++        {
++            static int warned = 0;
++            if (warned++ < 8)
++                std::fprintf(stderr, "[spr] unsupported %s mode %u\n", toSpr ? "toSPR" : "fromSPR", mode);
++            return false;
++        }
++        completeDmacChannel(channelBase, toSpr ? 9u : 8u);
++        return true;
++    }
++    {
++        static const bool log = std::getenv("APE2_SPR_LOG") != nullptr;
++        static unsigned long long n = 0;
++        if (log && ((++n & 0x3FFFu) == 0u || n < 4u))
++            std::fprintf(stderr, "[spr] normal transfers %llu\n", n);
++    }
+ 
+     const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+     const uint32_t byteCount = qwc * 16u;
