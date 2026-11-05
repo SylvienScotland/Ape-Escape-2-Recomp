@@ -1,0 +1,415 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index ad7a4e2..720bb24 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -127,16 +127,41 @@ namespace
+ 
+             void spu2QueuePush(const std::vector<uint8_t> &ram, uint32_t address, uint32_t sizeBytes)
+             {
+-                if (sizeBytes < 4u || sizeBytes > kSpu2BlockCapacity || address == 0u)
++                if (sizeBytes < 4u || address == 0u)
+                     return;
+                 if (static_cast<uint64_t>(address) + sizeBytes > ram.size())
+                     return;
++                // 0225: the SPU2 consumes any auto-DMA buffer in 1 KB planar blocks (256 L + 256 R samples, as the
++                // PAL port's spu2.c reads it). The queue used to accept only arms the size of the first one (the
++                // intro's 1 KB) and nothing over 2 KB, so the hub's voice streams (bigger arms from an 8 KB ring)
++                // were all dropped and the sister spoke in silence. Split every arm into 1 KB blocks.
++                constexpr uint32_t kPlanarBlock = 1024u;
++                if (sizeBytes > kPlanarBlock)
++                {
++                    if (sizeBytes % kPlanarBlock != 0u)
++                    {
++                        static unsigned odd = 0u;
++                        if (odd++ < 8u)
++                            std::fprintf(stderr, "[spu2:queue] arm of %u bytes is not whole 1 KB blocks%c", sizeBytes,
++                                         10);
++                        return;
++                    }
++                    for (uint32_t off = 0u; off < sizeBytes; off += kPlanarBlock)
++                        spu2QueuePush(ram, address + off, kPlanarBlock);
++                    return;
++                }
+                 Spu2Queue &queue = spu2Queue();
+                 static const auto wallStart = std::chrono::steady_clock::now(); // 0204: wall clock for rate accounting
+                 if (queue.blockBytes == 0u)
+                     queue.blockBytes = sizeBytes;
+                 if (sizeBytes != queue.blockBytes)
++                {
++                    static unsigned mismatched = 0u;
++                    if (mismatched++ < 8u)
++                        std::fprintf(stderr, "[spu2:queue] arm of %u bytes dropped (blocks are %zu)%c", sizeBytes,
++                                     queue.blockBytes, 10);
+                     return;
++                }
+                 if (queue.count >= kSpu2QueueTargetDepth)
+                 {
+                     ++queue.dropped;
+@@ -409,6 +434,19 @@ namespace
+ 
+     uint32_t IopMemory::s_currentPc = 0u;
+ 
++    void IopMemory::noteGuestAdmas(uint32_t address, uint32_t value)
++    {
++        // 0225: what the driver wrote to a core's ADMAS, apart from the busy bit this file sets itself (0161)
++        const uint32_t phys = address & ~1u;
++        if (phys != 0x1F9001B0u && phys != 0x1F9005B0u)
++            return;
++        const int core = phys == 0x1F9005B0u ? 1 : 0;
++        m_guestAdmas[core] = static_cast<uint16_t>(value);
++        static unsigned logged = 0u;
++        if (logged++ < 40u)
++            std::fprintf(stderr, "[spu2:admas] driver core%d ADMAS=0x%x%c", core, value, 10);
++    }
++
+     void IopMemory::write16(uint32_t address, uint16_t value)
+     {
+         const uint32_t phys = physicalAddress(address);
+@@ -468,6 +506,7 @@ namespace
+                 std::fprintf(stderr, "%c", 10);
+             }
+             (void)current;
++            noteGuestAdmas(phys, value);
+             m_spu2.write16(phys, value); // 0223: one register; the 32-bit read-modify-write rewrote its neighbour
+             return;
+         }
+@@ -691,7 +730,11 @@ namespace
+ 
+         // 0093: hand the value to the real SPU2 register file so voices can be keyed and mixed.
+         if (spu2Enabled() && IopSpu2::contains(address))
++        {
++            noteGuestAdmas(address, value & 0xFFFFu);
++            noteGuestAdmas(address + 2u, value >> 16);
+             m_spu2.write32(address, value);
++        }
+ 
+ 
+         m_hardware[address] = value;
+@@ -728,7 +771,24 @@ namespace
+         uint32_t admas = 0u;
+         if (const auto current = m_hardware.find(admasWord); current != m_hardware.end())
+             admas = current->second & 0xFFFFu;
+-        const bool autoDma = (admas & (secondCore ? 2u : 1u)) != 0u || secondCore; // 0135
++        // 0225: auto-DMA only when the driver itself set the core's ADMAS (sceSdBlockTrans). The 0135 rule "every
++        // core-1 transfer is the stream" sent sceSdVoiceTrans uploads on core 1 - the hub's voice lines, VAG ADPCM
++        // the driver plays on voices - into the PCM stream (static) instead of SPU RAM. APE2_SPU2_CORE1AUTO=1
++        // restores the 0135 rule.
++        static const bool core1AlwaysAuto = std::getenv("APE2_SPU2_CORE1AUTO") != nullptr;
++        (void)admas;
++        // ADMAS stays set after the intro's stream (the driver never clears it), so a core-1 upload is told apart
++        // the way libsd's own calls differ: sceSdVoiceTrans writes TSA before every transfer, sceSdBlockTrans never.
++        const bool voiceUpload = spu2Enabled() && m_spu2.takeTsaWritten(secondCore ? 1 : 0);
++        const bool autoDma =
++            ((m_guestAdmas[secondCore ? 1 : 0] & 3u) != 0u && !voiceUpload) || (core1AlwaysAuto && secondCore);
++        if (secondCore && voiceUpload)
++        {
++            static unsigned logged = 0u;
++            if (logged++ < 16u)
++                std::fprintf(stderr, "[spu2:voicetrans] core1 upload of %llu words to SPU RAM%c",
++                             static_cast<unsigned long long>(transferWords), 10);
++        }
+         // 0161: what is the driver actually trying to move? Record every SPU2 channel arm so its retry loop can be
+         // matched to a transfer instead of guessed at.
+         {
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index 691b5da..c02b99c 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -1,126 +1,128 @@
+-#pragma once
+-
+-#include "iop_sio2.h"
+-#include "iop_spu2.h"
+-
+-#include <cstddef>
+-#include <cstdint>
+-#include <functional>
+-#include <optional>
+-#include <span>
+-#include <string>
+-#include <unordered_map>
+-#include <vector>
+-
+-namespace ps2x::iop::detail
+-{
+-    class IopMemory
+-    {
+-    public:
+-        static constexpr uint32_t RamSize = 2u * 1024u * 1024u;
+-        static constexpr uint32_t ScratchBase = 0x1F800000u;
+-        static constexpr uint32_t ScratchSize = 0x400u;
+-        static constexpr uint32_t HardwareBase = 0x1F801000u;
+-        static constexpr uint32_t HardwareEnd = 0x1F900000u;
+-        static constexpr uint32_t Spu2Base = 0x1F900000u;
+-        static constexpr uint32_t Spu2End = 0x1FA00000u;
+-        // 0167: guest PC of the instruction touching hardware, so SPU2 writes can be attributed to code.
+-        static uint32_t s_currentPc;
+-        static constexpr uint32_t SifBase = 0x1D000000u;
+-        static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00070000u; // was 0x120000: modules end ~0x52000; games need the rest as heap
+-        static constexpr uint32_t HeapLimit = 0x001F0000u;
+-
+-        struct Allocation
+-        {
+-            uint32_t address = 0;
+-            uint32_t size = 0;
+-        };
+-
+-        struct DmaStart
+-        {
+-            int irq = 0;
+-            uint64_t delayCycles = 0;
+-        };
+-
+-        IopMemory();
+-
+-        void reset();
+-
+-        [[nodiscard]] uint8_t read8(uint32_t address) const;
+-        [[nodiscard]] uint16_t read16(uint32_t address) const;
+-        [[nodiscard]] uint32_t read32(uint32_t address) const;
+-        void write8(uint32_t address, uint8_t value);
+-        void write16(uint32_t address, uint16_t value);
+-        void write32(uint32_t address, uint32_t value);
+-
+-        [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
+-        [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
+-        [[nodiscard]] bool zeroRam(uint32_t address, size_t size);
+-        [[nodiscard]] bool ownsRamRange(uint32_t address, size_t size) const;
+-        [[nodiscard]] bool isHardwareAddress(uint32_t address) const;
+-        [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
+-
+-        [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+-        [[nodiscard]] bool freeAllocation(uint32_t address);
+-        [[nodiscard]] uint32_t maxFreeMemory() const;
+-        [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+-
+-        [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
+-        [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }
+-        [[nodiscard]] uint32_t interruptControl() const noexcept { return m_interruptControl; }
+-        void setInterruptStatus(uint32_t value) noexcept { m_interruptStatus = value; }
+-        void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
+-        void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
+-
+-        [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+-
+-        // 0161: drop the ADMAS busy bit for the channel whose transfer just completed.
+-        void completeSpu2Dma();
+-        // 0077: autonomous auto-DMA - the per-block period to keep re-scheduling, while it stays armed.
+-        [[nodiscard]] std::optional<uint64_t> dmaRearmDelay(int irq) const noexcept;
+-        [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+-
+-        // 0075: SPU2 playback. The game feeds streamed PCM into IOP RAM and arms SPU2 auto-DMA on it; the DMA
+-        // block used to be discarded, so nothing was ever audible. pullSpu2Pcm hands the armed buffer to the
+-        // host as 16-bit stereo frames, advancing a read cursor at the hardware playback rate.
+-        [[nodiscard]] size_t pullSpu2Pcm(int16_t *destination, size_t frameCount);
+-        [[nodiscard]] bool spu2StreamArmed() const noexcept { return m_spu2Armed; }
+-        // 0145: lets a probe tell whether an SPU2 access came from the driver interrupt handler.
+-        void setSpu2HandlerContext(bool value) noexcept { m_inSpu2Handler = value; }
+-
+-        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+-
+-    private:
+-        [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
+-        void writeHardware32(uint32_t address, uint32_t value);
+-        void markOwned(uint32_t address, size_t size);
+-        [[nodiscard]] uint32_t readSio2(uint32_t phys, unsigned sizeBytes) const;
+-        void writeSio2(uint32_t phys, uint32_t value, unsigned sizeBytes);
+-
+-        std::vector<uint8_t> m_ram;
+-        std::vector<uint8_t> m_owned;
+-        std::vector<uint8_t> m_scratch;
+-        std::unordered_map<uint32_t, uint32_t> m_hardware;
+-        std::vector<Allocation> m_allocations;
+-        uint32_t m_heapCursor = HeapBase;
+-        uint32_t m_interruptStatus = 0;
+-        uint32_t m_interruptMask = 0;
+-        uint32_t m_interruptControl = 1;
+-        struct AdmaTimer
+-        {
+-            bool active = false;
+-            int irq = 0;
+-            uint64_t delayCycles = 0;
+-        };
+-        std::optional<DmaStart> m_dmaStart;
+-        uint32_t m_admasWord = 0u;
+-        uint32_t m_admasBit = 0u;
+-        AdmaTimer m_admaTimer; // 0077: autonomous auto-DMA block interrupt
+-        mutable IopSio2 m_sio2;
+-        IopSpu2 m_spu2; // 0093: real voices, ADPCM and mixing replace the IOP-RAM PCM ring // mutable: reading DATAOUT pops its FIFO (patch 0018)
+-        uint32_t m_spu2ReadAddr = 0u; // playback cursor inside the armed auto-DMA buffer
+-        bool m_spu2Armed = false;
+-        mutable bool m_inSpu2Handler = false; // 0145
+-    };
+-}
++#pragma once
++
++#include "iop_sio2.h"
++#include "iop_spu2.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <optional>
++#include <span>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace ps2x::iop::detail
++{
++    class IopMemory
++    {
++    public:
++        static constexpr uint32_t RamSize = 2u * 1024u * 1024u;
++        static constexpr uint32_t ScratchBase = 0x1F800000u;
++        static constexpr uint32_t ScratchSize = 0x400u;
++        static constexpr uint32_t HardwareBase = 0x1F801000u;
++        static constexpr uint32_t HardwareEnd = 0x1F900000u;
++        static constexpr uint32_t Spu2Base = 0x1F900000u;
++        static constexpr uint32_t Spu2End = 0x1FA00000u;
++        // 0167: guest PC of the instruction touching hardware, so SPU2 writes can be attributed to code.
++        static uint32_t s_currentPc;
++        static constexpr uint32_t SifBase = 0x1D000000u;
++        static constexpr uint32_t SifEnd = 0x1D001000u;
++        static constexpr uint32_t HeapBase = 0x00070000u; // was 0x120000: modules end ~0x52000; games need the rest as heap
++        static constexpr uint32_t HeapLimit = 0x001F0000u;
++
++        struct Allocation
++        {
++            uint32_t address = 0;
++            uint32_t size = 0;
++        };
++
++        struct DmaStart
++        {
++            int irq = 0;
++            uint64_t delayCycles = 0;
++        };
++
++        IopMemory();
++
++        void reset();
++
++        [[nodiscard]] uint8_t read8(uint32_t address) const;
++        [[nodiscard]] uint16_t read16(uint32_t address) const;
++        [[nodiscard]] uint32_t read32(uint32_t address) const;
++        void write8(uint32_t address, uint8_t value);
++        void noteGuestAdmas(uint32_t address, uint32_t value);
++        void write16(uint32_t address, uint16_t value);
++        void write32(uint32_t address, uint32_t value);
++
++        [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
++        [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
++        [[nodiscard]] bool zeroRam(uint32_t address, size_t size);
++        [[nodiscard]] bool ownsRamRange(uint32_t address, size_t size) const;
++        [[nodiscard]] bool isHardwareAddress(uint32_t address) const;
++        [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
++
++        [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
++        [[nodiscard]] bool freeAllocation(uint32_t address);
++        [[nodiscard]] uint32_t maxFreeMemory() const;
++        [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
++
++        [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
++        [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }
++        [[nodiscard]] uint32_t interruptControl() const noexcept { return m_interruptControl; }
++        void setInterruptStatus(uint32_t value) noexcept { m_interruptStatus = value; }
++        void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
++        void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
++
++        [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
++
++        // 0161: drop the ADMAS busy bit for the channel whose transfer just completed.
++        void completeSpu2Dma();
++        // 0077: autonomous auto-DMA - the per-block period to keep re-scheduling, while it stays armed.
++        [[nodiscard]] std::optional<uint64_t> dmaRearmDelay(int irq) const noexcept;
++        [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
++
++        // 0075: SPU2 playback. The game feeds streamed PCM into IOP RAM and arms SPU2 auto-DMA on it; the DMA
++        // block used to be discarded, so nothing was ever audible. pullSpu2Pcm hands the armed buffer to the
++        // host as 16-bit stereo frames, advancing a read cursor at the hardware playback rate.
++        [[nodiscard]] size_t pullSpu2Pcm(int16_t *destination, size_t frameCount);
++        [[nodiscard]] bool spu2StreamArmed() const noexcept { return m_spu2Armed; }
++        // 0145: lets a probe tell whether an SPU2 access came from the driver interrupt handler.
++        void setSpu2HandlerContext(bool value) noexcept { m_inSpu2Handler = value; }
++
++        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
++
++    private:
++        [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
++        void writeHardware32(uint32_t address, uint32_t value);
++        void markOwned(uint32_t address, size_t size);
++        [[nodiscard]] uint32_t readSio2(uint32_t phys, unsigned sizeBytes) const;
++        void writeSio2(uint32_t phys, uint32_t value, unsigned sizeBytes);
++
++        std::vector<uint8_t> m_ram;
++        std::vector<uint8_t> m_owned;
++        std::vector<uint8_t> m_scratch;
++        std::unordered_map<uint32_t, uint32_t> m_hardware;
++        std::vector<Allocation> m_allocations;
++        uint32_t m_heapCursor = HeapBase;
++        uint32_t m_interruptStatus = 0;
++        uint32_t m_interruptMask = 0;
++        uint32_t m_interruptControl = 1;
++        struct AdmaTimer
++        {
++            bool active = false;
++            int irq = 0;
++            uint64_t delayCycles = 0;
++        };
++        std::optional<DmaStart> m_dmaStart;
++        uint32_t m_admasWord = 0u;
++        uint32_t m_admasBit = 0u;
++        AdmaTimer m_admaTimer; // 0077: autonomous auto-DMA block interrupt
++        mutable IopSio2 m_sio2;
++        IopSpu2 m_spu2; // 0093: real voices, ADPCM and mixing replace the IOP-RAM PCM ring // mutable: reading DATAOUT pops its FIFO (patch 0018)
++        uint32_t m_spu2ReadAddr = 0u; // playback cursor inside the armed auto-DMA buffer
++        bool m_spu2Armed = false;
++        uint16_t m_guestAdmas[2] = {0u, 0u}; // 0225: ADMAS as the driver wrote it, per core
++        mutable bool m_inSpu2Handler = false; // 0145
++    };
++}
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index ccf7b47..c9c3915 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -219,7 +219,10 @@ namespace ps2x::iop::detail
+         case kKoff: keyOff(ci, value); break;
+         case kKoff + 2: keyOff(ci, static_cast<uint32_t>(value & 0xFFu) << 16); break;
+         case kTsa:
+-        case kTsa + 2: c.tsa = pairAddress(base + kTsa) & (kRamSize - 1u); break;
++        case kTsa + 2:
++            c.tsa = pairAddress(base + kTsa) & (kRamSize - 1u);
++            m_tsaWritten[ci] = true;
++            break;
+         case kData: // PIO transfer: one halfword at TSA
+             m_ram[c.tsa & (kRamSize - 1u)] = static_cast<uint8_t>(value);
+             m_ram[(c.tsa + 1u) & (kRamSize - 1u)] = static_cast<uint8_t>(value >> 8);
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index 13b6392..5469f8e 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -43,6 +43,14 @@ namespace ps2x::iop::detail
+         // Produces interleaved stereo frames at 48 kHz and returns how many were written.
+         size_t mix(int16_t *out, size_t frames);
+ 
++        // 0225: TSA written since the last call - sceSdVoiceTrans sets it before every upload, sceSdBlockTrans never
++        bool takeTsaWritten(int core) noexcept
++        {
++            const bool w = m_tsaWritten[core & 1];
++            m_tsaWritten[core & 1] = false;
++            return w;
++        }
++
+         [[nodiscard]] unsigned long long keyonCount() const noexcept { return m_keyonCount; }
+         [[nodiscard]] int activeVoices() const noexcept;
+         [[nodiscard]] unsigned long long blocksDecoded() const noexcept { return m_blocksDecoded; }
+@@ -104,6 +112,7 @@ namespace ps2x::iop::detail
+         Core m_cores[kCores];
+         uint16_t m_raw[0x800]{}; // the whole register window as written, halfword indexed
+         bool m_mvolWritten = false;
++        bool m_tsaWritten[kCores] = {false, false};
+         unsigned long long m_keyonCount = 0;
+         unsigned long long m_blocksDecoded = 0;
+     };

@@ -3871,3 +3871,24 @@ Verified against PAL's Studio C preset: the game writes exactly its values x4 (e
 0x0DFB), and the work area 0xFC810-0xFFFFF is exactly that preset's size, so the register units are halfwords.
 Same hub run with and without reverb: rms 3,155 vs 1,858, L/R correlation 0.857 vs 0.877, no clipping.
 `APE2_REVERB=0` turns it off; `APE2_SPU2_FXLOG=1` logs the effect register writes. Player: "it's perfect".
+
+### 0225 - The sister's voice in the hub: core-1 voice uploads went to the stream (0058)
+
+Player report: the sister in the Travel Station has no voice. A logging run with the player talking to her showed
+the game does read her lines (`VOICE/STATION/FIRSTIME/NATUMI.VGS` at lsn 0x2ac27, `TRAVEL/MECA.VGS` at
+0x299d9) through `sceCdStStart`/`sceCdStRead`. VGS data is VAG ADPCM (valid shift/filter bytes, flags 0; lag-1
+correlation as PCM 0.08), uploaded by the driver with `sceSdVoiceTrans` on core 1 into SPU RAM and played on a
+voice - not PCM for the stream.
+
+Two faults, in `iop_memory.cpp`:
+
+1. The 0135 rule treated every core-1 DMA as the auto-DMA stream, so her ADPCM never reached SPU RAM. With the
+   arms split into 1 KB blocks (a first fix attempt) it was played as PCM, heard as static. Auto-DMA is now
+   decided from ADMAS as the driver wrote it (`m_guestAdmas`, apart from the 0161 busy bit), and since the
+   driver never clears core 1's ADMAS after the intro (only three ADMAS writes in a session: 0, 0, 2), an
+   upload is recognised the way libsd's calls differ: `sceSdVoiceTrans` writes TSA before every transfer,
+   `sceSdBlockTrans` never (`IopSpu2::takeTsaWritten`). `APE2_SPU2_CORE1AUTO=1` restores the 0135 rule.
+2. The stream queue only accepted arms the size of the first one (1 KB) and none over 2 KB; any arm is now split
+   into the 1 KB planar blocks the SPU2 consumes.
+
+Intro verified unattended after each step (24.4 s of stream audio, clean). Player: "fixed".
