@@ -3705,3 +3705,22 @@ Run 0234 (build 224):
 The residual 16-23 kHz loss is Catmull-Rom's own response near Nyquist; removing it needs a windowed-sinc kernel, which is only worth doing if the player still hears dullness.
 
 Patch 0054 was regenerated to cover the cubic version, and both new patches are now recorded in `C:\dev\PS2Recomp\.ape2_patches_applied` - the build script re-applies every patch in `patches/ps2recomp`, so a patch left unrecorded there is applied on top of itself and fails.
+
+### 0222 - The intro music was read with the wrong stereo layout (0055)
+
+Player report: the intro music sounds "slightly muffled, pixely, the beat a little too deep, the yell a little too
+high pitched". The cause is not timing or resampling: each auto-DMA block is **planar**, the way the SPU2 reads
+it - 256 left samples, then 256 right samples (the PAL port's `spu2.c` reads them at +0 and +0x200). The queue
+drain in `pullSpu2Pcm` read the 1 KB block as interleaved L/R pairs, so each ear got every other sample at twice
+the pitch, in 2.7 ms pieces 187.5 times a second.
+
+Measured on a raw block dump (`dumps/spu2e/spu2_core1.bin`, 5,775 distinct blocks):
+
+- planar: median sample step inside a block **446**, across a block seam **443** (seamless); roughness 0.29/0.30
+- interleaved (old): inside 795, seam 967; roughness 0.53
+
+The 0208 "bit-identical" check could not see this: both sides of that comparison read the same bytes the same
+wrong way. Fixed in `iop_memory.cpp` (patch 0055); `APE2_SPU2_REF` now writes the de-planarised pairs. After the
+fix a 45 s intro run's device capture has roughness 0.27/0.26 (dev224: 0.46) and L/R correlation 0.86.
+Listening files: `dumps/audio/dev_fixed.wav` (fixed build) and `dumps/audio/intro_planar_fixed.wav` (the dump
+re-read planar). The pacing, queue and resampler from 0204-0215 are unchanged.

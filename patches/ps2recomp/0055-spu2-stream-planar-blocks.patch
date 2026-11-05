@@ -1,0 +1,38 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 502fc0f..ac581be 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -948,15 +948,26 @@ namespace
+                 while (filledFrames < frames && queue.count != 0u && blockFrames != 0u)
+                 {
+                     const size_t take = std::min(blockFrames - blockCursor, frames - filledFrames);
+-                    const int16_t *src = reinterpret_cast<const int16_t *>(queue.blocks[queue.head].data()) +
+-                                         blockCursor * 2u;
+-                    for (size_t i = 0; i < take * 2u; ++i)
++                    // 0222: an auto-DMA block is planar, as the SPU2 reads it: the first half holds the left
++                    // samples and the second half the right (256 + 256 for the 1 KB blocks, as the PAL port's
++                    // spu2.c reads them at +0 and +0x200). Reading it as interleaved L/R pairs gave each ear every
++                    // other sample at twice the pitch, in 2.7 ms pieces - the intro music's "pixely" sound.
++                    const int16_t *block = reinterpret_cast<const int16_t *>(queue.blocks[queue.head].data());
++                    const int16_t *srcL = block + blockCursor;
++                    const int16_t *srcR = block + blockFrames + blockCursor;
++                    for (size_t i = 0; i < take; ++i)
+                     {
+-                        const int mixed = static_cast<int>(destination[filledFrames * 2u + i]) + static_cast<int>(src[i]);
+-                        destination[filledFrames * 2u + i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
++                        int16_t *outFrame = destination + (filledFrames + i) * 2u;
++                        outFrame[0] = static_cast<int16_t>(
++                            std::clamp(static_cast<int>(outFrame[0]) + static_cast<int>(srcL[i]), -32768, 32767));
++                        outFrame[1] = static_cast<int16_t>(
++                            std::clamp(static_cast<int>(outFrame[1]) + static_cast<int>(srcR[i]), -32768, 32767));
++                        if (refStreamFile != nullptr)
++                        {
++                            const int16_t pair[2] = {srcL[i], srcR[i]};
++                            std::fwrite(pair, sizeof(pair), 1u, refStreamFile);
++                        }
+                     }
+-                    if (refStreamFile != nullptr)
+-                        std::fwrite(src, sizeof(int16_t) * 2u, take, refStreamFile);
+                     filledFrames += take;
+                     blockCursor += take;
+                     if (blockCursor >= blockFrames)
