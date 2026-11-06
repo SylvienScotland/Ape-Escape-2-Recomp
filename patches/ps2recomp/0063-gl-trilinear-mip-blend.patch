@@ -1,0 +1,221 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 310c4c6..2e2131d 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -33,6 +33,14 @@
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ 
++// 0063: the next mip level of the primitive being submitted, for the trilinear blend (set by gs_frontend.cpp)
++struct Ape2MipBlend
++{
++    bool on = false;
++    GSDrawState next{};
++    float base = 0.0f, k = 0.0f, scale = 1.0f;
++};
++
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
+@@ -68,7 +76,7 @@ namespace ape2gl
+     constexpr GLenum GL_NEAREST_MIPMAP_NEAREST = 0x2700, GL_LINEAR_MIPMAP_LINEAR = 0x2703;
+     constexpr GLenum GL_TEXTURE_MAG_FILTER = 0x2800, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803;
+     constexpr GLenum GL_CLAMP_TO_EDGE = 0x812F, GL_REPEAT = 0x2901;
+-    constexpr GLenum GL_TEXTURE0 = 0x84C0, GL_TEXTURE1 = 0x84C1;
++    constexpr GLenum GL_TEXTURE0 = 0x84C0, GL_TEXTURE1 = 0x84C1, GL_TEXTURE2 = 0x84C2;
+     constexpr GLenum GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0;
+     constexpr GLenum GL_FRAGMENT_SHADER = 0x8B30, GL_VERTEX_SHADER = 0x8B31, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82;
+     constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9;
+@@ -470,6 +478,8 @@ private:
+         int needDst = 0;
+         int scx0 = 0, scy0 = 0, scx1 = 0, scy1 = 0;
+         int pass2 = 0;
++        GLuint tex2 = 0;     // 0063: the next mip level, blended in by the per-pixel LOD
++        float lod[4] = {};   // on, base level, K, 2^L
+         bool operator==(const DrawState &o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+     };
+     struct Vert
+@@ -489,6 +499,7 @@ private:
+     int m_scale = 1;
+     bool m_barrier = false;
+     GLuint m_prog = 0, m_progCopy = 0, m_vao = 0, m_vbo = 0;
++    GLint u_tex2 = -1, u_lod = -1;
+     GLint u_tex = -1, u_dst = -1, u_vp = -1, u_mode = -1, u_atst = -1, u_blend = -1, u_misc = -1, u_dstoff = -1, u_fix = -1, u_fog = -1;
+     GLint uc_tex = -1;
+     GLuint m_dstCopyTex = 0, m_dstCopyFbo = 0;
+@@ -531,7 +542,7 @@ private:
+     static bool is16(uint32_t psm) { return psm == GS_PSM_CT16 || psm == GS_PSM_CT16S || psm == GS_PSM_Z16 || psm == GS_PSM_Z16S; }
+     bool onGl() const { return m_inited && !m_failed && std::this_thread::get_id() == m_glThread; }
+ 
+-    // ---------------------------------------------------------------- shaders (PAL's, unchanged)
++    // ---------------------------------------------------------------- shaders (PAL's; 0063 adds the trilinear blend)
+     static constexpr const char *kVs =
+         "#version 330 core\n"
+         "in vec4 a0; in vec4 a1; in vec4 a2;\n"
+@@ -546,7 +557,7 @@ private:
+     static constexpr const char *kFs =
+         "#version 330 core\n"
+         "in vec4 v_col; flat in vec4 v_colf; noperspective in vec3 v_stq; noperspective in float v_z; noperspective in float v_f;\n"
+-        "uniform sampler2D u_tex; uniform sampler2D u_dst;\n"
++        "uniform sampler2D u_tex; uniform sampler2D u_dst; uniform sampler2D u_tex2; uniform vec4 u_lod;\n"
+         "uniform ivec4 u_mode; uniform ivec4 u_atst; uniform ivec4 u_blend; uniform ivec4 u_misc; uniform ivec4 u_fog;\n"
+         "uniform vec2 u_dstoff; uniform float u_fix;\n"
+         "layout(location = 0, index = 0) out vec4 o_col;\n"
+@@ -556,7 +567,13 @@ private:
+         "  c = floor(c + 0.0001);\n"
+         "  vec3 rgb = c.rgb; float a = c.a;\n"
+         "  if (u_mode.x != 0) {\n"
+-        "    vec4 t = floor(texture(u_tex, v_stq.xy / v_stq.z) * 255.0 + 0.5);\n"
++        "    vec2 uv = v_stq.xy / v_stq.z;\n"
++        "    vec4 t = texture(u_tex, uv);\n"
++        "    if (u_lod.x > 0.5) {\n"
++        "      float lod = -log2(max(abs(v_stq.z), 1e-30)) * u_lod.w + u_lod.z;\n"
++        "      t = mix(t, texture(u_tex2, uv), clamp(lod - u_lod.y, 0.0, 1.0));\n"
++        "    }\n"
++        "    t = floor(t * 255.0 + 0.5);\n"
+         "    int tfx = u_mode.y;\n"
+         "    if (tfx == 0) { rgb = floor(t.rgb * c.rgb / 128.0); a = u_mode.z != 0 ? floor(t.a * c.a / 128.0) : c.a; }\n"
+         "    else if (tfx == 1) { rgb = t.rgb; a = u_mode.z != 0 ? t.a : c.a; }\n"
+@@ -634,6 +651,8 @@ private:
+             return false;
+         }
+         u_tex = glGetUniformLocation(m_prog, "u_tex");
++        u_tex2 = glGetUniformLocation(m_prog, "u_tex2");
++        u_lod = glGetUniformLocation(m_prog, "u_lod");
+         u_dst = glGetUniformLocation(m_prog, "u_dst");
+         u_vp = glGetUniformLocation(m_prog, "u_vp");
+         u_mode = glGetUniformLocation(m_prog, "u_mode");
+@@ -1399,6 +1418,8 @@ private:
+         glUseProgram(m_prog);
+         glUniform1i(u_tex, 0);
+         glUniform1i(u_dst, 1);
++        glUniform1i(u_tex2, 2);
++        glUniform4f(u_lod, s.lod[0], s.lod[1], s.lod[2], s.lod[3]);
+         glUniform4f(u_vp, 2.0f / rt.w, 2.0f / rt.h, 1.0f / 4294967296.0f, 0);
+         glUniform4i(u_mode, s.mode[0], s.mode[1], s.mode[2], s.mode[3]);
+         glUniform4i(u_atst, s.atst[0], s.atst[1], s.atst[2], s.atst[3]);
+@@ -1437,6 +1458,16 @@ private:
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, s.wms == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, s.wmt == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++            if (s.tex2)
++            {
++                glActiveTexture(GL_TEXTURE2);
++                glBindTexture(GL_TEXTURE_2D, s.tex2);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, f);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, s.wms == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, s.wmt == 0 ? GL_REPEAT : GL_CLAMP_TO_EDGE);
++                glActiveTexture(GL_TEXTURE0);
++            }
+         }
+         if (s.needDst)
+             bindDst(s, std::max(m_bx0, 0), std::max(m_by0, 0), std::min(m_bx1, rt.w - 1), std::min(m_by1, rt.h - 1));
+@@ -2014,6 +2045,23 @@ private:
+         }
+         DrawState s;
+         stateFrom(st, s, rt, zb, tex, texRt);
++        {
++            extern thread_local Ape2MipBlend g_ape2MipBlend; // gs_frontend.cpp (0063)
++            if (g_ape2MipBlend.on && tme && tex && !texRt)
++            {
++                int dw2 = 1, dh2 = 1;
++                syncRange(g_ape2MipBlend.next.context.tex0.tbp0, texBlocks(g_ape2MipBlend.next.context.tex0), "texture");
++                const GLuint tex2 = cpuTexture(g_ape2MipBlend.next, dw2, dh2);
++                if (tex2)
++                {
++                    s.tex2 = tex2;
++                    s.lod[0] = 1.0f;
++                    s.lod[1] = g_ape2MipBlend.base;
++                    s.lod[2] = g_ape2MipBlend.k;
++                    s.lod[3] = g_ape2MipBlend.scale;
++                }
++            }
++        }
+         if (dupTie && strictZ && s.depthTest)
+             s.depthFunc = static_cast<int>(GL_GREATER); // 0056: a coplanar twin must not overwrite at equal depth
+         if (tme && !tex)
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index de0117a..3c65356 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -20,6 +20,15 @@ namespace
+     void mipSubmit(GSRasterBackend &be, const GSPrimitiveBatch &in, int force = -100); // 0226, below
+ }
+ 
++// 0063: the next mip level for the GPU renderer's trilinear blend (zz_ape2_gs_gl.cpp reads it in Submit)
++struct Ape2MipBlend
++{
++    bool on = false;
++    GSDrawState next{};
++    float base = 0.0f, k = 0.0f, scale = 1.0f;
++};
++thread_local Ape2MipBlend g_ape2MipBlend;
++
+ namespace
+ {
+     static constexpr uint32_t kHostFrameWidth = 640u;
+@@ -2276,7 +2285,62 @@ namespace
+         if (tri && !noSplit && force == -100 && !in.state.prim.fst && !m.lcm && m.mmin >= 2 && m.mxl > 0 && mipSplit(be, in, m))
+             return;
+         GSPrimitiveBatch b = in;
+-        mipApply(b, m, mipEffective(m, force != -100 ? force : mipPick(m, in)));
++        const int lv = mipEffective(m, force != -100 ? force : mipPick(m, in));
++        mipApply(b, m, lv);
++        {
++            // during an F9 burst: mipmapped primitives covering APE2_PROBE_PT=x,y (default 256,330) - debugging aid
++            if (g_ape2FrameDumpBurst.load(std::memory_order_relaxed) > 0)
++            {
++                static int px = -1, py = -1;
++                if (px < 0)
++                {
++                    px = 256;
++                    py = 330;
++                    if (const char *e = std::getenv("APE2_PROBE_PT"))
++                        std::sscanf(e, "%d,%d", &px, &py);
++                }
++                const auto &c = in.state.context;
++                const float ofx = static_cast<float>(c.xyoffset.ofx >> 4), ofy = static_cast<float>(c.xyoffset.ofy >> 4);
++                float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, qmin = 1e30f, qmax = -1e30f;
++                for (int i = 0; i < in.vertexCount; ++i)
++                {
++                    const GSVertex &v = in.vertices[static_cast<size_t>(i)];
++                    x0 = std::min(x0, v.x - ofx);
++                    x1 = std::max(x1, v.x - ofx);
++                    y0 = std::min(y0, v.y - ofy);
++                    y1 = std::max(y1, v.y - ofy);
++                    qmin = std::min(qmin, v.q);
++                    qmax = std::max(qmax, v.q);
++                }
++                if (px >= x0 && px <= x1 && py >= y0 && py <= y1)
++                    std::fprintf(stderr, "[mip:probe] burst %d tbp0=0x%x psm=0x%x %dx%d tex1=%016llx mip1=%016llx lv=%d -> tbp0=0x%x %dx%d q=%g..%g abe=%d alpha=%llx test=%llx tfx=%d tcc=%d fst=%d\n",
++                                 g_ape2FrameDumpBurst.load(std::memory_order_relaxed), c.tex0.tbp0, c.tex0.psm, 1 << c.tex0.tw, 1 << c.tex0.th,
++                                 static_cast<unsigned long long>(c.tex1), static_cast<unsigned long long>(c.miptbp1), lv,
++                                 b.state.context.tex0.tbp0, b.state.textureWidth, b.state.textureHeight, qmin, qmax,
++                                 in.state.prim.abe ? 1 : 0, static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test),
++                                 c.tex0.tfx, c.tex0.tcc, in.state.prim.fst ? 1 : 0);
++            }
++        }
++        // 0063: the trilinear filters (MMIN 3, 5) blend floor(LOD) and the next level by LOD's fraction, per
++        // pixel. With one level per primitive the switch showed as light bands across the floors that moved as
++        // you walked; the GPU renderer now gets the next level too and blends by the per-pixel LOD. The next
++        // level is one the PS2 samples in these modes, so the game has it uploaded. APE2_GS_TRILINEAR=0
++        // disables it (the software renderer keeps one level).
++        static const bool triOn = [] { const char *e = std::getenv("APE2_GS_TRILINEAR"); return !(e && e[0] == '0'); }();
++        const int baseLv = std::max(lv, 0);
++        if (triOn && (m.mmin == 3 || m.mmin == 5) && !m.lcm && baseLv < m.mxl)
++        {
++            GSPrimitiveBatch b2 = in;
++            mipApply(b2, m, baseLv + 1);
++            g_ape2MipBlend.on = true;
++            g_ape2MipBlend.next = b2.state;
++            g_ape2MipBlend.base = static_cast<float>(baseLv);
++            g_ape2MipBlend.k = m.k;
++            g_ape2MipBlend.scale = static_cast<float>(1 << m.l);
++            be.Submit(b);
++            g_ape2MipBlend.on = false;
++            return;
++        }
+         be.Submit(b);
+     }
+ }

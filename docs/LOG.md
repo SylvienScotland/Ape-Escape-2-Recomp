@@ -4022,3 +4022,17 @@ CT32 among them).
 
 Result in the same stage: 52-60 fps (was 40-48), GS thread ~30% busy. Player: "feels a lot smoother, not 60 but
 smoother". Still open: the remaining dips, and the mip-level bands on the floors.
+### 0230 - Trilinear blend in the GPU renderer; what the "white layer" on the floors is (0063)
+
+- The trilinear filters (MMIN 3, 5) blend floor(LOD) and the next level per pixel; we drew one level per
+  primitive. The frontend now also prepares the next level (`g_ape2MipBlend`, a thread-local side channel to the
+  GL backend, so `GSDrawState` did not change) and the fragment shader blends it in by the per-pixel LOD,
+  `-log2(|q|) * 2^L + K` from the interpolated Q (`u_tex2`, `u_lod`). `APE2_GS_TRILINEAR=0` disables it; the
+  software renderer keeps one level. 54-60 fps over a 15-minute session.
+- The player still sees a light, whitish layer on the stage floors that moves as you walk, gone with
+  `APE2_GS_MIPMAP=0` (which brings back the flickering garbage). A probe (`[mip:probe]`, during an F9 burst:
+  mipmapped primitives covering `APE2_PROBE_PT=x,y`) shows the floor drawn twice with one texture: an opaque
+  base pass with K -18.1, L 1 (levels 1-2 near the camera), and a blended detail pass with K -20.0 (level 0).
+  All those levels are uploaded every frame (0x2fe0 / 0x30e0 / 0x3120 ...), and the levels match the GS
+  formula, so the paler middle distance is most likely the PS2's own look (averaged, lower-contrast levels under
+  the sharp detail pass). To be compared with PCSX2 or a console before changing anything.
