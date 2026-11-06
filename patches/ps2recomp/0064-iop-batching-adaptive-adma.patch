@@ -1,0 +1,75 @@
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index 720bb24..4fb3fd7 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -1105,6 +1105,26 @@ namespace
+             std::fprintf(stderr, "[spu2:admas] idle word=0x%03x now=0x%04x%c", m_admasWord & 0x3FFu, value, 10);
+     }
+ 
++    namespace
++    {
++        // 0064: the auto-DMA block period follows the playback queue, as the SPU2 paces it on the hardware (it
++        // consumes at exactly 48 kHz and interrupts when a block is used up). A fixed period could not suit both
++        // streams: the 0206 calibration (1240 cycles/word) is right for the title music and starved the FMVs' 48 kHz
++        // stereo sound (133 blocks/s for 187.5, the movies played 1.5x long since the player follows its audio),
++        // and 880 was right for the movies and overfed the music (dropped blocks). The period is the calibrated
++        // one times 0.3 + 0.15 x depth (depth ~4.7 = 1x; 0.4x at most for an empty queue, 1.6x at most). APE2_SPU2_ADMA_ADAPT=0
++        // keeps it fixed.
++        uint64_t admaPaced(uint64_t base)
++        {
++            static const bool adapt = [] { const char *e = std::getenv("APE2_SPU2_ADMA_ADAPT"); return !(e && e[0] == '0'); }();
++            if (!adapt || base == 0u)
++                return base;
++            const double depth = static_cast<double>(spu2Queue().count);
++            const double f = std::min(1.6, std::max(0.4, 0.3 + depth * 0.15));
++            return std::max<uint64_t>(1u, static_cast<uint64_t>(static_cast<double>(base) * f));
++        }
++    }
++
+     std::optional<uint64_t> IopMemory::dmaRearmDelay(int irq) const noexcept
+     {
+         static unsigned calls = 0u;
+@@ -1119,7 +1139,7 @@ namespace
+                          static_cast<unsigned long long>(m_admaTimer.delayCycles));
+         if (!m_admaTimer.active || m_admaTimer.irq != irq || m_admaTimer.delayCycles == 0u)
+             return std::nullopt;
+-        return m_admaTimer.delayCycles;
++        return admaPaced(m_admaTimer.delayCycles);
+     }
+ 
+     std::optional<IopMemory::DmaStart> IopMemory::takeDmaStart() noexcept
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 65483d4..7fd51df 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -842,6 +842,8 @@ namespace ps2x::iop::detail
+             static uint64_t lastLogCycles = 0u;
+             static auto lastLog = std::chrono::steady_clock::now();
+             probeCycles += cycles;
++            static uint32_t probeCalls = 0; // 0064: the clock read once per 1024 calls, not on every one (it cost ~10% of the EE thread in movies)
++            if ((++probeCalls & 0x3FFu) == 0u)
+             {
+                 const auto now = std::chrono::steady_clock::now();
+                 const double elapsed =
+@@ -1129,11 +1131,19 @@ namespace ps2x::iop::detail
+ 
+     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
+     {
++        // 0064: run the IOP once at least APE2_IOP_BATCH (default 64) IOP cycles are owed - about 2 us - rather than
++        // for every single cycle: each call repeats the interrupt/timer service and the EE checkpoints call this
++        // constantly (the IOP was 44% of the EE thread in the FMVs). APE2_IOP_BATCH=1 restores the old stepping.
++        static const uint64_t batch = [] { const char *e = std::getenv("APE2_IOP_BATCH"); const long v = e ? std::strtol(e, nullptr, 10) : 64; return static_cast<uint64_t>(v > 0 ? v : 1); }();
+         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+         const uint64_t iopCycles = total / 8u;
++        if (iopCycles < batch)
++        {
++            m_impl->eeCycleCarry = total;
++            return;
++        }
+         m_impl->eeCycleCarry = total % 8u;
+-        if (iopCycles)
+-            m_impl->runCycles(iopCycles);
++        m_impl->runCycles(iopCycles);
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

@@ -4036,3 +4036,18 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   All those levels are uploaded every frame (0x2fe0 / 0x30e0 / 0x3120 ...), and the levels match the GS
   formula, so the paler middle distance is most likely the PS2's own look (averaged, lower-contrast levels under
   the sharp detail pass). To be compared with PCSX2 or a console before changing anything.
+### 0231 - FMVs at their real length: the audio feed paced them (0064)
+
+- The intro (D1.PSS) is 39.8 s by its PTS; we took ~60 s, and it took that long however the EE was changed
+  (clock catch-up, IOP cost, frame lock off: 60 fps presented, still 56 s). The player follows its audio: the
+  48 kHz stereo PCM (`SShd`: type 1, 48000, 2 ch, 512 interleave) arrived at ~133 blocks/s for 187.5
+  (`[spu2:wall]`), because the auto-DMA block period is the 0206 calibration, 1240 IOP cycles per word, tuned on
+  the title music. 880 gave the movie its 40 s and overfed the music (dropped blocks climbing). The period now
+  follows the playback queue, as the SPU2 paces it on the hardware: calibrated x (0.3 + 0.15 x depth), 0.4x to
+  1.6x (`admaPaced`, `APE2_SPU2_ADMA_ADAPT=0`). Intro 40 s, music afterwards with no steady drops. Player: "very
+  nice, sounds great, only counted 7 fps dips in the intro".
+- The IOP was 44% of the EE thread in the FMVs: `runCycles` read the clock on every call for a probe that logs
+  every 2 s (now once per 1024 calls), and the IOP was stepped for every owed cycle (now once 64 are owed,
+  `APE2_IOP_BATCH`).
+- Found on the way, not changed yet: guest thread switches throw a C++ exception (`EeDispatcherTransfer`,
+  `CxxThrowException` ~17% of the EE thread in the movies, which yield tens of thousands of times a second).
