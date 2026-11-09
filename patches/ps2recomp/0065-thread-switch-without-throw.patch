@@ -1,0 +1,296 @@
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..6a9aa59 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -338,6 +338,27 @@ public:
+     bool registerFunction(uint32_t address, RecompiledFunction func);
+     RecompiledFunction lookupFunction(uint32_t address);
+     bool hasFunction(uint32_t address) const;
++    // 0065: host frames (stubs, overrides, scheduler callbacks, syscall handlers) between the scheduler loop and
++    // the running guest code. A thread switch may unwind by plain returns instead of a C++ throw only when the
++    // syscall is the one host frame, so no host code would carry on after the switch.
++    bool isHostFunction(uint32_t address) const;
++    uint32_t m_ape2HostDepth = 0u;
++    uint32_t m_ape2SyscallRetPc = 0u;
++    struct Ape2HostFrame
++    {
++        PS2Runtime &runtime;
++        bool on;
++        Ape2HostFrame(PS2Runtime &r, bool o) : runtime(r), on(o)
++        {
++            if (on)
++                ++runtime.m_ape2HostDepth;
++        }
++        ~Ape2HostFrame()
++        {
++            if (on)
++                --runtime.m_ape2HostDepth;
++        }
++    };
+     bool dispatchGuestBranch(uint8_t *rdram,
+                              R5900Context *ctx,
+                              uint32_t targetPc,
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..60d14c2 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -299,6 +299,9 @@ public:
+     int rotateReadyQueue(int priority, bool interruptSafe);
+     int releaseWait(int id, bool interruptSafe);
+     void transferIfRequested(bool interruptSafe);
++    // 0065: set when transferIfRequested switched threads without throwing; dispatchGuestBranch then returns false
++    // so the generated callers unwind by plain returns, and the scheduler loop clears it.
++    bool transferDeferred() const noexcept { return m_transferDeferred; }
+ 
+     int createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option);
+     int deleteSemaphore(int id, bool interruptSafe);
+@@ -422,6 +425,8 @@ private:
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
++    bool m_transferDeferred = false; // 0065
++    bool canDeferTransfer() const;   // 0065
+     bool m_timeSliceExpired = false;
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 0b13f23..2f839f4 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -1,3 +1,4 @@
++#include <map>
+ #include <string>
+ #include <cstdio>
+ #include <unordered_map>
+@@ -275,6 +276,7 @@ void EeScheduler::run()
+             running->resumeCompletion = {};
+             try
+             {
++                PS2Runtime::Ape2HostFrame hostFrame(m_runtime, true); // 0065
+                 completion(running->activeContext());
+             }
+             catch (const EeDispatcherTransfer &)
+@@ -309,6 +311,7 @@ void EeScheduler::run()
+                 {
+                     try
+                     {
++                        PS2Runtime::Ape2HostFrame hostFrame(m_runtime, true); // 0065
+                         completed.onComplete(completed.context, running->activeContext());
+                     }
+                     catch (const EeDispatcherTransfer &)
+@@ -407,7 +410,11 @@ void EeScheduler::run()
+             m_guestExecuting.store(true, std::memory_order_release);
+             const auto callStart = std::chrono::steady_clock::now(); // 0130
+             const uint64_t callStartCycle = m_eeCycle;               // 0061
+-            function(m_rdram, &context, &m_runtime);
++            {
++                PS2Runtime::Ape2HostFrame hostFrame(m_runtime, m_runtime.isHostFunction(context.pc));
++                function(m_rdram, &context, &m_runtime);
++            }
++            m_transferDeferred = false; // 0065
+             {
+                 // 0130: one generated call taking tens of milliseconds would explain the ~90 ms the EE loses per
+                 // frame while the presenter stays at 60 fps and neither CPU accounts any cycles.
+@@ -767,6 +774,40 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     return KE_OK;
+ }
+ 
++extern uint32_t g_ape2LastSyscall, g_ape2LastSyscallRa; // ps2_runtime.cpp
++namespace
++{
++    // APE2_XFERLOG=1: count thread transfers per kind (each one is a C++ throw) and print them every 2 s
++    // (debugging aid, Ape Escape 2 recomp)
++    void ape2NoteTransfer(int kind)
++    {
++        static const bool on = std::getenv("APE2_XFERLOG") != nullptr;
++        if (!on)
++            return;
++        static uint64_t counts[5] = {};
++        static auto last = std::chrono::steady_clock::now();
++        ++counts[kind];
++        static std::map<uint64_t, uint64_t> bySite;
++        if (kind == 0)
++            ++bySite[(uint64_t(g_ape2LastSyscall) << 32) | g_ape2LastSyscallRa];
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(2))
++        {
++            std::fprintf(stderr, "[xfer] 2s: yield %llu block %llu invoke %llu invokeSeq %llu exit %llu%c",
++                         (unsigned long long)counts[0], (unsigned long long)counts[1], (unsigned long long)counts[2],
++                         (unsigned long long)counts[3], (unsigned long long)counts[4], 10);
++            for (const auto &[k, n] : bySite)
++                if (n > 100u)
++                    std::fprintf(stderr, "[xfer]   yield syscall 0x%x ra 0x%x: %llu%c", unsigned(k >> 32), unsigned(k),
++                                 (unsigned long long)n, 10);
++            bySite.clear();
++            for (auto &c : counts)
++                c = 0;
++            last = now;
++        }
++    }
++}
++
+ [[noreturn]] void EeScheduler::exitCurrent(bool deleteThreadRecord)
+ {
+     assertExecutor();
+@@ -785,6 +826,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+         m_runtime.guestFree(ownedStack);
+     }
+     publishSnapshot();
++    ape2NoteTransfer(4);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1094,6 +1136,31 @@ int EeScheduler::releaseWait(int id, bool interruptSafe)
+     return KE_OK;
+ }
+ 
++// 0065: a thread switch normally throws EeDispatcherTransfer to drop the guest code's native frames, and on
++// Windows each throw costs microseconds. The FMV threads yield to each other ~70,000 times a second
++// (RotateThreadReadyQueue from 0x1a54f0, ~17% of the EE thread in throw/unwind). When the syscall handler is the
++// only host frame and the guest continues with just `jr $ra; nop` (every libkernel syscall stub), the switch can
++// unwind by returns instead: the stub returns to its caller's dispatchGuestBranch, which sees the deferred
++// transfer and returns false, and so on up to the scheduler loop. Executing the `jr $ra` early only moves the
++// thread's resume pc from the stub to its caller. APE2_XFER_DEFER=0 always throws.
++bool EeScheduler::canDeferTransfer() const
++{
++    static const bool enabled = [] { const char *e = std::getenv("APE2_XFER_DEFER"); return !(e && e[0] == '0'); }();
++    const uint32_t pc = m_runtime.m_ape2SyscallRetPc;
++    if (!enabled || pc == 0u || m_runtime.m_ape2HostDepth != 1u || m_rdram == nullptr)
++    {
++        return false;
++    }
++    const uint32_t offset = pc & 0x01FFFFFCu;
++    if (offset + 8u > PS2_RAM_SIZE)
++    {
++        return false;
++    }
++    uint32_t words[2] = {};
++    std::memcpy(words, m_rdram + offset, sizeof(words));
++    return words[0] == 0x03E00008u && words[1] == 0u;
++}
++
+ void EeScheduler::transferIfRequested(bool interruptSafe)
+ {
+     assertExecutor();
+@@ -1111,6 +1178,12 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
+     m_rescheduleRequested = false;
+     m_timeSliceExpired = false;
+     publishSnapshot();
++    if (canDeferTransfer())
++    {
++        m_transferDeferred = true;
++        return;
++    }
++    ape2NoteTransfer(0);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1414,6 +1487,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     invocation.sequence = ++m_invocationSequence;
+     owner->invocations.push_back(std::move(invocation));
+     publishSnapshot();
++    ape2NoteTransfer(2);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1433,6 +1507,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+         owner->invocations.push_back(std::move(*it));
+     }
+     publishSnapshot();
++    ape2NoteTransfer(3);
+     throw EeDispatcherTransfer{};
+ }
+ 
+@@ -1984,6 +2059,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
+     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
+     m_currentThreadId = 0;
+     publishSnapshot();
++    ape2NoteTransfer(1);
+     throw EeDispatcherTransfer{};
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 970b44e..f7aac64 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1187,9 +1187,36 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // 0065: slots replaced after start-up (stubs, game overrides); the static table holds only generated code
++    std::vector<uint8_t> &ape2HostSlots()
++    {
++        static std::vector<uint8_t> slots;
++        return slots;
++    }
++}
++
++bool PS2Runtime::isHostFunction(uint32_t address) const
++{
++    uint32_t slot = 0u;
++    if (!generatedFunctionTableSlot(address, slot))
++        return true;
++    const auto &slots = ape2HostSlots();
++    return slot < slots.size() && slots[slot] != 0u;
++}
++
+ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
+ {
+     uint32_t slot = 0u;
++    if (generatedFunctionTableSlot(address, slot))
++    {
++        auto &slots = ape2HostSlots();
++        if (slots.size() <= slot)
++            slots.resize(static_cast<size_t>(g_ps2RecompiledFunctionTableSlotCount), 0u);
++        if (slot < slots.size())
++            slots[slot] = 1u;
++    }
+     if (!generatedFunctionTableSlot(address, slot))
+     {
+         std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
+@@ -1508,7 +1535,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+             upperBefore[k] = w[1];
+         }
+     }
+-    targetFn(rdram, ctx, this);
++    {
++        Ape2HostFrame hostFrame(*this, isHostFunction(targetPc));
++        targetFn(rdram, ctx, this);
++    }
++    // 0065: the thread switched during the call without a throw; unwind this guest frame by returning
++    if (m_eeScheduler && m_eeScheduler->transferDeferred())
++    {
++        return false;
++    }
+     if (callCheck && ctx->pc == fallthroughPc)
+     {
+         for (int k = 0; k < 9; ++k)
+@@ -1623,6 +1658,8 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx)
+     handleSyscall(rdram, ctx, 0);
+ }
+ 
++uint32_t g_ape2LastSyscall = 0u, g_ape2LastSyscallRa = 0u; // APE2_XFERLOG (EeScheduler.cpp)
++
+ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId)
+ {
+     if (ctx->in_delay_slot)
+@@ -1635,6 +1672,17 @@ void PS2Runtime::handleSyscall(uint8_t *rdram, R5900Context *ctx, uint32_t encod
+                                    ? encodedSyscallId
+                                    : getRegU32(ctx, 3); // $v1 / $3 is the EE kernel syscall number
+ 
++    // 0065: the handler is a host frame; record where the guest code continues for canDeferTransfer
++    Ape2HostFrame hostFrame(*this, true);
++    struct RetPcScope
++    {
++        uint32_t &slot;
++        uint32_t saved;
++        ~RetPcScope() { slot = saved; }
++    } retPcScope{m_ape2SyscallRetPc, m_ape2SyscallRetPc};
++    m_ape2SyscallRetPc = ctx->pc;
++    g_ape2LastSyscall = syscallId;
++    g_ape2LastSyscallRa = getRegU32(ctx, 31);
+     if (ps2_syscalls::dispatchNumericSyscall(syscallId, rdram, ctx, this))
+     {
+         return;

@@ -4051,3 +4051,17 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   `APE2_IOP_BATCH`).
 - Found on the way, not changed yet: guest thread switches throw a C++ exception (`EeDispatcherTransfer`,
   `CxxThrowException` ~17% of the EE thread in the movies, which yield tens of thousands of times a second).
+### 0232 - Thread switches without a C++ throw (0065)
+
+- `APE2_XFERLOG` counts thread transfers per kind: in the FMVs ~70,000 a second are yields, all
+  RotateThreadReadyQueue(11) through 0x1a54f0 from two threads that hand the CPU to each other (0x1a4e84 in the
+  movie loop, 0x1a9158 in a loop that spins until 0x1aa578 has data). Every switch threw `EeDispatcherTransfer`
+  to drop the guest code's native frames, ~17% of the EE thread in throw/unwind.
+- When the syscall handler is the only host frame between the scheduler loop and the guest code, and the guest
+  continues with just `jr $ra; nop` (every libkernel syscall stub), the switch now unwinds by returns: the stub
+  returns, its caller's `dispatchGuestBranch` sees the deferred transfer and returns false, and so on up to the
+  loop. Host frames are tracked by a counter: slots set through `replaceFunction` (stubs, game overrides), the
+  syscall handler itself and the scheduler's completion callbacks. `APE2_XFER_DEFER=0` always throws.
+- Intro: yield throws 70,000/s -> ~0; 55.5 -> 56.6 fps average, 2 s windows under 55: 9 -> 5. Player: "much
+  smoother overall", dips 7 -> 3-4 (always in the same spots of the movie), music fine, gameplay fine; big dips
+  remain in the pause menu and the stage select screen.
