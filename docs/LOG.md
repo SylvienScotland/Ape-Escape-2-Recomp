@@ -4088,3 +4088,13 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   decode into a shared texture and corrupted other textures' copies (purple coin stack); fixed.
   `APE2_GL_TEXHASH_CHECK=1` decodes every hit again and compares: 376,000 hits checked in play, 0 wrong.
 - Player: gameplay "fps feels nice", icons clean; the pause menu and the stage select are still not smooth.
+### 0234 - Frame pacing stats, 1 ms timer resolution (0067)
+
+- The `[perf]` line now ends with `worst frame N ms, >20ms N, >33ms N`: the 2 s fps average hid the hitches the
+  player feels. In play, most 2 s windows held 1-3 frames of exactly 33 ms (one missed vblank); the intro has
+  single 83-100 ms frames at the same spots of the movie.
+- The scheduler paces frames with `wait_until`, which Windows rounds to the 15.6 ms timer tick unless the
+  process asks for 1 ms. `timeBeginPeriod(1)` at start-up (`APE2_TIMER_RES=0` keeps the default tick). Title:
+  0-1 slow frames per 2 s. Play: not a measurable change (2.5 -> 3.3 slow frames per 2 s on different content),
+  so the 33 ms frames in play have another cause, still open. Player: the pause menu now feels fixed (more
+  likely 0066's work) and "overall gameplay feels great".

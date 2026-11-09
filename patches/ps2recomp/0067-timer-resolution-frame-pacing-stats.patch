@@ -1,0 +1,89 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 2f839f4..826c471 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -774,6 +774,35 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
+     return KE_OK;
+ }
+ 
++#ifdef _WIN32
++// 0067: the scheduler paces frames with condition-variable waits (wait_until), and Windows rounds those to the
++// system timer tick, 15.6 ms unless the process asks for 1 ms. A wait meant to end just before a frame's deadline
++// woke up to ~15 ms late: single 33 ms frames (one missed vblank) 1-3 times every 2 s in play. APE2_TIMER_RES=0
++// keeps the default tick.
++extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int);
++extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned int);
++#pragma comment(lib, "winmm.lib")
++namespace
++{
++    struct Ape2TimerResolution
++    {
++        bool on = false;
++        Ape2TimerResolution()
++        {
++            const char *e = std::getenv("APE2_TIMER_RES");
++            on = !(e && e[0] == '0');
++            if (on)
++                timeBeginPeriod(1u);
++        }
++        ~Ape2TimerResolution()
++        {
++            if (on)
++                timeEndPeriod(1u);
++        }
++    } g_ape2TimerResolution;
++}
++#endif
++
+ extern uint32_t g_ape2LastSyscall, g_ape2LastSyscallRa; // ps2_runtime.cpp
+ namespace
+ {
+diff --git a/ps2xRuntime/src/lib/ps2_perf.h b/ps2xRuntime/src/lib/ps2_perf.h
+index b9ddd03..93e5b47 100644
+--- a/ps2xRuntime/src/lib/ps2_perf.h
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -41,6 +41,9 @@ namespace ps2perf
+     inline std::atomic<uint64_t> g_calls[ZoneCount]{};
+     inline std::atomic<uint64_t> g_frames{0};
+     inline std::atomic<int64_t> g_nextReportNs{0};
++    // frame pacing: the longest gap between two frames and the gaps over 20 / 33 ms in the interval
++    inline std::atomic<int64_t> g_worstGapNs{0};
++    inline std::atomic<uint32_t> g_gaps20{0}, g_gaps33{0};
+ 
+     inline int64_t nowNs()
+     {
+@@ -95,8 +98,11 @@ namespace ps2perf
+                 break;
+         }
+         if (len < static_cast<int>(sizeof(line)))
+-            std::snprintf(line + len, sizeof(line) - len, " | other %.0f%%",
+-                          wall > 0 ? 100.0 * (wall - inside) / wall : 0.0);
++            len += std::snprintf(line + len, sizeof(line) - len, " | other %.0f%%",
++                                 wall > 0 ? 100.0 * (wall - inside) / wall : 0.0);
++        if (len < static_cast<int>(sizeof(line)))
++            std::snprintf(line + len, sizeof(line) - len, " | worst frame %.1f ms, >20ms %u, >33ms %u",
++                          static_cast<double>(g_worstGapNs.exchange(0)) / 1e6, g_gaps20.exchange(0), g_gaps33.exchange(0));
+         std::fprintf(stderr, "%s\n", line);
+         std::fflush(stderr);
+ 
+@@ -222,6 +228,19 @@ namespace ps2perf
+     inline void countFrame()
+     {
+         g_frames.fetch_add(1, std::memory_order_relaxed);
+-        maybeReport(nowNs());
++        const int64_t now = nowNs();
++        static int64_t lastFrameNs = 0;
++        if (lastFrameNs != 0)
++        {
++            const int64_t gap = now - lastFrameNs;
++            if (gap > g_worstGapNs.load(std::memory_order_relaxed))
++                g_worstGapNs.store(gap, std::memory_order_relaxed);
++            if (gap > 20'000'000)
++                g_gaps20.fetch_add(1, std::memory_order_relaxed);
++            if (gap > 33'000'000)
++                g_gaps33.fetch_add(1, std::memory_order_relaxed);
++        }
++        lastFrameNs = now;
++        maybeReport(now);
+     }
+ }
