@@ -1,0 +1,526 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 2e2131d..5b7c272 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -1,3 +1,6 @@
++#include <chrono>
++#include <string>
++#include <map>
+ // GPU renderer (Ape Escape 2 recomp patch 0047): the GS drawn with OpenGL 3.3 core.
+ //
+ // A port of the PAL port's GPU renderer (JackyPendrag0n/ae2-recomp, port/src/gs_hw.h and gl.h, used with the
+@@ -302,20 +305,69 @@ public:
+         m_cpu->LoadClut(tex0, texclut);
+     }
+ 
++    // 0066: a local copy between two render targets of the same colour format stays on the GPU. The pause menu
++    // and the stage select copy whole 512x448 frames between targets every frame (0xe00 -> 0x0, 0x2a00.. ->
++    // 0xe00); each one read both targets back, copied in VRAM and uploaded the result again (~250 ms in every
++    // 2 s). The destination rectangle is marked as drawn, so anything that later reads that VRAM reads it back
++    // first. APE2_GPU_COPY=0 keeps the VRAM path.
++    bool gpuLocalCopy(const GSTransferCommand &command)
++    {
++        static const bool enabled = [] { const char *e = std::getenv("APE2_GPU_COPY"); return !(e && e[0] == '0'); }();
++        if (!enabled)
++            return false;
++        const auto &b = command.bitbltbuf;
++        const auto &p = command.trxpos;
++        const auto &r = command.trxreg;
++        if (b.spsm != b.dpsm || (b.spsm != GS_PSM_CT32 && b.spsm != GS_PSM_CT16))
++            return false;
++        const bool sixteen = is16(b.spsm);
++        Target *src = findTarget(b.sbp, b.sbw, sixteen);
++        Target *dst = findTarget(b.dbp, b.dbw, sixteen);
++        if (!src || !dst || src == dst)
++            return false;
++        const int w = static_cast<int>(r.rrw), h = static_cast<int>(r.rrh);
++        const int sx = static_cast<int>(p.ssax), sy = static_cast<int>(p.ssay);
++        const int dx = static_cast<int>(p.dsax), dy = static_cast<int>(p.dsay);
++        if (w <= 0 || h <= 0 || sx + w > src->w || sy + h > src->vh || dx + w > dst->w || dy + h > dst->vh)
++            return false;
++        flush();
++        const int S = m_scale;
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, src->fbo);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst->fbo);
++        glDisable(GL_SCISSOR_TEST);
++        glBlitFramebuffer(sx * S, sy * S, (sx + w) * S, (sy + h) * S, dx * S, dy * S, (dx + w) * S, (dy + h) * S,
++                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        glBindFramebuffer(GL_FRAMEBUFFER, dst->fbo);
++        mark(*dst, dx, dy, dx + w - 1, dy + h - 1);
++        dst->lru = ++m_tick;
++        src->lru = m_tick;
++        ++m_stGpuCopies;
++        return true;
++    }
++    uint64_t m_stGpuCopies = 0;
++
+     void BeginTransfer(const GSTransferCommand &command) override
+     {
++        if (onGl() && command.direction == 2u && gpuLocalCopy(command))
++            return;
+         if (onGl())
+         {
+             const auto &b = command.bitbltbuf;
+             const auto &p = command.trxpos;
+             const auto &r = command.trxreg;
++            // APE2_SYNCLOG: name the transfer in the read-back log (debugging aid)
++            static char dstWhy[160], srcWhy[160];
++            std::snprintf(dstWhy, sizeof(dstWhy), "transfer destination dir=%u dpsm=0x%x dbw=%u at %u,%u %ux%u from sbp=0x%x spsm=0x%x %u,%u",
++                          command.direction, b.dpsm, b.dbw, p.dsax, p.dsay, r.rrw, r.rrh, b.sbp, b.spsm, p.ssax, p.ssay);
++            std::snprintf(srcWhy, sizeof(srcWhy), "transfer source dir=%u spsm=0x%x sbw=%u at %u,%u %ux%u to dbp=0x%x dpsm=0x%x %u,%u",
++                          command.direction, b.spsm, b.sbw, p.ssax, p.ssay, r.rrw, r.rrh, b.dbp, b.dpsm, p.dsax, p.dsay);
+             if (command.direction == 0u || command.direction == 2u)
+             {
+                 // the destination's drawing goes back to VRAM before it is (partly) overwritten
+-                syncRange(b.dbp, transferBlocks(b.dbw, b.dpsm, p.dsay, r.rrw, r.rrh), "transfer destination");
++                syncTransfer(b.dbp, b.dbw, b.dpsm, p.dsay, r.rrw, r.rrh, dstWhy);
+             }
+             if (command.direction == 1u || command.direction == 2u)
+-                syncRange(b.sbp, transferBlocks(b.sbw, b.spsm, p.ssay, r.rrw, r.rrh), "transfer source");
++                syncTransfer(b.sbp, b.sbw, b.spsm, p.ssay, r.rrw, r.rrh, srcWhy);
+         }
+         m_cpu->BeginTransfer(command);
+         if (onGl())
+@@ -454,6 +506,9 @@ private:
+         GLuint ztex = 0;
+         bool gpuDirty = false;
+         int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
++        // 0066: rows already read back since they were last drawn. VRAM is the newer copy of those rows (the game
++        // may have uploaded into them since), so no later read-back may write them again.
++        std::vector<uint8_t> cleanRows;
+         uint64_t lru = 0;
+     };
+     struct Depth
+@@ -533,8 +588,95 @@ private:
+         uint64_t epoch = 0, key0 = 0, key1 = 0, key2 = 0;
+         uint32_t clutVersion = 0;
+         int w = 0, h = 0;
++        uint64_t contentHash = 0, contentId = 0; // 0067: the content cache entry tex belongs to
+     };
+     std::unordered_map<const void *, GlTexture> m_textures;
++    // 0067: GL textures by content. The game streams its textures: every frame it uploads them again into a shared
++    // VRAM area and draws with them right away, so the address-keyed cache saw ~8,000 stale textures a second in
++    // play (~230 M texels decoded and uploaded a second, the GS thread's main cost). A texture whose VRAM was
++    // rewritten is hashed first (its pages, format, size, palette and TEXA, not its address); the same content
++    // reuses the GL texture decoded before. APE2_GL_TEXHASH=0 disables it.
++    struct ContentTexture
++    {
++        GLuint tex = 0;
++        int w = 0, h = 0;
++        uint64_t lastFrame = 0, id = 0;
++        uint64_t texelHash = 0; // APE2_GL_TEXHASH_CHECK: hash of the decoded texels
++    };
++    static uint64_t texelHash(const GSCpuBackend::DecodedTexture &d)
++    {
++        uint64_t h = 1469598103934665603ull;
++        for (const uint32_t t : d.texels)
++            h = (h ^ t) * 1099511628211ull;
++        return h;
++    }
++    std::unordered_map<uint64_t, ContentTexture> m_content;
++    uint64_t m_contentTexels = 0, m_contentNextId = 0;
++    uint64_t m_stContentHits = 0, m_stContentMisses = 0;
++    static bool contentCacheOn()
++    {
++        static const bool on = [] { const char *e = std::getenv("APE2_GL_TEXHASH"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    static uint64_t contentHash(const GSCpuBackend::DecodedTexture &d)
++    {
++        // the pages the texture covers in its private VRAM copy, four lanes for speed
++        const uint64_t kMul = 0x9E3779B97F4A7C15ull;
++        uint64_t h0 = d.key[1] ^ 0x243F6A8885A308D3ull, h1 = d.key[2] ^ 0x13198A2E03707344ull;
++        const auto &t0 = d.decodeState.context.tex0;
++        uint64_t h2 = (static_cast<uint64_t>(t0.tbp0 & 31u) | (static_cast<uint64_t>(t0.tbw) << 8) |
++                       (static_cast<uint64_t>(t0.psm) << 16) | (static_cast<uint64_t>(d.w) << 24) | (static_cast<uint64_t>(d.h) << 40)) ^
++                      0xA4093822299F31D0ull;
++        uint64_t h3 = 0x082EFA98EC4E6C89ull;
++        const size_t page = GSMem::TexturePageCache::kPageSize;
++        for (uint32_t r = 0; r < d.pageRows; ++r)
++            for (uint32_t c = 0; c < d.pageCols; ++c)
++            {
++                const size_t off = (static_cast<size_t>(r) * d.pagesPerRow + c) * page;
++                if (off + page > d.raw.size())
++                    continue;
++                const uint8_t *q = d.raw.data() + off;
++                for (size_t i = 0; i < page; i += 32)
++                {
++                    uint64_t w[4];
++                    std::memcpy(w, q + i, 32);
++                    h0 = (h0 ^ w[0]) * kMul;
++                    h1 = (h1 ^ w[1]) * kMul;
++                    h2 = (h2 ^ w[2]) * kMul;
++                    h3 = (h3 ^ w[3]) * kMul;
++                    h0 ^= h0 >> 32;
++                    h1 ^= h1 >> 32;
++                    h2 ^= h2 >> 32;
++                    h3 ^= h3 >> 32;
++                }
++            }
++        uint64_t h = h0 ^ (h1 * 0xC2B2AE3D27D4EB4Full) ^ (h2 * 0x165667B19E3779F9ull) ^ (h3 * 0x27D4EB2F165667C5ull);
++        h ^= h >> 31;
++        return h | 1u;
++    }
++    bool contentAlive(const GlTexture &g) const
++    {
++        const auto it = m_content.find(g.contentHash);
++        return it != m_content.end() && it->second.id == g.contentId;
++    }
++    void contentEvict()
++    {
++        // textures unused for 30 frames; never one used in this or the previous frame (a batch may still use it)
++        const uint64_t kBudget = 48ull << 20; // texels
++        if (m_contentTexels <= kBudget && m_content.size() <= 8192u)
++            return;
++        for (auto it = m_content.begin(); it != m_content.end();)
++        {
++            if (it->second.lastFrame + 30u < m_frames)
++            {
++                glDeleteTextures(1, &it->second.tex);
++                m_contentTexels -= static_cast<uint64_t>(it->second.w) * static_cast<uint64_t>(it->second.h);
++                it = m_content.erase(it);
++            }
++            else
++                ++it;
++        }
++    }
+     uint64_t m_frames = 0;
+     uint64_t m_stDraws = 0, m_stBatches = 0, m_stDstReads = 0, m_stDownloads = 0, m_stDisplayDownloads = 0, m_stUploads = 0, m_stTexUploads = 0;
+     bool m_inDisplayDownload = false;
+@@ -783,7 +925,7 @@ private:
+         ++m_stUploads;
+     }
+     // the drawn part of a target back into VRAM (downscaled, point sampled)
+-    void download(Target &rt)
++    void download(Target &rt, int rowLo = -1, int rowHi = -1)
+     {
+         if (!rt.gpuDirty)
+             return;
+@@ -802,11 +944,53 @@ private:
+             glBindFramebuffer(GL_FRAMEBUFFER, m_dnFbo);
+             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_dnTex, 0);
+         }
+-        const int x0 = rt.dx0, y0 = rt.dy0, rw = rt.dx1 - rt.dx0 + 1, rh = rt.dy1 - rt.dy0 + 1;
+-        glBindFramebuffer(GL_FRAMEBUFFER, m_dnFbo);
+-        glViewport(0, 0, w, h);
+-        plainState();
+-        quad(rt.tex, -1, -1, 1, 1, 0, 0, 1, 1, false);
++        // 0066: a row range reads back only those dirty rows, skipping rows read back since they were last drawn;
++        // the target stays dirty until no dirty row is left
++        const int ry0 = rowLo < 0 ? rt.dy0 : std::max(rt.dy0, rowLo);
++        const int ry1 = rowHi < 0 ? rt.dy1 : std::min(rt.dy1, rowHi);
++        if (ry0 > ry1)
++            return;
++        if (rt.cleanRows.size() != static_cast<size_t>(rt.h))
++            rt.cleanRows.assign(static_cast<size_t>(rt.h), 0u);
++        bool blitted = false;
++        for (int a = ry0; a <= ry1;)
++        {
++            if (rt.cleanRows[static_cast<size_t>(a)])
++            {
++                ++a;
++                continue;
++            }
++            int b = a;
++            while (b + 1 <= ry1 && !rt.cleanRows[static_cast<size_t>(b + 1)])
++                ++b;
++            if (!blitted)
++            {
++                glBindFramebuffer(GL_FRAMEBUFFER, m_dnFbo);
++                glViewport(0, 0, w, h);
++                plainState();
++                quad(rt.tex, -1, -1, 1, 1, 0, 0, 1, 1, false);
++                blitted = true;
++            }
++            downloadRows(rt, a, b);
++            std::fill(rt.cleanRows.begin() + a, rt.cleanRows.begin() + b + 1, uint8_t{1});
++            a = b + 1;
++        }
++        bool any = false;
++        for (int y = rt.dy0; y <= rt.dy1 && !any; ++y)
++            any = !rt.cleanRows[static_cast<size_t>(y)];
++        if (!any)
++        {
++            rt.gpuDirty = false;
++            rt.cleanRows.assign(rt.cleanRows.size(), 0u);
++        }
++        ++m_stDownloads;
++        if (m_inDisplayDownload)
++            ++m_stDisplayDownloads;
++    }
++    // rows [ry0, ry1] of the target (already drawn into m_dnFbo) into VRAM
++    void downloadRows(Target &rt, int ry0, int ry1)
++    {
++        const int x0 = rt.dx0, y0 = ry0, rw = rt.dx1 - rt.dx0 + 1, rh = ry1 - ry0 + 1;
+         std::vector<uint32_t> px(static_cast<size_t>(rw) * static_cast<size_t>(rh));
+         glPixelStorei(GL_PACK_ALIGNMENT, 4);
+         glReadPixels(x0, y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+@@ -826,10 +1010,6 @@ private:
+                                       static_cast<uint32_t>(x0 + rw - 1), static_cast<uint32_t>(y0 + rh - 1));
+             m_cpu->m_vramEpoch.fetch_add(1);
+         }
+-        rt.gpuDirty = false;
+-        ++m_stDownloads;
+-        if (m_inDisplayDownload)
+-            ++m_stDisplayDownloads;
+     }
+ 
+     // ---------------------------------------------------------------- targets
+@@ -861,6 +1041,11 @@ private:
+         y1 = std::min(y1, o.h - 1);
+         if (x0 > x1 || y0 > y1)
+             return;
++        if (!o.gpuDirty)
++            o.cleanRows.assign(o.cleanRows.size(), 0u); // 0066
++        else
++            for (int y = y0; y <= y1 && y < static_cast<int>(o.cleanRows.size()); ++y)
++                o.cleanRows[static_cast<size_t>(y)] = 0u;
+         if (!o.gpuDirty)
+         {
+             o.dx0 = x0;
+@@ -1049,16 +1234,88 @@ private:
+         return z;
+     }
+     // [bp, bp + nblocks) overlaps a target with GPU-only content: read it back
++    // 0066: read back only the page rows that hold [bp, bp + nblocks), and skip rows already read back since the
++    // target was last drawn. A palette load of 8 blocks at the frame buffer's base read the whole 512x448 frame
++    // back every frame in play, and the pause menu / stage select read 512x512 targets back ~160 times a second.
++    // APE2_SYNC_ROWS=0 reads back whole targets as before.
+     void syncRange(uint32_t bp, uint32_t nblocks, const char *why)
+     {
+-        (void)why;
++        static const bool rows = [] { const char *e = std::getenv("APE2_SYNC_ROWS"); return !(e && e[0] == '0'); }();
+         for (Target &o : m_rt)
+             if (o.used && dirtyOverlaps(o, bp, nblocks))
+             {
++                int lo = -1, hi = -1;
++                if (rows && o.fbw != 0u)
++                {
++                    const uint32_t ph = o.is16 ? 64u : 32u;
++                    const uint32_t rowBlocks = o.fbw * 32u;
++                    const uint32_t first = bp > o.fbp ? bp - o.fbp : 0u;
++                    const uint32_t last = bp + nblocks - 1u - std::min(bp + nblocks - 1u, o.fbp);
++                    lo = static_cast<int>(first / rowBlocks * ph);
++                    hi = static_cast<int>((last / rowBlocks + 1u) * ph - 1u);
++                    lo = std::max(lo, o.dy0);
++                    hi = std::min(hi, o.dy1);
++                    if (lo > hi)
++                        continue;
++                    bool allClean = o.cleanRows.size() == static_cast<size_t>(o.h);
++                    for (int y = lo; y <= hi && allClean; ++y)
++                        allClean = o.cleanRows[static_cast<size_t>(y)] != 0u;
++                    if (allClean)
++                        continue;
++                }
++                noteSync(why, bp, nblocks, o);
++                const auto t0 = std::chrono::steady_clock::now();
+                 flush();
+-                download(o);
++                download(o, lo, hi);
++                m_syncNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+             }
+     }
++    // APE2_SYNCLOG=1: GPU read-backs per 2 s by cause, source range and target (debugging aid)
++    uint64_t m_syncNs = 0; // APE2_SYNCLOG
++    void noteSync(const char *why, uint32_t bp, uint32_t nblocks, const Target &o)
++    {
++        static const bool on = std::getenv("APE2_SYNCLOG") != nullptr;
++        if (!on)
++            return;
++        static std::map<std::string, uint64_t> counts;
++        static auto last = std::chrono::steady_clock::now();
++        char key[400];
++        std::snprintf(key, sizeof(key), "%s bp=0x%x+0x%x -> rt fbp=0x%x fbw=%u is16=%d %dx%d dirty x%d-%d y%d-%d", why, bp, nblocks,
++                      o.fbp, o.fbw, o.is16 ? 1 : 0, o.w, o.h, o.dx0, o.dx1, o.dy0, o.dy1);
++        ++counts[key];
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(2))
++        {
++            uint64_t total = 0;
++            for (const auto &[k, n] : counts)
++                total += n;
++            std::fprintf(stderr, "[gpu:sync] 2s: %llu read-backs, %.1f ms in flush + read-back%c", (unsigned long long)total,
++                         static_cast<double>(m_syncNs) / 1e6, 10);
++            m_syncNs = 0;
++            std::vector<std::pair<uint64_t, std::string>> top;
++            for (const auto &[k, n] : counts)
++                top.emplace_back(n, k);
++            std::sort(top.rbegin(), top.rend());
++            for (size_t i = 0; i < top.size() && i < 8u; ++i)
++                std::fprintf(stderr, "[gpu:sync]   %llu x %s%c", (unsigned long long)top[i].first, top[i].second.c_str(), 10);
++            counts.clear();
++            last = now;
++        }
++    }
++    // 0066: a transfer's blocks start at the page row of its first row, not at row 0
++    void syncTransfer(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t y0, uint32_t w, uint32_t h, const char *why)
++    {
++        const uint32_t total = transferBlocks(bw, psm, y0, w, h);
++        uint32_t skip = 0u;
++        if (bw != 0u)
++        {
++            const uint32_t pw = (psm == GS_PSM_T4 || psm == GS_PSM_T8) ? 128u : 64u;
++            const uint32_t ph = psm == GS_PSM_T4 ? 128u : (psm == GS_PSM_T8 || is16(psm)) ? 64u : 32u;
++            const uint32_t pagesPerRow = std::max<uint32_t>(1u, bw * 64u / pw);
++            skip = std::min(total, y0 / ph * pagesPerRow * 32u);
++        }
++        syncRange(bp + skip, total - skip, why);
++    }
+     static uint32_t transferBlocks(uint32_t bw, uint32_t psm, uint32_t y0, uint32_t w, uint32_t h)
+     {
+         const uint32_t bpp = psm == GS_PSM_T4 ? 4u : psm == GS_PSM_T8 ? 8u : is16(psm) ? 16u : 32u;
+@@ -1228,9 +1485,125 @@ private:
+         GlTexture &g = m_textures[d];
+         tw = d->w;
+         th = d->h;
++        const bool cc = contentCacheOn() && d->rawBase != nullptr && !d->raw.empty();
+         if (g.tex && g.epoch == d->decodeEpoch && g.key0 == d->key[0] && g.key1 == d->key[1] && g.key2 == d->key[2] &&
+-            g.clutVersion == d->clutVersion && g.w == d->w && g.h == d->h)
++            g.clutVersion == d->clutVersion && g.w == d->w && g.h == d->h && (g.contentHash == 0u || contentAlive(g)))
++        {
++            if (g.contentHash != 0u)
++                m_content[g.contentHash].lastFrame = m_frames;
+             return g.tex;
++        }
++        // 0067: the same content was decoded before: use its GL texture
++        uint64_t chash = 0;
++        if (cc)
++        {
++            chash = contentHash(*d);
++            const auto it = m_content.find(chash);
++            if (it != m_content.end() && it->second.w == d->w && it->second.h == d->h)
++            {
++                it->second.lastFrame = m_frames;
++                static const bool check = std::getenv("APE2_GL_TEXHASH_CHECK") != nullptr;
++                if (check && d->rawBase)
++                {
++                    auto &cd = const_cast<GSCpuBackend::DecodedTexture &>(*d);
++                    if (fastDecode(cd, d->rawBase))
++                    {
++                        const uint64_t th = texelHash(*d);
++                        static int bad = 0, total = 0;
++                        ++total;
++                        if (th != it->second.texelHash && bad++ < 40)
++                        {
++                            const auto &t0 = d->decodeState.context.tex0;
++                            std::fprintf(stderr, "[gpu:texhash] WRONG HIT %d/%d tbp0=0x%x tbw=%u psm=0x%x %dx%d cbp=0x%x cpsm=%u csa=%u key1=%llx%c",
++                                         bad, total, t0.tbp0, t0.tbw, t0.psm, d->w, d->h, t0.cbp, t0.cpsm, t0.csa,
++                                         (unsigned long long)d->key[1], 10);
++                        }
++                        else if (total % 2000 == 0)
++                            std::fprintf(stderr, "[gpu:texhash] %d hits checked, %d wrong%c", total, bad, 10);
++                    }
++                }
++                if (g.contentHash == 0u && g.tex)
++                    glDeleteTextures(1, &g.tex); // a texture of its own from before (not in the content cache)
++                g.tex = it->second.tex;
++                g.contentHash = chash;
++                g.contentId = it->second.id;
++                g.epoch = d->decodeEpoch;
++                g.key0 = d->key[0];
++                g.key1 = d->key[1];
++                g.key2 = d->key[2];
++                g.clutVersion = d->clutVersion;
++                g.w = d->w;
++                g.h = d->h;
++                ++m_stContentHits;
++                return g.tex;
++            }
++            ++m_stContentMisses;
++            // decode into a new texture the content cache owns; the old one stays with its own content
++            if (g.contentHash == 0u && g.tex)
++                glDeleteTextures(1, &g.tex);
++            g.tex = 0;
++            g.w = 0;
++            g.h = 0;
++            g.contentHash = 0;
++        }
++        else if (g.contentHash != 0u)
++        {
++            // not hashable (wraps around VRAM): decode into a texture of its own, never into a shared one
++            g.tex = 0;
++            g.w = 0;
++            g.h = 0;
++            g.contentHash = 0;
++        }
++        // APE2_SYNCLOG: texture decodes per 2 s by address, format and size (debugging aid)
++        {
++            static const bool on = std::getenv("APE2_SYNCLOG") != nullptr;
++            if (on)
++            {
++                static std::map<std::string, uint64_t> decodes;
++                static uint64_t texels = 0;
++                static auto last = std::chrono::steady_clock::now();
++                const auto &t0 = state.context.tex0;
++                char key[160];
++                std::snprintf(key, sizeof(key), "%s tbp0=0x%x tbw=%u psm=0x%x %dx%d cbp=0x%x", g.tex ? "stale" : "new", t0.tbp0, t0.tbw,
++                              t0.psm, d->w, d->h, t0.cbp);
++                ++decodes[key];
++                texels += static_cast<uint64_t>(d->w) * static_cast<uint64_t>(d->h);
++                static std::map<std::string, std::pair<uint64_t, uint64_t>> byShape;
++                char shape[64];
++                std::snprintf(shape, sizeof(shape), "%s psm=0x%x %dx%d", g.tex ? "stale" : "new", t0.psm, d->w, d->h);
++                auto &e = byShape[shape];
++                ++e.first;
++                e.second += static_cast<uint64_t>(d->w) * static_cast<uint64_t>(d->h);
++                const auto now = std::chrono::steady_clock::now();
++                if (now - last >= std::chrono::seconds(2))
++                {
++                    uint64_t total = 0;
++                    std::vector<std::pair<uint64_t, std::string>> top;
++                    for (const auto &[k, n] : decodes)
++                    {
++                        total += n;
++                        top.emplace_back(n, k);
++                    }
++                    std::sort(top.rbegin(), top.rend());
++                    std::fprintf(stderr, "[gpu:dec] 2s: %llu decodes, %llu texels (content cache: %llu hits, %llu misses, %zu textures)%c",
++                                 (unsigned long long)total, (unsigned long long)texels, (unsigned long long)m_stContentHits,
++                                 (unsigned long long)m_stContentMisses, m_content.size(), 10);
++                    m_stContentHits = m_stContentMisses = 0;
++                    for (size_t i = 0; i < top.size() && i < 8u; ++i)
++                        std::fprintf(stderr, "[gpu:dec]   %llu x %s%c", (unsigned long long)top[i].first, top[i].second.c_str(), 10);
++                    std::vector<std::pair<uint64_t, std::string>> shapes;
++                    for (const auto &[k, v] : byShape)
++                        shapes.emplace_back(v.second, k + " x" + std::to_string(v.first));
++                    std::sort(shapes.rbegin(), shapes.rend());
++                    for (size_t i = 0; i < shapes.size() && i < 6u; ++i)
++                        std::fprintf(stderr, "[gpu:dec]   shape %s: %llu texels%c", shapes[i].second.c_str(), (unsigned long long)shapes[i].first, 10);
++                    byShape.clear();
++                    decodes.clear();
++                    texels = 0;
++                    last = now;
++                }
++            }
++        }
+         // APE2_GL_TEXLOG=1: textures uploaded (size, format, address, why)
+         static const bool texLog = std::getenv("APE2_GL_TEXLOG") != nullptr;
+         if (texLog)
+@@ -1360,6 +1733,27 @@ private:
+         g.clutVersion = d->clutVersion;
+         g.w = d->w;
+         g.h = d->h;
++        if (cc)
++        {
++            contentEvict();
++            ContentTexture &e = m_content[chash];
++            if (e.tex && e.tex != g.tex) // same hash, other size: replace it
++            {
++                glDeleteTextures(1, &e.tex);
++                m_contentTexels -= static_cast<uint64_t>(e.w) * static_cast<uint64_t>(e.h);
++            }
++            e.tex = g.tex;
++            e.w = d->w;
++            e.h = d->h;
++            e.lastFrame = m_frames;
++            e.id = ++m_contentNextId;
++            static const bool check = std::getenv("APE2_GL_TEXHASH_CHECK") != nullptr;
++            if (check)
++                e.texelHash = texelHash(*d);
++            m_contentTexels += static_cast<uint64_t>(d->w) * static_cast<uint64_t>(d->h);
++            g.contentHash = chash;
++            g.contentId = e.id;
++        }
+         ++m_stTexUploads;
+         return g.tex;
+     }

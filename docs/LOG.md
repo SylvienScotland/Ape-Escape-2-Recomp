@@ -4065,3 +4065,26 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
 - Intro: yield throws 70,000/s -> ~0; 55.5 -> 56.6 fps average, 2 s windows under 55: 9 -> 5. Player: "much
   smoother overall", dips 7 -> 3-4 (always in the same spots of the movie), music fine, gameplay fine; big dips
   remain in the pause menu and the stage select screen.
+### 0233 - GPU renderer: row read-backs, GPU local copies, textures cached by content (0066)
+
+- `APE2_SYNCLOG` names every GPU read-back (cause, source range, target, time) and every texture decode (address,
+  format, size) per 2 s.
+- Read-backs: a palette load of 8 blocks at the frame buffer's base read the whole 512x448 frame back every
+  frame in play. `syncRange` now reads back only the page rows of the requested blocks, and each target keeps a
+  per-row map of rows read back since they were last drawn; those rows are never read back again (VRAM is the
+  newer copy: the game uploads icons into them, and a later whole read-back wrote the old drawing over them -
+  the striped coin stack and button icons in the pause menu). Transfers start at the page row of their first
+  row. `APE2_SYNC_ROWS=0` restores whole-target read-backs.
+- The pause menu and the stage select copy whole 512x448 frames between targets every frame (local-to-local,
+  0xe00 -> 0x0, 0x2a00.. -> 0xe00): each one read both targets back, copied in VRAM and uploaded again, ~250 ms
+  in every 2 s. Copies between two targets of the same colour format are now a `glBlitFramebuffer`; the
+  destination rectangle is marked as drawn (`APE2_GPU_COPY=0`). Read-backs in the pause menu: ~250 -> ~90 ms/2 s.
+- Textures by content: the game streams its textures (uploads them again into a shared VRAM area every frame
+  and draws with them right away). In play the address-keyed cache saw ~8,000 stale textures a second, ~230 M
+  texels decoded and uploaded to GL a second, the GS thread's main cost. A texture whose VRAM was rewritten is now
+  hashed (its pages, format, size, in-page offset, palette and TEXA keys; not its address) and the same content
+  reuses the GL texture decoded before (`APE2_GL_TEXHASH=0`). Measured: ~9,000 hits and ~1,000 misses a second,
+  decoded texels 460 M -> 5 M per 2 s. A first version let textures that wrap around VRAM (no private page copy)
+  decode into a shared texture and corrupted other textures' copies (purple coin stack); fixed.
+  `APE2_GL_TEXHASH_CHECK=1` decodes every hit again and compares: 376,000 hits checked in play, 0 wrong.
+- Player: gameplay "fps feels nice", icons clean; the pause menu and the stage select are still not smooth.
