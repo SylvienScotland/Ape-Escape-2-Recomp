@@ -9,8 +9,10 @@
 #include "ps2_runtime_macros.h"
 #include "game_overrides.h"
 #include "ps2_recompiled_functions.h"
+#include "runtime/ee_scheduler.h"
 
 void ape2NoteGameFrame(); // EeScheduler.cpp
+void ape2EnterGameFrame(int threadId); // EeScheduler.cpp
 
 namespace
 {
@@ -18,6 +20,7 @@ namespace
 
     void ape2_stage_frame(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        ape2EnterGameFrame(runtime->eeScheduler().currentThreadId());
         sub_0019BCE0_0x19bce0(rdram, ctx, runtime);
         ape2NoteGameFrame();
     }

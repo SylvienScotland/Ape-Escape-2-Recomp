@@ -1,0 +1,281 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 826c471..7ab8ec2 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -16,6 +16,10 @@
+ #include <limits>
+ #include <stdexcept>
+ #include "../ps2_perf.h"
++#include <condition_variable>
++#include <mutex>
++
++void ape2SignalPresentVSync(); // 0068, defined below
+ 
+ namespace
+ {
+@@ -49,8 +53,12 @@ namespace
+     // frame sees one vsync and a slow frame plays a little slower instead, as in the PAL port. A vsync is never
+     // held longer than four periods; screens without the frame mark run free. APE2_VSYNC_FRAMELOCK=0 disables it.
+     std::atomic<uint64_t> g_gameFramesDone{0};
++    std::atomic<bool> g_inGameFrame{false}; // inside the game's stage-frame function
++    std::atomic<int> g_gameFrameThread{0};  // the guest thread that runs it
+     uint64_t g_gameFramesAtVsync = 0;
+     std::chrono::steady_clock::time_point g_vsyncHeldSince{};
++    bool g_inGameFrameAtHold = false;
++    std::map<uint32_t, uint32_t> g_holdPcs; // APE2_GAPLOG: guest PCs while a hold is long
+ 
+     bool holdVBlankForGameFrame()
+     {
+@@ -73,11 +81,36 @@ namespace
+         if (enabled && active && frames == g_gameFramesAtVsync)
+         {
+             if (g_vsyncHeldSince == std::chrono::steady_clock::time_point{})
++            {
+                 g_vsyncHeldSince = now;
++                g_inGameFrameAtHold = g_inGameFrame.load(std::memory_order_acquire);
++            }
++            if (now - g_vsyncHeldSince > 2 * kVBlankPeriod)
++            {
++                if (const uint32_t *pcWord = ps2perf::g_activePc.load(std::memory_order_relaxed))
++                    ++g_holdPcs[static_cast<uint32_t>(*reinterpret_cast<const volatile uint32_t *>(pcWord))];
++            }
+             if (now - g_vsyncHeldSince < 4 * kVBlankPeriod)
+                 return true;
+         }
+         g_gameFramesAtVsync = frames;
++        if (g_vsyncHeldSince != std::chrono::steady_clock::time_point{})
++        {
++            static const bool gapLog = [] { const char *e = std::getenv("APE2_GAPLOG"); return e && e[0] == '1'; }();
++            const double heldMs = std::chrono::duration<double, std::milli>(now - g_vsyncHeldSince).count();
++            if (gapLog && heldMs > 4.0)
++                std::fprintf(stderr, "[gap:hold] t=%.1f vsync held %.1f ms for the game frame, inside it now %d, at start %d\n",
++                             std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(), heldMs,
++                             g_inGameFrame.load() ? 1 : 0, g_inGameFrameAtHold ? 1 : 0);
++            if (gapLog && !g_holdPcs.empty())
++            {
++                std::fprintf(stderr, "[gap:pc]");
++                for (const auto &[pc, n] : g_holdPcs)
++                    std::fprintf(stderr, " %06x:%u", pc, n);
++                std::fprintf(stderr, "\n");
++            }
++        }
++        g_holdPcs.clear();
+         g_vsyncHeldSince = {};
+         return false;
+     }
+@@ -2176,6 +2209,37 @@ void EeScheduler::processPendingEvents()
+ 
+ void EeScheduler::processDueDeadlines()
+ {
++    // 0068: a vsync is never held (0049) while the game waits for one. Some stage frames (scene cuts in the intro,
++    // the title) wait for vsyncs inside the frame function itself: the thread running it calls SleepThread
++    // (0x39ca40) and the game's vsync handler wakes it with iWakeupThread. The hold and the frame then waited on
++    // each other until the 4-period cap: 3 frames of 85 ms every few seconds. Also covered: a thread in WaitVSync
++    // and a vsync flag the game asked to be set. APE2_HOLD_WAITING=1 holds anyway (the old behaviour).
++    auto gameWaitsForVSync = [this]() -> bool
++    {
++        static const bool holdAnyway = [] { const char *e = std::getenv("APE2_HOLD_WAITING"); return e && e[0] == '1'; }();
++        static const bool gapLog = [] { const char *e = std::getenv("APE2_GAPLOG"); return e && e[0] == '1'; }();
++        bool waits = m_vsyncFlagAddress != 0u;
++        unsigned counts[8]{};
++        for (const auto &[id, t] : m_threads)
++        {
++            if (t.status == EeThreadStatus::Waiting || t.status == EeThreadStatus::WaitingSuspended)
++            {
++                ++counts[static_cast<unsigned>(t.wait.reason) & 7u];
++                if (t.wait.reason == EeWaitReason::VSync)
++                    waits = true;
++                if (t.wait.reason == EeWaitReason::Sleep && id == g_gameFrameThread.load(std::memory_order_relaxed) &&
++                    g_inGameFrame.load(std::memory_order_acquire))
++                    waits = true; // the stage frame sleeps until the game's vsync handler wakes it
++            }
++        }
++        if (gapLog && g_gameFramesDone.load(std::memory_order_relaxed) == g_gameFramesAtVsync &&
++            g_vsyncHeldSince == std::chrono::steady_clock::time_point{})
++        {
++            std::fprintf(stderr, "[gap:wait] vsync due, frame unfinished: flag %d, waiting sleep %u sema %u evf %u vsync %u ext %u mpeg %u\n",
++                         m_vsyncFlagAddress != 0u ? 1 : 0, counts[1], counts[2], counts[3], counts[4], counts[5], counts[6]);
++        }
++        return waits && !holdAnyway;
++    };
+     for (;;)
+     {
+         std::vector<ScheduledEvent> due;
+@@ -2275,7 +2339,7 @@ void EeScheduler::processDueDeadlines()
+ 
+         for (ScheduledEvent &scheduled : due)
+         {
+-            if (scheduled.event.type == EeEventType::VBlankStart && holdVBlankForGameFrame())
++            if (scheduled.event.type == EeEventType::VBlankStart && !gameWaitsForVSync() && holdVBlankForGameFrame())
+             {
+                 // the game has not finished the frame it started at the last vsync: look again after it has run a
+                 // little further (a cycle deadline, so the EE keeps running rather than waiting here)
+@@ -2314,6 +2378,7 @@ void EeScheduler::processEvent(const EeEvent &event)
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
++        ape2SignalPresentVSync(); // 0068: wake the presenter for this frame
+         if ((m_vsyncTick & 1u) != 0u)
+         {
+             m_runtime.memory().gs().csr.fetch_or(0x2000ull, std::memory_order_acq_rel);
+@@ -2634,8 +2699,38 @@ void EeScheduler::publishIdleDebugContext()
+     }
+ }
+ 
++// 0068: the presenter (ps2_runtime.cpp) picked up a new frame by polling the vsync tick at raylib's own 60 Hz
++// (SetTargetFPS), a second clock beside the scheduler's vsync. The two drift past each other, and whenever their
++// phases met a poll fell just before a tick: one frame was shown for 33 ms and the next one was skipped - the 1-3
++// missed vblanks per 2 s in play (LOG 0234). The presenter now waits for the scheduler's vsync instead.
++namespace
++{
++    std::mutex g_presentVsyncMutex;
++    std::condition_variable g_presentVsyncCv;
++}
++
++void ape2SignalPresentVSync()
++{
++    { std::lock_guard<std::mutex> lock(g_presentVsyncMutex); }
++    g_presentVsyncCv.notify_all();
++}
++
++// waits until the vsync tick differs from `seen` (or the timeout passes, so the window keeps handling events)
++void ape2WaitPresentVSync(const std::atomic<uint64_t> &tick, uint64_t seen, std::chrono::milliseconds timeout)
++{
++    std::unique_lock<std::mutex> lock(g_presentVsyncMutex);
++    g_presentVsyncCv.wait_for(lock, timeout, [&]() { return tick.load(std::memory_order_acquire) != seen; });
++}
++
+ // the game finished a stage frame (frame-locked vsync, patch 0049; called by the game's override)
++void ape2EnterGameFrame(int threadId)
++{
++    g_gameFrameThread.store(threadId, std::memory_order_relaxed);
++    g_inGameFrame.store(true, std::memory_order_release);
++}
++
+ void ape2NoteGameFrame()
+ {
++    g_inGameFrame.store(false, std::memory_order_release);
+     g_gameFramesDone.fetch_add(1, std::memory_order_release);
+ }
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index f7aac64..563d534 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -375,6 +375,16 @@ namespace
+     }
+ }
+ 
++void ape2WaitPresentVSync(const std::atomic<uint64_t> &tick, uint64_t seen, std::chrono::milliseconds timeout); // EeScheduler.cpp, 0068
++static bool ape2PresentOnVSync()
++{
++    static const bool on = []() {
++        const char *e = std::getenv("APE2_PRESENT_ON_VSYNC");
++        return !(e && e[0] == '0');
++    }();
++    return on;
++}
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -835,7 +845,9 @@ bool PS2Runtime::initialize(const char *title)
+         InitAudioDevice();
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+-        SetTargetFPS(60);
++        // 0068: frames are paced by the emulated vsync (the presenter waits for it in the run loop); raylib's own
++        // 60 Hz limiter is a second clock that drifted against it. APE2_PRESENT_ON_VSYNC=0 restores the limiter.
++        SetTargetFPS(ape2PresentOnVSync() ? 0 : 60);
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -2671,6 +2683,12 @@ void PS2Runtime::run()
+ 
+             }
+         });
++        if (ape2PresentOnVSync()) // 0068: one presenter pass per emulated vsync
++        {
++            static uint64_t s_presentedTick = 0;
++            ape2WaitPresentVSync(m_memory.gs().vsyncTick, s_presentedTick, std::chrono::milliseconds(50));
++            s_presentedTick = m_memory.gs().vsyncTick.load(std::memory_order_acquire);
++        }
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         // 0075: SPU2 streamed audio. The game's music arrives as PCM in IOP RAM and is armed onto SPU2 core1
+diff --git a/ps2xRuntime/src/lib/ps2_perf.h b/ps2xRuntime/src/lib/ps2_perf.h
+index 93e5b47..1479d2e 100644
+--- a/ps2xRuntime/src/lib/ps2_perf.h
++++ b/ps2xRuntime/src/lib/ps2_perf.h
+@@ -13,6 +13,7 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <mutex>
+ #include <thread>
+ #include <unordered_map>
+@@ -188,7 +189,12 @@ namespace ps2perf
+                 const uint32_t pc = *reinterpret_cast<const volatile uint32_t *>(p);
+                 ++hist[pc];
+                 ++total;
+-                hostSampleTick();
++                static const bool hostSampling = [] { // APE2_PERF_HOST=0: no stack samples (no EE suspends)
++                    const char *e = std::getenv("APE2_PERF_HOST");
++                    return !(e && e[0] == '0');
++                }();
++                if (hostSampling)
++                    hostSampleTick();
+             }
+             if (std::chrono::steady_clock::now() < next)
+                 continue;
+@@ -239,6 +245,9 @@ namespace ps2perf
+                 g_gaps20.fetch_add(1, std::memory_order_relaxed);
+             if (gap > 33'000'000)
+                 g_gaps33.fetch_add(1, std::memory_order_relaxed);
++            static const bool gapLog = [] { const char *e = std::getenv("APE2_GAPLOG"); return e && e[0] == '1'; }();
++            if (gapLog && gap > 25'000'000)
++                std::fprintf(stderr, "[gap:frame] t=%.1f frame gap %.1f ms\n", now / 1e6, gap / 1e6);
+         }
+         lastFrameNs = now;
+         maybeReport(now);
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index f60b6cd..d466ea4 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -17,6 +17,18 @@
+ #include <unordered_map>
+ #include <utility>
+ #include <vector>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++static bool ape2GapLog()
++{
++    static const bool on = [] { const char *e = std::getenv("APE2_GAPLOG"); return e && e[0] == '1'; }();
++    return on;
++}
++static double ape2GapNowMs()
++{
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -666,6 +678,17 @@ namespace ps2x::iop::detail
+ 
+         bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
+         {
++            struct GapTimer // APE2_GAPLOG=1: slow disc reads
++            {
++                double t0 = ape2GapNowMs();
++                uint32_t lsn, n;
++                ~GapTimer()
++                {
++                    const double d = ape2GapNowMs() - t0;
++                    if (ape2GapLog() && d > 4.0)
++                        std::fprintf(stderr, "[gap:cd] t=%.1f read lsn=%u sectors=%u took %.1f ms\n", t0, lsn, n, d);
++                }
++            } gapTimer{ape2GapNowMs(), lsn, sectors};
+             static unsigned long long cdReads = 0ull, cdReadFails = 0ull, cdSectorsTotal = 0ull;
+             ++cdReads;
+             cdSectorsTotal += sectors;

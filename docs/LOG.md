@@ -4098,3 +4098,22 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   0-1 slow frames per 2 s. Play: not a measurable change (2.5 -> 3.3 slow frames per 2 s on different content),
   so the 33 ms frames in play have another cause, still open. Player: the pause menu now feels fixed (more
   likely 0066's work) and "overall gameplay feels great".
+### 0235 - Frames presented on the emulated vsync; no vsync hold while the stage frame sleeps (0068)
+
+- The presenter picked up new frames by polling the vsync tick at raylib's own 60 Hz (`SetTargetFPS(60)`), a second
+  clock beside the scheduler's vsync. The two drift past each other, and whenever their phases met a poll fell just
+  before a tick: one frame shown for 33 ms, the next one skipped - the 1-3 missed vblanks per 2 s in play (0234).
+  The scheduler now signals each vsync and the presenter waits for it; raylib's limiter is off
+  (`APE2_PRESENT_ON_VSYNC=0` restores it). Play windows: >33 ms frames 1-3 per 2 s -> 0.
+- The remaining hitches were 3 frames of ~85 ms every ~6 s (intro, title, menus). `APE2_GAPLOG=1` (frame gaps,
+  vsync holds with the guest PCs during long holds, slow disc reads) showed every one was the frame-lock (0049)
+  hold running to its 4-period cap, with the game inside its stage frame and its main thread in `SleepThread`
+  (0x39ca40): those frames wait for the game's vsync handler to wake them (`iWakeupThread`), so the hold and the
+  frame waited on each other. A vsync is no longer held while the stage frame's thread sleeps, a thread is in
+  WaitVSync, or a vsync flag is armed (`APE2_HOLD_WAITING=1` restores the old behaviour). The override passes the
+  stage frame's thread id (`ape2EnterGameFrame`). Intro: 40 holds -> 8, every 2 s window at 60 fps except the movie
+  open (~650 ms file load) and the intro -> title transition (real scene setup, plus one spin at 0x37c5a0 comparing
+  two fields of a libgraph-style struct - open).
+- Not the cause, ruled out on the way: the host stack sampler (now `APE2_PERF_HOST=0` to switch it off), disc
+  reads (none slower than 4 ms logged).
+- Player: "the best run by far".
