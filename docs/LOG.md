@@ -4117,3 +4117,24 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
 - Not the cause, ruled out on the way: the host stack sampler (now `APE2_PERF_HOST=0` to switch it off), disc
   reads (none slower than 4 ms logged).
 - Player: "the best run by far".
+
+### 0236 - GPU renderer: underwater render targets by page blits, texture and target reuse (0069)
+
+- Underwater the frame rate fell to ~12 fps. The game copies the screen into 0xe00 and draws it back both as one
+  512-wide buffer (fbw=8) and as seven 64-wide columns (fbw=1, 0xe00..0x1a00), and draws small tiles by moving FBP
+  across one 256-wide area. Every switch made a new target, retired the old one with a full `glReadPixels` read-back
+  and filled the new one from VRAM pixel by pixel (`APE2_RTLOG=1` shows target creations/drops per 2 s).
+- A frame base inside an existing target of the same width is drawn into that target at the page offset
+  (`aliasTarget`, depth-less draws only; `APE2_GL_RT_ALIAS=0` off). ZTST ALWAYS without Z writes no longer asks for a
+  depth buffer.
+- A GS page holds the same pixels at any buffer width, so the GPU-only pages of an overlapped target now move to the
+  new one by `glBlitFramebuffer` (columns -> 512 wide), or are scattered into the new target and new targets of the
+  same shape after it (512 wide -> columns); rows the blits cover are no longer uploaded from VRAM. A texture over
+  pages drawn at another width is gathered the same way (`APE2_GL_PAGE_BLIT=0` off).
+- Narrow targets (<= 64x512) are read back whole: eight textures a frame sample the column at 0x1c00 and each
+  read-back stalls the GPU.
+- Retired targets' textures/framebuffers and evicted content-cache textures are reused by size (~1500 new textures
+  a second underwater; driver allocations were ~15% of the GS thread). The 0056 coplanar-copy set is a flat
+  frame-stamped table instead of `std::unordered_set` (~9%).
+- Underwater: ~12 fps -> 44-55 fps, effect looks right (player). Still open: the GS thread is busy with per-primitive
+  work (~28k primitives a frame underwater); the intro movie's single-frame skips (known, unchanged).

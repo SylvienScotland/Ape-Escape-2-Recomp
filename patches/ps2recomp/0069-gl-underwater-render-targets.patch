@@ -1,0 +1,731 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 5b7c272..e2cd4bb 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -567,11 +567,20 @@ private:
+     int m_snapW = 0, m_snapH = 0;
+     Target m_rt[kTargets];
+     Depth m_z[kTargets];
++    // 0069: textures + framebuffers of retired targets, reused by new ones of the same size (underwater ~10 targets
++    // are created and retired every frame; driver allocations cost ~15% of the GS thread)
++    struct PoolTex
++    {
++        GLuint tex = 0, fbo = 0;
++        int w = 0, h = 0;
++    };
++    std::vector<PoolTex> m_texPool;
+     uint64_t m_tick = 0;
+     DrawState m_cur{};
+     bool m_haveCur = false;
+     std::vector<Vert> m_v;
+     int m_bx0 = 1 << 20, m_by0 = 1 << 20, m_bx1 = -(1 << 20), m_by1 = -(1 << 20);
++    int m_aliasX = 0, m_aliasY = 0; // 0069: the current draw's offset inside its target (aliasTarget)
+     int m_db[kMaxDstBoxes][4] = {};
+     int m_ndb = 0;
+     float m_fu = 1, m_fv = 1, m_su = 1, m_sv = 1;
+@@ -669,7 +678,7 @@ private:
+         {
+             if (it->second.lastFrame + 30u < m_frames)
+             {
+-                glDeleteTextures(1, &it->second.tex);
++                freeTex(it->second.tex, it->second.w, it->second.h);
+                 m_contentTexels -= static_cast<uint64_t>(it->second.w) * static_cast<uint64_t>(it->second.h);
+                 it = m_content.erase(it);
+             }
+@@ -677,6 +686,31 @@ private:
+                 ++it;
+         }
+     }
++    // 0069: underwater the game streams ~1500 new textures a second; creating and deleting a GL texture for each
++    // cost ~15% of the GS thread in driver allocations. Evicted ones are kept by size and reused.
++    std::map<uint64_t, std::vector<GLuint>> m_freeTex;
++    size_t m_freeTexCount = 0;
++    static uint64_t sizeKey(int w, int h) { return (static_cast<uint64_t>(static_cast<uint32_t>(w)) << 32) | static_cast<uint32_t>(h); }
++    void freeTex(GLuint t, int w, int h)
++    {
++        if (m_freeTexCount >= 2048u)
++        {
++            glDeleteTextures(1, &t);
++            return;
++        }
++        m_freeTex[sizeKey(w, h)].push_back(t);
++        ++m_freeTexCount;
++    }
++    GLuint takeTex(int w, int h)
++    {
++        const auto it = m_freeTex.find(sizeKey(w, h));
++        if (it == m_freeTex.end() || it->second.empty())
++            return 0;
++        const GLuint t = it->second.back();
++        it->second.pop_back();
++        --m_freeTexCount;
++        return t;
++    }
+     uint64_t m_frames = 0;
+     uint64_t m_stDraws = 0, m_stBatches = 0, m_stDstReads = 0, m_stDownloads = 0, m_stDisplayDownloads = 0, m_stUploads = 0, m_stTexUploads = 0;
+     bool m_inDisplayDownload = false;
+@@ -1084,12 +1118,49 @@ private:
+             m_haveCur = false;
+         }
+         download(o);
+-        glDeleteTextures(1, &o.tex);
+-        glDeleteFramebuffers(1, &o.fbo);
++        releaseTargetTex(o);
++    }
++    void makeTargetTex(Target &t)
++    {
++        for (size_t i = 0; i < m_texPool.size(); ++i)
++            if (m_texPool[i].w == t.w && m_texPool[i].h == t.h)
++            {
++                t.tex = m_texPool[i].tex;
++                t.fbo = m_texPool[i].fbo;
++                m_texPool.erase(m_texPool.begin() + static_cast<std::ptrdiff_t>(i));
++                return;
++            }
++        t.tex = newTex(t.w * m_scale, t.h * m_scale, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++        glGenFramebuffers(1, &t.fbo);
++        glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.tex, 0);
++    }
++    void releaseTargetTex(Target &o)
++    {
++        if (m_haveCur && m_cur.rt == &o)
++        {
++            flush();
++            m_haveCur = false;
++        }
++        attachZ(o, nullptr);
++        if (m_texPool.size() < 12)
++            m_texPool.push_back(PoolTex{o.tex, o.fbo, o.w, o.h});
++        else
++        {
++            glDeleteTextures(1, &o.tex);
++            glDeleteFramebuffers(1, &o.fbo);
++        }
++        o.tex = o.fbo = 0;
+         o.used = false;
+     }
+     void dropTargets()
+     {
++        for (const PoolTex &pt : m_texPool)
++        {
++            glDeleteTextures(1, &pt.tex);
++            glDeleteFramebuffers(1, &pt.fbo);
++        }
++        m_texPool.clear();
+         for (int i = 0; i < kTargets; ++i)
+         {
+             if (m_rt[i].used)
+@@ -1105,17 +1176,401 @@ private:
+         m_haveCur = false;
+         m_v.clear();
+     }
++    static void rtCount(const char *key)
++    {
++        static std::map<std::string, unsigned> counts;
++        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++        ++counts[key];
++        const auto now = std::chrono::steady_clock::now();
++        if (now < next)
++            return;
++        next = now + std::chrono::seconds(2);
++        std::vector<std::pair<unsigned, std::string>> rows;
++        for (const auto &[k, n] : counts)
++            rows.emplace_back(n, k);
++        std::sort(rows.rbegin(), rows.rend());
++        std::fprintf(stderr, "[gpu:rt] 2s: %zu kinds\n", rows.size());
++        for (size_t i = 0; i < rows.size() && i < 30; ++i)
++            std::fprintf(stderr, "[gpu:rt]   %u x %s\n", rows[i].first, rows[i].second.c_str());
++        counts.clear();
++    }
++    void rtLog(const char *what, const Target &rt, int y0, int y1, const Target *dropped)
++    {
++        static const bool on = [] { const char *e = std::getenv("APE2_RTLOG"); return e && e[0] == '1'; }();
++        if (!on)
++            return;
++        char key[200];
++        if (dropped)
++            std::snprintf(key, sizeof(key), "%s fbp=0x%x fbw=%u is16=%d rows %d-%d drops fbp=0x%x fbw=%u is16=%d vh=%d dirty=%d",
++                          what, rt.fbp, rt.fbw, rt.is16 ? 1 : 0, y0, y1, dropped->fbp, dropped->fbw, dropped->is16 ? 1 : 0,
++                          dropped->vh, dropped->gpuDirty ? 1 : 0);
++        else
++            std::snprintf(key, sizeof(key), "%s fbp=0x%x fbw=%u is16=%d rows %d-%d", what, rt.fbp, rt.fbw, rt.is16 ? 1 : 0, y0, y1);
++        rtCount(key);
++    }
++    // 0069: a GS page (32-bit: 64x32, 16-bit: 64x64) holds the same pixels whatever the buffer width, so a target
++    // seen at another width is the same pages moved around. Underwater the game draws the screen copy at 0xe00 as
++    // a 512-wide buffer and as 64-wide columns every frame, and each switch read the other one back (512x480
++    // glReadPixels). The GPU-only pages of an overlapped target now move to the new one by blits when all of
++    // them land in the rows being claimed. APE2_GL_PAGE_BLIT=0 disables it (and the texture path below).
++    static bool pageBlitOn()
++    {
++        static const bool on = [] { const char *e = std::getenv("APE2_GL_PAGE_BLIT"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++    // calls f(srcX, srcY, dstX, dstY) for every page of o's GPU-only area; false if one does not land in rt rows y0..y1
++    template <class F>
++    bool forDirtyPages(const Target &o, const Target &rt, int y0, int y1, F &&f)
++    {
++        const int ph = o.is16 ? 64 : 32;
++        const int64_t base = static_cast<int64_t>(o.fbp / 32u) - static_cast<int64_t>(rt.fbp / 32u);
++        for (int pr = o.dy0 / ph; pr <= o.dy1 / ph; ++pr)
++            for (int pc = std::max(o.dx0, 0) / 64; pc <= std::min(o.dx1, o.w - 1) / 64; ++pc)
++            {
++                const int64_t rel = base + static_cast<int64_t>(pr) * o.fbw + pc;
++                if (rel < 0)
++                    return false;
++                const int rx = static_cast<int>(rel % rt.fbw) * 64, ry = static_cast<int>(rel / rt.fbw) * ph;
++                if (ry < y0 || ry + ph - 1 > y1 || ry + ph > rt.h)
++                    return false;
++                f(pc * 64, pr * ph, rx, ry);
++            }
++        return true;
++    }
++    bool pagesMovable(const Target &o, const Target &rt, int y0, int y1)
++    {
++        if (!pageBlitOn() || !o.gpuDirty || o.is16 != rt.is16 || o.fbp % 32u != 0u || rt.fbp % 32u != 0u ||
++            o.fbw == 0u || rt.fbw == 0u)
++            return false;
++        // rows read back since they were drawn may hold newer uploads in VRAM: leave those to the read-back path
++        for (int y = o.dy0; y <= o.dy1 && y < static_cast<int>(o.cleanRows.size()); ++y)
++            if (o.cleanRows[static_cast<size_t>(y)])
++                return false;
++        return forDirtyPages(o, rt, y0, y1, [](int, int, int, int) {});
++    }
++    // 0069: the other direction (a wide target's pages wanted by a narrow one): underwater each frame the 64-wide
++    // column at 0xe00 is drawn over the 512-wide copy, whose pages fall into that column and the six after it. All
++    // of them are handed over by blits: the pages for the new target's own surface go to it (its rows are extended
++    // to take them), the rest go to new targets of the same width and height that follow it in VRAM, provided
++    // those hold no other target.
++    struct Scatter
++    {
++        int n = 0;
++        uint32_t fbp[8] = {};
++        int hi[8] = {};
++    };
++    // where page `rel` (counted from rt.fbp) lands: k = 0 is rt itself, k > 0 the k-th surface after it
++    static void pageSlot(const Target &rt, int64_t rel, int &k, int &x, int &y)
++    {
++        const int ph = rt.is16 ? 64 : 32;
++        const int64_t per = static_cast<int64_t>(rt.fbw) * (rt.h / ph);
++        k = static_cast<int>(rel / per);
++        const int64_t in = rel % per;
++        x = static_cast<int>(in % rt.fbw) * 64;
++        y = static_cast<int>(in / rt.fbw) * ph;
++    }
++    template <class F>
++    void forOwnPages(const Target &o, const Target &rt, F &&f)
++    {
++        const int ph = o.is16 ? 64 : 32;
++        const int64_t base = static_cast<int64_t>(o.fbp / 32u) - static_cast<int64_t>(rt.fbp / 32u);
++        for (int pr = o.dy0 / ph; pr <= o.dy1 / ph; ++pr)
++            for (int pc = std::max(o.dx0, 0) / 64; pc <= std::min(o.dx1, o.w - 1) / 64; ++pc)
++                f(pc * 64, pr * ph, base + static_cast<int64_t>(pr) * o.fbw + pc);
++    }
++    bool scatterPlan(const Target &o, const Target &rt, int y0, int &y1, Scatter &sc)
++    {
++        if (!pageBlitOn() || !o.gpuDirty || o.is16 != rt.is16 || o.fbp % 32u != 0u || rt.fbp % 32u != 0u ||
++            o.fbw == 0u || rt.fbw == 0u || o.fbw == rt.fbw)
++            return false;
++        for (int y = o.dy0; y <= o.dy1 && y < static_cast<int>(o.cleanRows.size()); ++y)
++            if (o.cleanRows[static_cast<size_t>(y)])
++                return false;
++        const int ph = rt.is16 ? 64 : 32;
++        bool ok = true;
++        int rtHi = y1;
++        sc = Scatter{};
++        forOwnPages(o, rt, [&](int, int, int64_t rel) {
++            if (!ok)
++                return;
++            int k, x, y;
++            if (rel < 0 || (pageSlot(rt, rel, k, x, y), k > 8))
++            {
++                ok = false;
++                return;
++            }
++            if (k == 0)
++            {
++                if (y < y0)
++                    ok = false; // rows rt already holds
++                rtHi = std::max(rtHi, y + ph - 1);
++                return;
++            }
++            const uint32_t f = rt.fbp + static_cast<uint32_t>(k) * rt.fbw * static_cast<uint32_t>(rt.h / ph) * 32u;
++            int i = 0;
++            while (i < sc.n && sc.fbp[i] != f)
++                ++i;
++            if (i == sc.n)
++            {
++                if (sc.n == 8)
++                {
++                    ok = false;
++                    return;
++                }
++                sc.fbp[sc.n] = f;
++                sc.hi[sc.n++] = 0;
++            }
++            sc.hi[i] = std::max(sc.hi[i], y + ph - 1);
++        });
++        if (!ok)
++            return false;
++        // the new surfaces may hold nothing but o
++        for (int i = 0; i < sc.n; ++i)
++        {
++            const uint32_t n = static_cast<uint32_t>((sc.hi[i] + 1) / ph) * rt.fbw * 32u;
++            for (const Target &t : m_rt)
++                if (t.used && &t != &o && overlaps(t, sc.fbp[i], n))
++                    return false;
++        }
++        y1 = rtHi;
++        return true;
++    }
++    // rows y0..y1 of rt from VRAM, except page rows that blits will cover whole (cover: one byte per page)
++    void uploadUncovered(Target &rt, int y0, int y1, const std::vector<uint8_t> &cover)
++    {
++        const int ph = rt.is16 ? 64 : 32, per = static_cast<int>(rt.fbw);
++        auto full = [&](int y) {
++            const size_t r = static_cast<size_t>(y / ph) * static_cast<size_t>(per);
++            if (r + static_cast<size_t>(per) > cover.size())
++                return false;
++            for (int c = 0; c < per; ++c)
++                if (!cover[r + static_cast<size_t>(c)])
++                    return false;
++            return true;
++        };
++        std::vector<uint32_t> px;
++        for (int a = y0; a <= y1;)
++        {
++            if (rt.fbw != 0u && full(a))
++            {
++                ++a;
++                continue;
++            }
++            int b = a;
++            while (b < y1 && !(rt.fbw != 0u && full(b + 1)))
++                ++b;
++            vramReadRgba(rt.fbp, rt.fbw, rt.is16 ? GS_PSM_CT16 : GS_PSM_CT32, 0, a, rt.w, b - a + 1, px);
++            uploadRect(rt, 0, a, rt.w, b - a + 1, px.data());
++            a = b + 1;
++        }
++    }
++    static void coverPage(const Target &rt, std::vector<uint8_t> &cover, int x, int y)
++    {
++        const int ph = rt.is16 ? 64 : 32;
++        if (cover.empty())
++            cover.assign(static_cast<size_t>(rt.h / ph) * rt.fbw, 0u);
++        const size_t i = static_cast<size_t>(y / ph) * rt.fbw + static_cast<size_t>(x / 64);
++        if (i < cover.size())
++            cover[i] = 1u;
++    }
++    void blitPage(const Target &o, Target &dst, int sx, int sy, int dx, int dy)
++    {
++        const int S = m_scale, ph = o.is16 ? 64 : 32;
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, o.fbo);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.fbo);
++        glBlitFramebuffer(sx * S, sy * S, (sx + 64) * S, (sy + ph) * S, dx * S, dy * S, (dx + 64) * S, (dy + ph) * S,
++                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        mark(dst, dx, dy, dx + 63, dy + ph - 1);
++    }
+     // rows y0..y1 of a target take their content from VRAM; older targets that claim that VRAM are retired first
+     void claimRows(Target &rt, int y0, int y1)
+     {
+         uint32_t b0, b1;
+         rowsBlocks(rt, y0, y1, b0, b1);
++        Target *scat = nullptr;
++        Scatter sc;
++        for (Target &o : m_rt)
++            if (o.used && &o != &rt && overlaps(o, b0, b1 - b0) && !pagesMovable(o, rt, y0, y1))
++            {
++                int hi = y1;
++                if (scatterPlan(o, rt, y0, hi, sc))
++                {
++                    scat = &o;
++                    if (hi > y1)
++                    {
++                        y1 = hi;
++                        rt.vh = std::max(rt.vh, y1 + 1);
++                        rowsBlocks(rt, y0, y1, b0, b1);
++                    }
++                    break;
++                }
++            }
++        if (y0 == 0)
++            rtLog("new", rt, y0, y1, nullptr);
++        Target *moved[kTargets];
++        int nMoved = 0;
+         for (Target &o : m_rt)
+             if (o.used && &o != &rt && overlaps(o, b0, b1 - b0))
++            {
++                if (&o == scat)
++                {
++                    rtLog(y0 == 0 ? "new (pages scattered)" : "grow (pages scattered)", rt, y0, y1, &o);
++                    continue;
++                }
++                if (pagesMovable(o, rt, y0, y1))
++                {
++                    rtLog(y0 == 0 ? "new (pages moved)" : "grow (pages moved)", rt, y0, y1, &o);
++                    moved[nMoved++] = &o;
++                    continue;
++                }
++                rtLog(y0 == 0 ? "new" : "grow", rt, y0, y1, &o);
+                 dropTarget(o);
+-        std::vector<uint32_t> px;
+-        vramReadRgba(rt.fbp, rt.fbw, rt.is16 ? GS_PSM_CT16 : GS_PSM_CT32, 0, y0, rt.w, y1 - y0 + 1, px);
+-        uploadRect(rt, 0, y0, rt.w, y1 - y0 + 1, px.data());
++            }
++        std::vector<uint8_t> cover;
++        for (int i = 0; i < nMoved; ++i)
++            forDirtyPages(*moved[i], rt, y0, y1, [&](int, int, int dx, int dy) { coverPage(rt, cover, dx, dy); });
++        if (scat)
++            forOwnPages(*scat, rt, [&](int, int, int64_t rel) {
++                int k, x, y;
++                pageSlot(rt, rel, k, x, y);
++                if (k == 0)
++                    coverPage(rt, cover, x, y);
++            });
++        uploadUncovered(rt, y0, y1, cover);
++        glDisable(GL_SCISSOR_TEST);
++        for (int i = 0; i < nMoved; ++i)
++        {
++            Target &o = *moved[i];
++            if (m_haveCur && m_cur.rt == &o)
++            {
++                flush();
++                m_haveCur = false;
++            }
++            forDirtyPages(o, rt, y0, y1, [&](int sx, int sy, int dx, int dy) { blitPage(o, rt, sx, sy, dx, dy); });
++            ++m_stGpuCopies;
++            releaseTargetTex(o);
++        }
++        if (scat)
++            scatterTo(*scat, rt, sc);
++        glBindFramebuffer(GL_FRAMEBUFFER, rt.fbo);
++    }
++    void scatterTo(Target &o, Target &rt, const Scatter &sc)
++    {
++        if (m_haveCur && m_cur.rt == &o)
++        {
++            flush();
++            m_haveCur = false;
++        }
++        const int ph = rt.is16 ? 64 : 32;
++        Target *dst[8] = {};
++        for (int i = 0; i < sc.n; ++i)
++        {
++            Target *t = nullptr;
++            for (Target &u : m_rt)
++                if (!u.used)
++                {
++                    t = &u;
++                    break;
++                }
++            if (!t)
++            {
++                for (Target &u : m_rt)
++                {
++                    bool keep = &u == &o || &u == &rt;
++                    for (int j = 0; j < i; ++j)
++                        keep = keep || &u == dst[j];
++                    if (!keep && (!t || u.lru < t->lru))
++                        t = &u;
++                }
++                dropTarget(*t);
++            }
++            *t = Target{};
++            t->used = true;
++            t->fbp = sc.fbp[i];
++            t->fbw = rt.fbw;
++            t->is16 = rt.is16;
++            t->w = rt.w;
++            t->h = rt.h;
++            t->vh = (sc.hi[i] + 1 + ph - 1) / ph * ph;
++            t->lru = ++m_tick;
++            makeTargetTex(*t);
++            dst[i] = t;
++            rtLog("new (scattered to)", *t, 0, t->vh - 1, nullptr);
++        }
++        for (int i = 0; i < sc.n; ++i)
++        {
++            std::vector<uint8_t> cover;
++            forOwnPages(o, rt, [&](int, int, int64_t rel) {
++                int k, x, y;
++                pageSlot(rt, rel, k, x, y);
++                if (k > 0 && rt.fbp + static_cast<uint32_t>(k) * rt.fbw * static_cast<uint32_t>(rt.h / ph) * 32u == sc.fbp[i])
++                    coverPage(*dst[i], cover, x, y);
++            });
++            uploadUncovered(*dst[i], 0, dst[i]->vh - 1, cover);
++        }
++        glDisable(GL_SCISSOR_TEST);
++        forOwnPages(o, rt, [&](int sx, int sy, int64_t rel) {
++            int k, x, y;
++            pageSlot(rt, rel, k, x, y);
++            Target *t = &rt;
++            if (k > 0)
++            {
++                const uint32_t f = rt.fbp + static_cast<uint32_t>(k) * rt.fbw * static_cast<uint32_t>(rt.h / ph) * 32u;
++                for (int i = 0; i < sc.n; ++i)
++                    if (sc.fbp[i] == f)
++                        t = dst[i];
++            }
++            blitPage(o, *t, sx, sy, x, y);
++        });
++        ++m_stGpuCopies;
++        releaseTargetTex(o);
++    }
++    // 0069: a frame base inside an existing target of the same width and format is the same surface at a pixel
++    // offset. Underwater the game draws small tiles by moving FBP across one 256-wide area (0x3c80, 0x3cc0,
++    // 0x31c0...); every base got its own target, each new one overlapped the last, and claimRows read the old one
++    // back (glReadPixels) and deleted it: 10-15 fps. Such draws now go into the containing target at the offset.
++    // Only for draws without a depth buffer. APE2_GL_RT_ALIAS=0 disables it.
++    Target *aliasTarget(uint32_t fbp, uint32_t fbw, bool sixteen, int bx1, int by1, int &ox, int &oy)
++    {
++        static const bool on = [] { const char *e = std::getenv("APE2_GL_RT_ALIAS"); return !(e && e[0] == '0'); }();
++        if (!on || fbw == 0u || findTarget(fbp, fbw, sixteen))
++            return nullptr;
++        const int ph = sixteen ? 64 : 32;
++        Target *best = nullptr;
++        int bestX = 0, bestY = 0;
++        for (Target &o : m_rt)
++        {
++            if (!o.used || o.fbw != fbw || o.is16 != sixteen || fbp <= o.fbp || (fbp - o.fbp) % 32u != 0u)
++                continue;
++            const uint32_t page = (fbp - o.fbp) / 32u;
++            const int x = static_cast<int>(page % fbw) * 64, y = static_cast<int>(page / fbw) * ph;
++            // bx1/by1 are the bbox's far edges (a 64-wide sprite ends at 64), so a draw fits while x + bx1 <= w
++            if (y >= o.vh || x + bx1 > o.w || y + by1 > o.h)
++                continue; // starts past the rows it holds, or the draw would wrap out of the surface
++            if (!best || y < bestY || (y == bestY && x < bestX))
++            {
++                best = &o;
++                bestX = x;
++                bestY = y;
++            }
++        }
++        if (!best)
++            return nullptr;
++        int needH = std::min(bestY + by1 + 1, best->h);
++        needH = (needH + ph - 1) / ph * ph;
++        if (needH > best->h)
++            return nullptr;
++        if (needH > best->vh)
++        {
++            flush();
++            const int y0 = best->vh;
++            best->vh = needH;
++            claimRows(*best, y0, needH - 1);
++        }
++        best->lru = ++m_tick;
++        ox = bestX;
++        oy = bestY;
++        return best;
+     }
+     Target *getTarget(uint32_t fbp, uint32_t fbw, bool sixteen, int needH)
+     {
+@@ -1177,10 +1632,7 @@ private:
+         rt->h = h;
+         rt->lru = ++m_tick;
+         rt->vh = needH;
+-        rt->tex = newTex(w * m_scale, h * m_scale, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
+-        glGenFramebuffers(1, &rt->fbo);
+-        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt->tex, 0);
++        makeTargetTex(*rt);
+         claimRows(*rt, 0, needH - 1);
+         return rt;
+     }
+@@ -1245,7 +1697,9 @@ private:
+             if (o.used && dirtyOverlaps(o, bp, nblocks))
+             {
+                 int lo = -1, hi = -1;
+-                if (rows && o.fbw != 0u)
++                // 0069: a narrow target (the underwater 64-wide columns, sampled by eight textures a frame) is read
++                // back whole at once: each read-back stalls the GPU, and eight of them cost more than one 64x512
++                if (rows && o.fbw != 0u && o.w * o.h > 64 * 512)
+                 {
+                     const uint32_t ph = o.is16 ? 64u : 32u;
+                     const uint32_t rowBlocks = o.fbw * 32u;
+@@ -1351,6 +1805,26 @@ private:
+         return tbw * h * bpp / 8u / 256u + 32u;
+     }
+     // a texture that is a render target (same address, a colour format the target holds)
++    // 0069: the texture's memory is drawn on the GPU by targets of another width (the underwater screen copy is
++    // drawn as 64-wide columns and sampled 512 wide): gather it into a target of the texture's own width by page
++    // blits (claimRows) instead of reading the columns back and decoding on the CPU. Not when the texture overlaps
++    // the target being drawn (getTarget could retire it).
++    Target *gatherTexTarget(const GSTex0Reg &t, int th, const Target &drawRt)
++    {
++        if (!pageBlitOn() || (t.psm != GS_PSM_CT32 && t.psm != GS_PSM_CT24) || t.tbw == 0u || t.tbp0 % 32u != 0u ||
++            (1u << t.tw) > t.tbw * 64u)
++            return nullptr;
++        const uint32_t nblocks = texBlocks(t);
++        if (overlaps(drawRt, t.tbp0, nblocks))
++            return nullptr;
++        bool other = false;
++        for (const Target &o : m_rt)
++            if (o.used && !o.is16 && o.fbw != t.tbw && dirtyOverlaps(o, t.tbp0, nblocks))
++                other = true;
++        if (!other)
++            return nullptr;
++        return getTarget(t.tbp0, t.tbw, false, std::min(std::max(th, 1), 1024));
++    }
+     Target *texTarget(const GSTex0Reg &t)
+     {
+         for (Target &o : m_rt)
+@@ -1700,7 +2174,16 @@ private:
+             dt.tileReady[i].store(1u, std::memory_order_release);
+         }
+         if (!g.tex)
+-            glGenTextures(1, &g.tex);
++        {
++            g.tex = takeTex(d->w, d->h);
++            if (g.tex)
++            {
++                g.w = d->w;
++                g.h = d->h;
++            }
++            else
++                glGenTextures(1, &g.tex);
++        }
+         glBindTexture(GL_TEXTURE_2D, g.tex);
+         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+         if (g.w != d->w || g.h != d->h)
+@@ -1739,7 +2222,7 @@ private:
+             ContentTexture &e = m_content[chash];
+             if (e.tex && e.tex != g.tex) // same hash, other size: replace it
+             {
+-                glDeleteTextures(1, &e.tex);
++                freeTex(e.tex, e.w, e.h);
+                 m_contentTexels -= static_cast<uint64_t>(e.w) * static_cast<uint64_t>(e.h);
+             }
+             e.tex = g.tex;
+@@ -1908,10 +2391,10 @@ private:
+         const auto &c = st.context;
+         s.rt = rt;
+         s.zb = zb;
+-        s.scx0 = c.scissor.x0;
+-        s.scy0 = c.scissor.y0;
+-        s.scx1 = std::min<int>(c.scissor.x1, rt->w - 1);
+-        s.scy1 = std::min<int>(c.scissor.y1, rt->h - 1);
++        s.scx0 = c.scissor.x0 + m_aliasX;
++        s.scy0 = c.scissor.y0 + m_aliasY;
++        s.scx1 = std::min<int>(c.scissor.x1 + m_aliasX, rt->w - 1);
++        s.scy1 = std::min<int>(c.scissor.y1 + m_aliasY, rt->h - 1);
+         const int tme = st.prim.tme ? 1 : 0;
+         s.mode[0] = tme;
+         s.mode[1] = tme ? c.tex0.tfx : 0;
+@@ -2209,14 +2692,49 @@ private:
+         static const bool strictZ = szEnv && szEnv[0] != '0';
+         bool dupTie = false;
+         {
+-            static thread_local std::unordered_set<uint64_t> seenOpaque;
++            // 0069: open addressing, entries stamped with the frame so a new frame clears nothing
++            static constexpr size_t kSeen = size_t{1} << 17;
++            static thread_local std::vector<uint64_t> seenKey(kSeen), seenGen(kSeen, ~0ull);
++            static thread_local size_t seenCount = 0;
+             static thread_local uint64_t seenEpoch = ~0ull;
+             const uint64_t epoch = m_frameEpoch.load(std::memory_order_relaxed);
+             if (epoch != seenEpoch)
+             {
+-                seenOpaque.clear();
++                seenCount = 0;
+                 seenEpoch = epoch;
+             }
++            struct
++            {
++                uint64_t epoch;
++                // false when the table is half full (the frame's later opaque draws are not matched)
++                bool insert(uint64_t k)
++                {
++                    if (seenCount >= kSeen / 2)
++                        return false;
++                    for (size_t i = static_cast<size_t>(k ^ (k >> 29)) & (kSeen - 1);; i = (i + 1) & (kSeen - 1))
++                    {
++                        if (seenGen[i] != epoch)
++                        {
++                            seenGen[i] = epoch;
++                            seenKey[i] = k;
++                            ++seenCount;
++                            return true;
++                        }
++                        if (seenKey[i] == k)
++                            return true;
++                    }
++                }
++                bool find(uint64_t k) const
++                {
++                    for (size_t i = static_cast<size_t>(k ^ (k >> 29)) & (kSeen - 1);; i = (i + 1) & (kSeen - 1))
++                    {
++                        if (seenGen[i] != epoch)
++                            return false;
++                        if (seenKey[i] == k)
++                            return true;
++                    }
++                }
++            } seenOpaque{epoch};
+             const GSVertex *sv = batch.vertices.data();
+             const bool blended = st.prim.abe != 0;
+             double zs[3] = {sv[0].z, sv[1].z, sv[2].z};
+@@ -2239,7 +2757,7 @@ private:
+             }
+             if (!blended)
+                 seenOpaque.insert(h);
+-            else if (seenOpaque.find(h) != seenOpaque.end())
++            else if (seenOpaque.find(h))
+             {
+                 dupTie = true;
+                 if (strictZ)
+@@ -2261,10 +2779,39 @@ private:
+ 
+         // target and depth
+         const bool sixteen = is16(c.frame.psm);
+-        Target *rt = getTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, sixteen, by1 + 1);
+-        Depth *zb = nullptr;
+         const bool zwrite = !c.zbuf.zmask;
+-        if (zte && (ztst >= 2 || zwrite || ztst == 1))
++        const bool needDepth = zte && (ztst >= 2 || zwrite);
++        {
++            static const bool rtlog = [] { const char *e = std::getenv("APE2_RTLOG"); return e && e[0] == '1'; }();
++            if (rtlog && needDepth && !findTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, is16(c.frame.psm)))
++            {
++                char key[200];
++                std::snprintf(key, sizeof(key), "depth draw, no exact target: fbp=0x%x fbw=%u ztst=%d zwrite=%d zbp=0x%x zpsm=0x%x",
++                              GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, ztst, zwrite ? 1 : 0,
++                              GSInternal::framePageBaseToBlock(c.zbuf.zbp), c.zbuf.psm);
++                rtCount(key);
++            }
++        }
++        m_aliasX = m_aliasY = 0;
++        Target *rt = needDepth ? nullptr
++                               : aliasTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, sixteen, bx1, by1,
++                                             m_aliasX, m_aliasY);
++        if (!rt)
++            rt = getTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, sixteen, by1 + 1);
++        if (m_aliasX != 0 || m_aliasY != 0)
++        {
++            for (int i = 0; i < nv; ++i)
++            {
++                px[i] += static_cast<float>(m_aliasX);
++                py[i] += static_cast<float>(m_aliasY);
++            }
++            bx0 += m_aliasX;
++            bx1 += m_aliasX;
++            by0 += m_aliasY;
++            by1 += m_aliasY;
++        }
++        Depth *zb = nullptr;
++        if (needDepth)
+             zb = getDepth(GSInternal::framePageBaseToBlock(c.zbuf.zbp), rt->w, rt->h);
+         // texture
+         GLuint tex = 0;
+@@ -2277,7 +2824,10 @@ private:
+             m_fu = 1.0f / (16.0f * tw);
+             m_fv = 1.0f / (16.0f * th);
+             m_su = m_sv = 1.0f;
+-            if (Target *src = texTarget(c.tex0))
++            Target *src = texTarget(c.tex0);
++            if (!src)
++                src = gatherTexTarget(c.tex0, th, *rt);
++            if (src)
+             {
+                 tex = src->tex;
+                 texRt = 1;
