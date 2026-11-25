@@ -4138,3 +4138,19 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   frame-stamped table instead of `std::unordered_set` (~9%).
 - Underwater: ~12 fps -> 44-55 fps, effect looks right (player). Still open: the GS thread is busy with per-primitive
   work (~28k primitives a frame underwater); the intro movie's single-frame skips (known, unchanged).
+
+### 0237 - GPU renderer: per-primitive cache of target, depth, texture and batch state (0070)
+
+- After 0069 the GS thread still looked up its render target, depth buffer and texture for every primitive (target
+  scans, the CPU backend's texture lookup under its mutex, the content cache) and rebuilt the batch state.
+- A primitive whose GS state (and 0063 mip-blend state) equals the previous one's reuses that one's results. Every
+  backend call other than Submit (uploads, transfers, palette loads, clears, syncs, Present, Display) moves a
+  generation counter that empties the cache, so it never outlives a VRAM change. Not kept for aliased targets (the
+  offset depends on the bbox) or for a decoded texture in the memory of the target being drawn. Hits require the
+  target to already hold the primitive's rows. `APE2_GL_PRIMCACHE=0` turns it off; the 600-display `[gpu]` line
+  counts hits.
+- Run 0258 (no host profiler): 92% of primitives from the cache in hub/stage play (1.19M of 1.30M per 600
+  displays); busy scene with ~8k prims/frame 30-45% hits, 56-58.5 fps. 95 of 170 2-second windows at exactly
+  60.0 fps. Player: "the fps is REALLY clean, felt like 60 fps locked or better"; underwater "only slightly slower".
+- Still open: the busy-scene windows with 11-31 frames over 20 ms (gs-raster 57-63%); the 83-85 ms single
+  frames (intro movie spots, known).
