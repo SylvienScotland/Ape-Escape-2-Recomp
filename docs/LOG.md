@@ -4154,3 +4154,18 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   60.0 fps. Player: "the fps is REALLY clean, felt like 60 fps locked or better"; underwater "only slightly slower".
 - Still open: the busy-scene windows with 11-31 frames over 20 ms (gs-raster 57-63%); the 83-85 ms single
   frames (intro movie spots, known).
+
+### 0238 - GPU renderer: the prim cache keeps aliased-target draws; miss log (0071)
+
+- `APE2_PRIMCACHE_LOG=1` prints, per 2 s, why primitives missed the 0070 cache: the GS fields that changed, the
+  backend call that cleared it, or why the entry was not kept.
+- Run 0259 underwater (with APE2_SYNCLOG): 1.3M hits vs 1.75M misses per 2 s, 95% of misses "aliased target" - the
+  small tiles the game draws by moving FBP across a shared 256-wide area (0069's aliasTarget).
+- aliasTarget now reports when its choice depends on the draw's size (a better-placed target was passed over only
+  because this bbox did not fit it, or the best one could not grow to hold it). Otherwise the entry is kept with its
+  offset, and a hit requires the new draw to fit the same target at the same offset within its rows in use.
+- Run 0260: 94-98% of primitives from the cache everywhere, 97-98% in the underwater scene (7-8.8k prims/frame), no
+  2-second window under 58.5 fps there. Player: "you fixed it!!".
+- Read-backs measured in 0259 underwater: 280-315 ms per 2 s in flush + read-back. Per 2 s ~84 x texture at 0x1c00
+  (64-wide column target), ~84 x CLUT at bp 0 (palette read from the frame buffer), the rest uploads into the
+  256-wide tile targets. Not addressed yet.

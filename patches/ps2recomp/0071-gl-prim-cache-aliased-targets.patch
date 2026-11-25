@@ -1,0 +1,333 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index f3368f1..4753194 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -283,7 +283,7 @@ public:
+     void Initialize(uint8_t *vram, uint32_t vramSize) override { m_cpu->Initialize(vram, vramSize); }
+     void Reset() override
+     {
+-        bump();
++        bump(0);
+         if (onGl())
+             dropTargets();
+         m_cpu->Reset();
+@@ -301,7 +301,7 @@ public:
+ 
+     void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
+     {
+-        bump();
++        bump(1);
+         // 0069: only a TEX0 that really loads a palette reads VRAM (the CPU backend's rule): an indexed format and a
+         // CLD that loads. Every TEX0 write came here, and the game's non-indexed TEX0s carry CBP 0 with CLD 0, which
+         // read the frame buffer at 0x0 back every frame (a GPU stall a frame in all play)
+@@ -355,7 +355,7 @@ public:
+ 
+     void BeginTransfer(const GSTransferCommand &command) override
+     {
+-        bump();
++        bump(2);
+         if (onGl() && command.direction == 2u && gpuLocalCopy(command))
+             return;
+         if (onGl())
+@@ -398,7 +398,7 @@ public:
+ 
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
+     {
+-        bump();
++        bump(3);
+         m_cpu->UploadImage(data, sizeBytes);
+         if (onGl() && m_uploadActive)
+         {
+@@ -439,33 +439,33 @@ public:
+ 
+     void Flush() override
+     {
+-        bump();
++        bump(4);
+         if (onGl())
+             flush();
+         m_cpu->Flush();
+     }
+     void TextureFlush() override
+     {
+-        bump();
++        bump(5);
+         m_cpu->TextureFlush();
+     }
+     void Sync(GSSyncReason reason) override
+     {
+-        bump();
++        bump(6);
+         if (onGl())
+             flush();
+         m_cpu->Sync(reason);
+     }
+     PresentationFrame Present(const GSPresentationRequest &request) override
+     {
+-        bump();
++        bump(7);
+         m_frameEpoch.fetch_add(1, std::memory_order_relaxed); // 0055 A/B: frame boundary for the dup cache
+         return m_cpu->Present(request);
+     }
+ 
+     bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
+     {
+-        bump();
++        bump(8);
+         if (onGl())
+             syncRange(GSInternal::framePageBaseToBlock(context.frame.fbp), 2048u, "clear");
+         const bool done = m_cpu->ClearFramebuffer(context, rgba);
+@@ -478,7 +478,7 @@ public:
+     uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override { return m_cpu->ReadVram(psm, base, bw, x, y); }
+     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
+     {
+-        bump();
++        bump(9);
+         m_cpu->WriteVram(psm, base, bw, x, y, value);
+     }
+     void SnapshotVram(std::vector<uint8_t> &out) const override { m_cpu->SnapshotVram(out); }
+@@ -487,7 +487,7 @@ public:
+     // GS thread: the game swapped buffers / a vsync passed: the displayed buffers' drawing goes to VRAM
+     void Display(uint64_t pmode, uint64_t dispfb1, uint64_t dispfb2)
+     {
+-        bump();
++        bump(10);
+         if (!onGl())
+             return;
+         for (int n = 0; n < 2; ++n)
+@@ -615,10 +615,102 @@ private:
+         DrawState s{};
+         GLuint tex = 0;
+         float fu = 1, fv = 1, su = 1, sv = 1;
++        bool aliased = false;
++        int ax = 0, ay = 0; // the draw's offset inside an aliased target
+     } m_pc;
++    // the kept target holds this draw's rows (bx1/by1 before the alias offset): getTarget / aliasTarget would return
++    // it unchanged
++    bool pcFits(int bx1, int by1) const
++    {
++        const Target &t = *m_pc.s.rt;
++        if (m_pc.aliased)
++            return m_pc.ax + bx1 <= t.w && m_pc.ay + by1 + 1 <= t.vh;
++        return std::min(by1 + 1, 1024) <= t.vh;
++    }
+     std::atomic<uint64_t> m_gen{0};
+     uint64_t m_stPrimHits = 0;
+-    void bump() { m_gen.fetch_add(1, std::memory_order_relaxed); }
++    // APE2_PRIMCACHE_LOG=1: why primitives missed the cache, per 2 s (debugging aid)
++    static bool pcLogOn()
++    {
++        static const bool on = [] { const char *e = std::getenv("APE2_PRIMCACHE_LOG"); return e && e[0] == '1'; }();
++        return on;
++    }
++    static constexpr const char *kBumpNames[] = {"Reset", "LoadClut", "BeginTransfer", "UploadImage", "Flush", "TextureFlush",
++                                                 "Sync", "Present", "ClearFramebuffer", "WriteVram", "Display"};
++    std::atomic<int> m_lastBump{-1};
++    void bump(int why)
++    {
++        m_gen.fetch_add(1, std::memory_order_relaxed);
++        if (pcLogOn())
++            m_lastBump.store(why, std::memory_order_relaxed);
++    }
++    void pcNoteMiss(const GSDrawState &st, const Ape2MipBlend &mip, uint64_t gen, int bx1, int by1)
++    {
++        static std::map<std::string, uint64_t> counts;
++        static uint64_t misses = 0, hits0 = 0;
++        static auto last = std::chrono::steady_clock::now();
++        ++misses;
++        std::string why;
++        if (!m_pc.valid)
++            why = m_pcWhyInvalid;
++        else if (m_pc.gen != gen)
++        {
++            const int b = m_lastBump.load(std::memory_order_relaxed);
++            why = std::string("cleared by ") + (b >= 0 && b < 11 ? kBumpNames[b] : "?");
++        }
++        else if (!pcFits(bx1, by1))
++            why = "rows past the target";
++        else
++        {
++            const GSDrawState &a = m_pc.st;
++            const GSContext &x = a.context, &y = st.context;
++            auto d = [&why](bool differ, const char *n) { if (differ) { if (!why.empty()) why += '+'; why += n; } };
++            d(std::memcmp(&x.frame, &y.frame, sizeof x.frame) != 0, "frame");
++            d(std::memcmp(&x.scissor, &y.scissor, sizeof x.scissor) != 0, "scissor");
++            d(std::memcmp(&x.tex0, &y.tex0, sizeof x.tex0) != 0, "tex0");
++            d(std::memcmp(&x.xyoffset, &y.xyoffset, sizeof x.xyoffset) != 0, "xyoffset");
++            d(std::memcmp(&x.zbuf, &y.zbuf, sizeof x.zbuf) != 0, "zbuf");
++            d(x.tex1 != y.tex1, "tex1");
++            d(x.miptbp1 != y.miptbp1 || x.miptbp2 != y.miptbp2, "miptbp");
++            d(x.clamp != y.clamp, "clamp");
++            d(x.alpha != y.alpha, "alpha");
++            d(x.test != y.test, "test");
++            d(x.fba != y.fba, "fba");
++            d(a.prim.type != st.prim.type, "prim.type");
++            d(a.prim.iip != st.prim.iip || a.prim.tme != st.prim.tme || a.prim.fge != st.prim.fge || a.prim.abe != st.prim.abe ||
++                  a.prim.aa1 != st.prim.aa1 || a.prim.fst != st.prim.fst || a.prim.ctxt != st.prim.ctxt || a.prim.fix != st.prim.fix,
++              "prim.flags");
++            d(std::memcmp(&a.texa, &st.texa, sizeof a.texa) != 0, "texa");
++            d(std::memcmp(&a.texclut, &st.texclut, sizeof a.texclut) != 0, "texclut");
++            d(a.pabe != st.pabe || a.scanmsk != st.scanmsk || a.dimx != st.dimx || a.dthe != st.dthe || a.colclamp != st.colclamp,
++              "misc");
++            d(a.fogR != st.fogR || a.fogG != st.fogG || a.fogB != st.fogB, "fogcol");
++            d(a.textureWidth != st.textureWidth || a.textureHeight != st.textureHeight, "texsize");
++            d(a.linearFilter != st.linearFilter, "linear");
++            d(!sameMipBlend(m_pc.mip, mip), "mipblend");
++            if (why.empty())
++                why = "padding only";
++        }
++        ++counts[why];
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last >= std::chrono::seconds(2))
++        {
++            std::vector<std::pair<uint64_t, std::string>> top;
++            for (const auto &[k, n] : counts)
++                top.emplace_back(n, k);
++            std::sort(top.rbegin(), top.rend());
++            const uint64_t hits = m_stPrimHitsTotal - hits0;
++            std::fprintf(stderr, "[gpu:pc] 2s: %llu hits, %llu misses%c", (unsigned long long)hits, (unsigned long long)misses, 10);
++            for (size_t i = 0; i < top.size() && i < 10u; ++i)
++                std::fprintf(stderr, "[gpu:pc]   %llu x %s%c", (unsigned long long)top[i].first, top[i].second.c_str(), 10);
++            counts.clear();
++            misses = 0;
++            hits0 = m_stPrimHitsTotal;
++            last = now;
++        }
++    }
++    const char *m_pcWhyInvalid = "first";
++    uint64_t m_stPrimHitsTotal = 0;
+     static bool sameMipBlend(const Ape2MipBlend &a, const Ape2MipBlend &b)
+     {
+         if (a.on != b.on)
+@@ -1574,7 +1666,9 @@ private:
+     // 0x31c0...); every base got its own target, each new one overlapped the last, and claimRows read the old one
+     // back (glReadPixels) and deleted it: 10-15 fps. Such draws now go into the containing target at the offset.
+     // Only for draws without a depth buffer. APE2_GL_RT_ALIAS=0 disables it.
+-    Target *aliasTarget(uint32_t fbp, uint32_t fbw, bool sixteen, int bx1, int by1, int &ox, int &oy)
++    // 0070: *sizeDependent is set when a better-placed target was passed over only because this draw's bbox did not
++    // fit it (a smaller draw with the same state could pick that one instead)
++    Target *aliasTarget(uint32_t fbp, uint32_t fbw, bool sixteen, int bx1, int by1, int &ox, int &oy, bool *sizeDependent = nullptr)
+     {
+         static const bool on = [] { const char *e = std::getenv("APE2_GL_RT_ALIAS"); return !(e && e[0] == '0'); }();
+         if (!on || fbw == 0u || findTarget(fbp, fbw, sixteen))
+@@ -1582,6 +1676,8 @@ private:
+         const int ph = sixteen ? 64 : 32;
+         Target *best = nullptr;
+         int bestX = 0, bestY = 0;
++        bool rejected = false;
++        int rejX = 0, rejY = 0;
+         for (Target &o : m_rt)
+         {
+             if (!o.used || o.fbw != fbw || o.is16 != sixteen || fbp <= o.fbp || (fbp - o.fbp) % 32u != 0u)
+@@ -1589,8 +1685,19 @@ private:
+             const uint32_t page = (fbp - o.fbp) / 32u;
+             const int x = static_cast<int>(page % fbw) * 64, y = static_cast<int>(page / fbw) * ph;
+             // bx1/by1 are the bbox's far edges (a 64-wide sprite ends at 64), so a draw fits while x + bx1 <= w
+-            if (y >= o.vh || x + bx1 > o.w || y + by1 > o.h)
+-                continue; // starts past the rows it holds, or the draw would wrap out of the surface
++            if (y >= o.vh)
++                continue; // starts past the rows it holds
++            if (x + bx1 > o.w || y + by1 > o.h)
++            {
++                // the draw would wrap out of the surface
++                if (!rejected || y < rejY || (y == rejY && x < rejX))
++                {
++                    rejected = true;
++                    rejX = x;
++                    rejY = y;
++                }
++                continue;
++            }
+             if (!best || y < bestY || (y == bestY && x < bestX))
+             {
+                 best = &o;
+@@ -1598,12 +1705,18 @@ private:
+                 bestY = y;
+             }
+         }
++        if (sizeDependent)
++            *sizeDependent = rejected && (!best || rejY < bestY || (rejY == bestY && rejX < bestX));
+         if (!best)
+             return nullptr;
+         int needH = std::min(bestY + by1 + 1, best->h);
+         needH = (needH + ph - 1) / ph * ph;
+         if (needH > best->h)
++        {
++            if (sizeDependent)
++                *sizeDependent = true;
+             return nullptr;
++        }
+         if (needH > best->vh)
+         {
+             flush();
+@@ -2837,7 +2950,7 @@ private:
+         const bool tme = st.prim.tme;
+         DrawState s;
+         bool hit = false;
+-        if (cacheUsable && m_pc.valid && m_pc.gen == gen && std::min(by1 + 1, 1024) <= m_pc.s.rt->vh &&
++        if (cacheUsable && m_pc.valid && m_pc.gen == gen && pcFits(bx1, by1) &&
+             std::memcmp(&m_pc.st, &st, sizeof st) == 0 && sameMipBlend(m_pc.mip, g_ape2MipBlend))
+         {
+             hit = true;
+@@ -2848,9 +2961,25 @@ private:
+             m_fv = m_pc.fv;
+             m_su = m_pc.su;
+             m_sv = m_pc.sv;
+-            m_aliasX = m_aliasY = 0;
++            m_aliasX = m_pc.ax;
++            m_aliasY = m_pc.ay;
++            if (m_aliasX != 0 || m_aliasY != 0)
++            {
++                for (int i = 0; i < nv; ++i)
++                {
++                    px[i] += static_cast<float>(m_aliasX);
++                    py[i] += static_cast<float>(m_aliasY);
++                }
++                bx0 += m_aliasX;
++                bx1 += m_aliasX;
++                by0 += m_aliasY;
++                by1 += m_aliasY;
++            }
+             ++m_stPrimHits;
++            ++m_stPrimHitsTotal;
+         }
++        if (!hit && cacheUsable && pcLogOn())
++            pcNoteMiss(st, g_ape2MipBlend, gen, bx1, by1);
+         if (!hit)
+         {
+         // target and depth
+@@ -2869,9 +2998,10 @@ private:
+             }
+         }
+         m_aliasX = m_aliasY = 0;
++        bool sizeDependent = false;
+         rt = needDepth ? nullptr
+                        : aliasTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, sixteen, bx1, by1,
+-                                     m_aliasX, m_aliasY);
++                                     m_aliasX, m_aliasY, &sizeDependent);
+         const bool aliased = rt != nullptr;
+         if (!rt)
+             rt = getTarget(GSInternal::framePageBaseToBlock(c.frame.fbp), c.frame.fbw, sixteen, by1 + 1);
+@@ -3089,8 +3219,11 @@ private:
+         // 0070: not kept when the draw went into an aliased target (its offset depends on the bbox), or when a
+         // decoded texture lies in the memory of the target being drawn (each draw there dirties what it samples, so
+         // the next one has to read back and decode again)
+-        m_pc.valid = cacheUsable && !aliased && !mipOverRt &&
++        m_pc.valid = cacheUsable && !sizeDependent && !mipOverRt &&
+                      !(tme && tex && !texRt && overlaps(*rt, c.tex0.tbp0, texBlocks(c.tex0)));
++        if (!m_pc.valid)
++            m_pcWhyInvalid = sizeDependent ? "not kept: target choice depends on size" : mipOverRt ? "not kept: mip texture in the target"
++                                                                    : "not kept: texture in the target";
+         if (m_pc.valid)
+         {
+             m_pc.gen = m_gen.load(std::memory_order_relaxed);
+@@ -3102,6 +3235,9 @@ private:
+             m_pc.fv = m_fv;
+             m_pc.su = m_su;
+             m_pc.sv = m_sv;
++            m_pc.aliased = aliased;
++            m_pc.ax = m_aliasX;
++            m_pc.ay = m_aliasY;
+         }
+         }
+         if (dupTie && strictZ && s.depthTest)
