@@ -1,0 +1,140 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 9988e66..d4eef1e 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -69,7 +69,7 @@ static std::atomic<bool> &ape2WideDisplay()
+ static void ape2FitWindowToAspect(bool wide)
+ {
+ #if !defined(PLATFORM_VITA)
+-    if (IsWindowFullscreen() || IsWindowMaximized())
++    if (IsWindowFullscreen() || IsWindowMaximized() || IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
+         return;
+     const int h = GetScreenHeight();
+     SetWindowSize(static_cast<int>(static_cast<float>(h) * (wide ? 16.0f / 9.0f : 4.0f / 3.0f) + 0.5f), h);
+@@ -78,6 +78,88 @@ static void ape2FitWindowToAspect(bool wide)
+ #endif
+ }
+ 
++// 0074: player settings in ape2.ini (current directory, or APE2_SETTINGS), written with the defaults when missing
++// and again when F6 / F11 change them. Each one is handed on as its APE2_* variable, so a variable set in the
++// environment still wins (for test runs).
++struct Ape2Settings
++{
++    int scale = 3;            // internal_resolution: 1-8 x the PS2's 512x448
++    std::string aspect = "4:3"; // aspect: 4:3, or 16:9 with the game's own 16:9 screen option
++    bool fullscreen = false;  // fullscreen: borderless window on the current monitor
++};
++static Ape2Settings &ape2Settings()
++{
++    static Ape2Settings s;
++    return s;
++}
++static std::string ape2SettingsPath()
++{
++    const char *e = std::getenv("APE2_SETTINGS");
++    return (e && *e) ? e : "ape2.ini";
++}
++static void ape2SaveSettings()
++{
++    const Ape2Settings &s = ape2Settings();
++    std::ofstream f(ape2SettingsPath(), std::ios::trunc);
++    if (!f)
++        return;
++    f << "# Ape Escape 2 recomp settings (edit freely; F6 and F11 in game save them here too).\n"
++         "# internal_resolution: 1-8 times the PS2's 512x448 (3 = 1536x1344, 4 = 2048x1792)\n"
++         "# aspect: 4:3, or 16:9 together with the game's own 16:9 screen setting in Options (F6 toggles)\n"
++         "# fullscreen: 0 or 1, a borderless window over the whole monitor (F11 toggles)\n\n"
++      << "internal_resolution = " << s.scale << "\n"
++      << "aspect = " << s.aspect << "\n"
++      << "fullscreen = " << (s.fullscreen ? 1 : 0) << "\n";
++}
++static void ape2SetEnv(const char *name, const std::string &value)
++{
++#if defined(_WIN32)
++    _putenv_s(name, value.c_str());
++#else
++    setenv(name, value.c_str(), 1);
++#endif
++}
++static void ape2LoadSettings()
++{
++    Ape2Settings &s = ape2Settings();
++    std::ifstream f(ape2SettingsPath());
++    if (!f)
++        ape2SaveSettings();
++    std::string line;
++    while (f && std::getline(f, line))
++    {
++        const size_t hash = line.find('#');
++        if (hash != std::string::npos)
++            line.resize(hash);
++        const size_t eq = line.find('=');
++        if (eq == std::string::npos)
++            continue;
++        auto trim = [](std::string t)
++        {
++            const size_t a = t.find_first_not_of(" \t\r");
++            const size_t b = t.find_last_not_of(" \t\r");
++            return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
++        };
++        const std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
++        if (key == "internal_resolution")
++            s.scale = std::clamp(std::atoi(value.c_str()), 1, 8);
++        else if (key == "aspect")
++            s.aspect = (value == "16:9" || value == "wide") ? "16:9" : "4:3";
++        else if (key == "fullscreen")
++            s.fullscreen = value == "1" || value == "true";
++    }
++    if (const char *e = std::getenv("APE2_GS_SCALE"))
++        s.scale = std::clamp(std::atoi(e), 1, 8);
++    else
++        ape2SetEnv("APE2_GS_SCALE", std::to_string(s.scale));
++    if (const char *e = std::getenv("APE2_ASPECT"))
++        s.aspect = (std::strcmp(e, "16:9") == 0 || std::strcmp(e, "wide") == 0) ? "16:9" : "4:3";
++    else
++        ape2SetEnv("APE2_ASPECT", s.aspect);
++    std::fprintf(stderr, "[settings] %s: internal_resolution %d, aspect %s, fullscreen %d\n", ape2SettingsPath().c_str(),
++                 s.scale, s.aspect.c_str(), s.fullscreen ? 1 : 0);
++}
++
+ struct ElfHeader
+ {
+     uint32_t magic;
+@@ -878,6 +960,7 @@ bool PS2Runtime::initialize(const char *title)
+             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
+             return false;
+         }
++        ape2LoadSettings(); // 0074: before anything reads the APE2_* settings
+ #if defined(PLATFORM_VITA)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
+ #else
+@@ -885,6 +968,8 @@ bool PS2Runtime::initialize(const char *title)
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+         if (ape2WideDisplay().load(std::memory_order_relaxed))
+             ape2FitWindowToAspect(true);
++        if (ape2Settings().fullscreen)
++            ToggleBorderlessWindowed();
+         {
+             void ape2CreateGsGlContext(); // APE2_GS_RENDERER=gl: the GS thread's GL context (zz_ape2_gs_gl.cpp)
+             ape2CreateGsGlContext();
+@@ -2843,8 +2928,20 @@ void PS2Runtime::run()
+             const bool wide = !ape2WideDisplay().load(std::memory_order_relaxed);
+             ape2WideDisplay().store(wide, std::memory_order_relaxed);
+             ape2FitWindowToAspect(wide);
++            ape2Settings().aspect = wide ? "16:9" : "4:3";
++            ape2SaveSettings();
+             std::fprintf(stderr, "[display] F6: %s picture\n", wide ? "16:9" : "4:3");
+         }
++        if (IsKeyPressed(KEY_F11))
++        {
++            ToggleBorderlessWindowed();
++            Ape2Settings &s = ape2Settings();
++            s.fullscreen = !s.fullscreen;
++            ape2SaveSettings();
++            if (!s.fullscreen)
++                ape2FitWindowToAspect(ape2WideDisplay().load(std::memory_order_relaxed));
++            std::fprintf(stderr, "[display] F11: %s\n", s.fullscreen ? "fullscreen" : "windowed");
++        }
+         if (IsKeyPressed(KEY_F9))
+         {
+             extern std::atomic<int> g_ape2FrameDumpBurst; // gs_frontend.cpp: burst frame dump (APE2_FRAME_DUMP)

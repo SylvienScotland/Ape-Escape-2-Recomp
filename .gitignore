@@ -26,6 +26,7 @@ kb*.txt
 *.bak
 imgui.ini
 pad.ini
+ape2.ini
 engine_work_*.patch
 after_fmv.txt
 boot_summary.txt

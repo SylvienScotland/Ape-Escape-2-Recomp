@@ -4195,3 +4195,12 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   `APE2_GPU_PRESENT=0` turns it off. New header Kernel/zz_ape2_gpu_present.h.
 - Run 0262 at `APE2_GS_SCALE=3` in 16:9: player "looks amazing! runs great!". 124 of 132 2-second windows at 58.5+
   fps; dips at boot, the known 83 ms spots, and two unexplained windows at 43-45 fps.
+
+### 0241 - Settings file ape2.ini, F11 fullscreen (0074)
+
+- `ape2.ini` (current directory, or `APE2_SETTINGS`) is written with the defaults when missing:
+  `internal_resolution = 3` (1-8), `aspect = 4:3` (or 16:9), `fullscreen = 0`. Each value is handed on as its
+  APE2_* variable (APE2_GS_SCALE, APE2_ASPECT) unless that variable is already set, so test runs can still override.
+- F6 (aspect) and the new F11 (borderless fullscreen) save the file. Leaving fullscreen refits the window to the
+  current aspect. `ape2.ini` is git-ignored like pad.ini.
+- Run 0263 without APE2_* display variables: file created with the defaults, 3x applied, F6/F11 work (player).
