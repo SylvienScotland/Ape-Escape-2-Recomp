@@ -1,0 +1,69 @@
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 563d534..b972e11 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -51,6 +51,30 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
+ static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
+ static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
+ #endif
++
++// 0072: display aspect of the presented picture. APE2_ASPECT=16:9 (or "wide") starts in 16:9, for the game's own
++// 16:9 screen option; F6 toggles it while playing.
++static std::atomic<bool> &ape2WideDisplay()
++{
++    static std::atomic<bool> wide{[] {
++        const char *e = std::getenv("APE2_ASPECT");
++        return e && (std::strcmp(e, "16:9") == 0 || std::strcmp(e, "wide") == 0);
++    }()};
++    return wide;
++}
++// a windowed (not maximized / fullscreen) window keeps its height and takes the picture's width, so no bars
++static void ape2FitWindowToAspect(bool wide)
++{
++#if !defined(PLATFORM_VITA)
++    if (IsWindowFullscreen() || IsWindowMaximized())
++        return;
++    const int h = GetScreenHeight();
++    SetWindowSize(static_cast<int>(static_cast<float>(h) * (wide ? 16.0f / 9.0f : 4.0f / 3.0f) + 0.5f), h);
++#else
++    (void)wide;
++#endif
++}
++
+ struct ElfHeader
+ {
+     uint32_t magic;
+@@ -838,6 +862,8 @@ bool PS2Runtime::initialize(const char *title)
+ #else
+         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++        if (ape2WideDisplay().load(std::memory_order_relaxed))
++            ape2FitWindowToAspect(true);
+         {
+             void ape2CreateGsGlContext(); // APE2_GS_RENDERER=gl: the GS thread's GL context (zz_ape2_gs_gl.cpp)
+             ape2CreateGsGlContext();
+@@ -2729,7 +2755,9 @@ void PS2Runtime::run()
+         const float screenHeight = static_cast<float>(GetScreenHeight());
+         // The PS2 always outputs a 4:3 picture whatever the frame buffer width (512, 640...), so fit a
+         // 4:3 box instead of keeping the source pixel aspect (Ape Escape 2 recomp patch 0011).
+-        constexpr float kDisplayAspect = 4.0f / 3.0f;
++        // 0072: with the game's own 16:9 screen option it draws an anamorphic picture for a widescreen TV to
++        // stretch; APE2_ASPECT=16:9 (or F6 in game) shows it in a 16:9 box.
++        const float kDisplayAspect = ape2WideDisplay().load(std::memory_order_relaxed) ? 16.0f / 9.0f : 4.0f / 3.0f;
+         const float dstHeight = std::min(screenHeight, screenWidth / kDisplayAspect);
+         const float dstWidth = dstHeight * kDisplayAspect;
+         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+@@ -2774,6 +2802,13 @@ void PS2Runtime::run()
+             }
+         }
+ 
++        if (IsKeyPressed(KEY_F6))
++        {
++            const bool wide = !ape2WideDisplay().load(std::memory_order_relaxed);
++            ape2WideDisplay().store(wide, std::memory_order_relaxed);
++            ape2FitWindowToAspect(wide);
++            std::fprintf(stderr, "[display] F6: %s picture\n", wide ? "16:9" : "4:3");
++        }
+         if (IsKeyPressed(KEY_F9))
+         {
+             extern std::atomic<int> g_ape2FrameDumpBurst; // gs_frontend.cpp: burst frame dump (APE2_FRAME_DUMP)

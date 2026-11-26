@@ -4169,3 +4169,15 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
 - Read-backs measured in 0259 underwater: 280-315 ms per 2 s in flush + read-back. Per 2 s ~84 x texture at 0x1c00
   (64-wide column target), ~84 x CLUT at bp 0 (palette read from the frame buffer), the rest uploads into the
   256-wide tile targets. Not addressed yet.
+
+### 0239 - 16:9 display for the game's own widescreen option (0072)
+
+- The PAL port's repository is no longer on GitHub, so nothing to borrow. The game has a 16:9 screen setting in
+  its Options menu (also in PCSX2's notes for SLUS-20685): it draws an anamorphic picture for a widescreen TV to
+  stretch, so only the presenter has to change.
+- The presenter fits a 16:9 box instead of 4:3 when `APE2_ASPECT=16:9` (or `wide`) is set, and F6 toggles it while
+  playing. A windowed (not maximized / fullscreen) window keeps its height and takes the picture's width.
+- Run 0261 with the in-game option on: player reports correct proportions, HUD and menus fine, game runs as before.
+  Next: internal resolution - the picture is still the 512x448 frame stretched ("blurry/pixely" at 1440p);
+  presentation reads the displayed buffer back through VRAM at 1x even with APE2_GS_SCALE (LOG 0047 note).
+  Later: detect the game's 16:9 setting in guest memory instead of F6/APE2_ASPECT.
