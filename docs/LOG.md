@@ -4181,3 +4181,17 @@ smoother". Still open: the remaining dips, and the mip-level bands on the floors
   Next: internal resolution - the picture is still the 512x448 frame stretched ("blurry/pixely" at 1440p);
   presentation reads the displayed buffer back through VRAM at 1x even with APE2_GS_SCALE (LOG 0047 note).
   Later: detect the game's 16:9 setting in guest memory instead of F6/APE2_ASPECT.
+
+### 0240 - The picture at the GPU renderer's internal resolution (0073)
+
+- Since 0047 the window showed the displayed buffer read back through VRAM at 1x, so `APE2_GS_SCALE` never reached
+  the screen and the 512x448 frame was stretched ("blurry/pixely" at 1440p).
+- At each display update (Display, GS thread) the displayed buffer's target is copied by `glBlitFramebuffer` into
+  one of six shared textures, with a fence. The presenter takes the newest copy of the buffer it latched
+  (`sourceFbp`, the DISPFB DBX/DBY origin included), holds it while it is shown, keeps the one-frame present delay,
+  waits on the fence in its own context (`glWaitSync` through glfwGetProcAddress) and draws it with blending off
+  (the GS alpha is not coverage). The GS thread only writes slots nobody holds. A displayed buffer without a target
+  (its newest contents came from VRAM writes) drops its copies, and the 1x picture is shown as before.
+  `APE2_GPU_PRESENT=0` turns it off. New header Kernel/zz_ape2_gpu_present.h.
+- Run 0262 at `APE2_GS_SCALE=3` in 16:9: player "looks amazing! runs great!". 124 of 132 2-second windows at 58.5+
+  fps; dips at boot, the known 83 ms spots, and two unexplained windows at 43-45 fps.

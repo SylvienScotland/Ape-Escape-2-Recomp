@@ -1,0 +1,362 @@
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gpu_present.h b/ps2xRuntime/src/lib/Kernel/zz_ape2_gpu_present.h
+new file mode 100644
+index 0000000..5662d13
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gpu_present.h
+@@ -0,0 +1,21 @@
++#pragma once
++// Ape Escape 2 recomp patch 0072: the displayed buffer at the GPU renderer's internal resolution, for the presenter
++// (zz_ape2_gs_gl.cpp makes the copies on the GS thread; ps2_runtime.cpp draws them).
++#include <cstdint>
++
++struct Ape2GpuFrame
++{
++    int slot = -1;          // -1: none, use the picture read back through VRAM
++    unsigned int tex = 0;   // GL texture, shared with the presenter's context
++    int texW = 0, texH = 0; // texture size in pixels
++    int scale = 1;          // pixels per GS pixel
++    int ox = 0, oy = 0;     // the displayed area's origin in the buffer, in GS pixels
++};
++
++// presenter thread: the newest copy of the buffer at fbp (in 256-byte blocks) that covers width x height, held
++// until released; false (out.slot == -1) when there is none
++bool ape2AcquireGpuFrame(uint32_t fbp, uint32_t width, uint32_t height, Ape2GpuFrame &out);
++void ape2HoldGpuFrame(const Ape2GpuFrame &frame);
++void ape2ReleaseGpuFrame(const Ape2GpuFrame &frame);
++// presenter thread, its own context current: the GPU waits for the copy before drawing it
++void ape2WaitGpuFrame(const Ape2GpuFrame &frame);
+diff --git a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+index 4753194..d6e6c0c 100644
+--- a/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
++++ b/ps2xRuntime/src/lib/Kernel/zz_ape2_gs_gl.cpp
+@@ -1,6 +1,8 @@
+ #include <chrono>
+ #include <string>
+ #include <map>
++#include <mutex>
++#include "zz_ape2_gpu_present.h"
+ // GPU renderer (Ape Escape 2 recomp patch 0047): the GS drawn with OpenGL 3.3 core.
+ //
+ // A port of the PAL port's GPU renderer (JackyPendrag0n/ae2-recomp, port/src/gs_hw.h and gl.h, used with the
+@@ -65,6 +67,8 @@ namespace ape2gl
+     typedef float GLfloat;
+     typedef char GLchar;
+     typedef ptrdiff_t GLsizeiptr, GLintptr;
++    typedef struct __GLsync *GLsync; // 0072
++    typedef unsigned long long GLuint64;
+ 
+     constexpr GLenum GL_TRIANGLES = 0x0004, GL_TRIANGLE_STRIP = 0x0005;
+     constexpr GLenum GL_ZERO = 0, GL_ONE = 1, GL_DST_COLOR = 0x0306;
+@@ -85,6 +89,8 @@ namespace ape2gl
+     constexpr GLenum GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9;
+     constexpr GLenum GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_FRAMEBUFFER_COMPLETE = 0x8CD5;
+     constexpr GLbitfield GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x0100;
++    constexpr GLenum GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117; // 0072
++    constexpr GLuint64 GL_TIMEOUT_IGNORED = ~0ull;
+     constexpr GLenum GL_RENDERER = 0x1F01, GL_EXTENSIONS = 0x1F03, GL_NUM_EXTENSIONS = 0x821D, GL_MAX_TEXTURE_SIZE = 0x0D33;
+ 
+ #define APE2_GL_FUNCS(X)                                                                                                     \
+@@ -149,6 +155,9 @@ namespace ape2gl
+     X(GLenum, glCheckFramebufferStatus, (GLenum))                                                                          \
+     X(void, glBlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum))               \
+     X(void, glFlush, (void))                                                                                               \
++    X(GLsync, glFenceSync, (GLenum, GLbitfield))                                                                           \
++    X(void, glWaitSync, (GLsync, GLbitfield, GLuint64))                                                                    \
++    X(void, glDeleteSync, (GLsync))                                                                                        \
+     X(void, glTextureBarrier, (void))
+ 
+ #define APE2_GL_DEF(ret, name, args) ret(WINAPI *name) args = nullptr;
+@@ -241,12 +250,39 @@ extern "C"
+     GLFWwindow *glfwCreateWindow(int width, int height, const char *title, void *monitor, GLFWwindow *share);
+     GLFWwindow *glfwGetCurrentContext(void);
+     void glfwMakeContextCurrent(GLFWwindow *window);
++    void *glfwGetProcAddress(const char *procname);
+ }
+ 
+ namespace
+ {
+     GLFWwindow *g_gsGlWindow = nullptr;
+ 
++    // 0072: copies of the displayed buffers at the renderer's internal resolution, made by the GS thread at each
++    // display update (Display) and drawn by the presenter instead of the 1x picture read back through VRAM. The
++    // presenter holds the slots it is showing (holds); the GS thread only writes slots nobody holds. The textures
++    // are shared between the two contexts; a fence orders the copy before the presenter's draw.
++    struct PresentSlot
++    {
++        ape2gl::GLuint tex = 0, fbo = 0;
++        int w = 0, h = 0, scale = 1; // native size of the copied target, and its scale
++        uint32_t fbp = 0;
++        int ox = 0, oy = 0; // where the display reads the buffer from (DISPFB DBX/DBY)
++        bool valid = false;
++        uint64_t serial = 0;
++        ape2gl::GLsync fence = nullptr;
++        int holds = 0;
++    };
++    constexpr int kPresentSlots = 6;
++    std::mutex g_presentMutex;
++    PresentSlot g_present[kPresentSlots];
++    uint64_t g_presentSerial = 0;
++
++    bool gpuPresentOn()
++    {
++        static const bool on = [] { const char *e = std::getenv("APE2_GPU_PRESENT"); return !(e && e[0] == '0'); }();
++        return on;
++    }
++
+     bool gpuRequested()
+     {
+         const char *e = std::getenv("APE2_GS_RENDERER");
+@@ -497,12 +533,13 @@ public:
+             const uint64_t fb = n ? dispfb2 : dispfb1;
+             const uint32_t fbp = static_cast<uint32_t>(fb & 0x1FFu) * 32u, fbw = static_cast<uint32_t>((fb >> 9) & 0x3Fu);
+             const uint32_t psm = static_cast<uint32_t>((fb >> 15) & 0x1Fu);
+-            if (Target *rt = findTarget(fbp, fbw, is16(psm)))
+-                if (rt->gpuDirty)
+-                {
+-                    flush();
+-                    download(*rt);
+-                }
++            Target *rt = findTarget(fbp, fbw, is16(psm));
++            if (rt && rt->gpuDirty)
++            {
++                flush();
++                download(*rt);
++            }
++            publishPresent(fbp, rt, static_cast<int>((fb >> 32) & 0x7FFu), static_cast<int>((fb >> 43) & 0x7FFu));
+         }
+         if (++m_frames % 600u == 0u)
+         {
+@@ -2770,6 +2807,66 @@ private:
+         s.needDst = shader || date;
+     }
+ 
++    // ---------------------------------------------------------------- presentation (0072)
++    // the displayed buffer at fbp (blocks) as the presenter's high-resolution picture. Without a target there the
++    // buffer's newest contents came from VRAM writes, so its older copies stop being offered.
++    void publishPresent(uint32_t fbp, Target *rt, int ox, int oy)
++    {
++        if (!gpuPresentOn())
++            return;
++        std::lock_guard<std::mutex> lock(g_presentMutex);
++        if (!rt)
++        {
++            for (PresentSlot &p : g_present)
++                if (p.valid && p.fbp == fbp)
++                    p.valid = false;
++            return;
++        }
++        // a slot nobody holds: an unused one, else the oldest copy
++        PresentSlot *slot = nullptr;
++        for (PresentSlot &p : g_present)
++        {
++            if (p.holds > 0)
++                continue;
++            if (!slot || (!p.valid && slot->valid) || (p.valid == slot->valid && p.serial < slot->serial))
++                slot = &p;
++        }
++        if (!slot)
++            return;
++        flush();
++        const int W = rt->w * m_scale, H = rt->h * m_scale;
++        if (!slot->tex || slot->w * slot->scale != W || slot->h * slot->scale != H)
++        {
++            if (slot->tex)
++            {
++                glDeleteTextures(1, &slot->tex);
++                glDeleteFramebuffers(1, &slot->fbo);
++            }
++            slot->tex = newTex(W, H, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
++            texParams(slot->tex, GL_LINEAR, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE);
++            glGenFramebuffers(1, &slot->fbo);
++            glBindFramebuffer(GL_FRAMEBUFFER, slot->fbo);
++            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot->tex, 0);
++        }
++        glBindFramebuffer(GL_READ_FRAMEBUFFER, rt->fbo);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, slot->fbo);
++        glDisable(GL_SCISSOR_TEST);
++        glBlitFramebuffer(0, 0, W, H, 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
++        if (slot->fence)
++            glDeleteSync(slot->fence);
++        slot->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++        glFlush(); // the presenter's context waits on the fence: it has to reach the GPU
++        slot->w = rt->w;
++        slot->h = rt->h;
++        slot->scale = m_scale;
++        slot->fbp = fbp;
++        slot->ox = ox;
++        slot->oy = oy;
++        slot->valid = true;
++        slot->serial = ++g_presentSerial;
++    }
++
+     // ---------------------------------------------------------------- primitives
+     void vert(const GSVertex &v, const GSVertex &col, float x, float y, bool tme, bool fst, float zf, float fog)
+     {
+@@ -3407,6 +3504,68 @@ void ape2GsGlDisplay(GSRasterBackend *backend, uint64_t pmode, uint64_t dispfb1,
+     }
+ }
+ 
++// 0072: the presenter's side of the high-resolution copies (see PresentSlot)
++bool ape2AcquireGpuFrame(uint32_t fbp, uint32_t width, uint32_t height, Ape2GpuFrame &out)
++{
++    out = Ape2GpuFrame{};
++    if (!gpuPresentOn() || width == 0u || height == 0u)
++        return false;
++    std::lock_guard<std::mutex> lock(g_presentMutex);
++    int best = -1;
++    for (int i = 0; i < kPresentSlots; ++i)
++    {
++        const PresentSlot &p = g_present[i];
++        if (p.valid && p.fbp == fbp && p.ox + static_cast<int>(width) <= p.w && p.oy + static_cast<int>(height) <= p.h &&
++            (best < 0 || p.serial > g_present[best].serial))
++            best = i;
++    }
++    if (best < 0)
++        return false;
++    PresentSlot &p = g_present[best];
++    ++p.holds;
++    out.slot = best;
++    out.tex = p.tex;
++    out.texW = p.w * p.scale;
++    out.texH = p.h * p.scale;
++    out.scale = p.scale;
++    out.ox = p.ox;
++    out.oy = p.oy;
++    return true;
++}
++
++void ape2HoldGpuFrame(const Ape2GpuFrame &frame)
++{
++    if (frame.slot < 0)
++        return;
++    std::lock_guard<std::mutex> lock(g_presentMutex);
++    ++g_present[frame.slot].holds;
++}
++
++void ape2ReleaseGpuFrame(const Ape2GpuFrame &frame)
++{
++    if (frame.slot < 0)
++        return;
++    std::lock_guard<std::mutex> lock(g_presentMutex);
++    if (g_present[frame.slot].holds > 0)
++        --g_present[frame.slot].holds;
++}
++
++void ape2WaitGpuFrame(const Ape2GpuFrame &frame)
++{
++    if (frame.slot < 0)
++        return;
++    // loaded in the presenter's own context (the GS thread's pointers belong to its context)
++    using WaitSyncFn = void(WINAPI *)(GLsync, GLbitfield, GLuint64);
++    static const WaitSyncFn waitSync = reinterpret_cast<WaitSyncFn>(glfwGetProcAddress("glWaitSync"));
++    GLsync fence = nullptr;
++    {
++        std::lock_guard<std::mutex> lock(g_presentMutex);
++        fence = g_present[frame.slot].fence; // held: the GS thread does not replace it
++    }
++    if (waitSync && fence)
++        waitSync(fence, 0, GL_TIMEOUT_IGNORED);
++}
++
+ #else
+ 
+ #include "runtime/gs/gs_cpu_backend.h"
+@@ -3414,5 +3573,13 @@ void ape2GsGlDisplay(GSRasterBackend *backend, uint64_t pmode, uint64_t dispfb1,
+ void ape2CreateGsGlContext() {}
+ std::unique_ptr<GSRasterBackend> ape2MakeRasterBackend() { return std::make_unique<GSCpuBackend>(); }
+ void ape2GsGlDisplay(GSRasterBackend *, uint64_t, uint64_t, uint64_t) {}
++bool ape2AcquireGpuFrame(uint32_t, uint32_t, uint32_t, Ape2GpuFrame &out)
++{
++    out = Ape2GpuFrame{};
++    return false;
++}
++void ape2HoldGpuFrame(const Ape2GpuFrame &) {}
++void ape2ReleaseGpuFrame(const Ape2GpuFrame &) {}
++void ape2WaitGpuFrame(const Ape2GpuFrame &) {}
+ 
+ #endif
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b972e11..9988e66 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -12,6 +12,7 @@
+ #include "Kernel/Stubs/Audio.h"
+ #include "Kernel/Stubs/GS.h"
+ #include "Kernel/Stubs/MPEG.h"
++#include "Kernel/zz_ape2_gpu_present.h"
+ #include "ps2_host_backend.h"
+ #include "ps2_iop_host.h"
+ #include "ps2x/iop/iop_subsystem.h"
+@@ -28,6 +29,8 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <sstream>
++#include "raylib.h"
++#include "rlgl.h" // 0072: raylib.h first (rlgl.h defines Matrix otherwise)
+ 
+ namespace ps2_stubs
+ {
+@@ -409,6 +412,9 @@ static bool ape2PresentOnVSync()
+     return on;
+ }
+ 
++// 0072: the high-resolution copy of the frame being shown (held), or none (slot -1): then frameTex is shown
++static Ape2GpuFrame g_ape2GpuShow{};
++
+ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+ {
+     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
+@@ -459,6 +465,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+                                                    &sourceFbp,
+                                                    &usedPreferredDisplaySource))
+     {
++        ape2ReleaseGpuFrame(g_ape2GpuShow);
++        g_ape2GpuShow = Ape2GpuFrame{};
+         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+         UpdateTexture(tex, blank.data);
+         UnloadImage(blank);
+@@ -516,6 +524,19 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+         }
+     }
+ 
++    // 0072: the same frame at the GPU renderer's resolution, when the displayed buffer was drawn on the GPU. It
++    // follows the 1x picture's one-frame delay: the copy latched now is shown on the next tick.
++    {
++        static Ape2GpuFrame s_gpuPrev{};
++        Ape2GpuFrame gpuNew{};
++        ape2AcquireGpuFrame(sourceFbp * 32u, width, height, gpuNew);
++        const Ape2GpuFrame gpuShow = (s_delayPresent && s_hasPrevFrame) ? s_gpuPrev : gpuNew;
++        ape2HoldGpuFrame(gpuShow);
++        ape2ReleaseGpuFrame(g_ape2GpuShow);
++        g_ape2GpuShow = gpuShow;
++        ape2ReleaseGpuFrame(s_gpuPrev);
++        s_gpuPrev = gpuNew;
++    }
+     if (s_delayPresent && s_hasPrevFrame)
+     {
+         UpdateTexture(tex, s_prevBuffer.data());
+@@ -2766,7 +2787,22 @@ void PS2Runtime::run()
+             (screenHeight - dstHeight) * 0.5f,
+             dstWidth,
+             dstHeight};
+-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++        if (g_ape2GpuShow.slot >= 0)
++        {
++            // 0072: the renderer's own resolution. The GS frame buffer's alpha is not coverage: drawn opaque.
++            ape2WaitGpuFrame(g_ape2GpuShow);
++            const Ape2GpuFrame &g = g_ape2GpuShow;
++            const Texture2D gpuTex{g.tex, g.texW, g.texH, 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
++            const float S = static_cast<float>(g.scale);
++            const Rectangle gpuSrc{static_cast<float>(g.ox) * S, static_cast<float>(g.oy) * S, srcWidth * S, srcHeight * S};
++            rlDrawRenderBatchActive();
++            rlDisableColorBlend();
++            DrawTexturePro(gpuTex, gpuSrc, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
++            rlDrawRenderBatchActive();
++            rlEnableColorBlend();
++        }
++        else
++            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
+         {
+             m_debugUiDrawCallback(*this, m_debugUiUserData);
